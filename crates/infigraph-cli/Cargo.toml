@@ -13,9 +13,11 @@ path = "src/main.rs"
 infigraph-core.workspace = true
 infigraph-languages.workspace = true
 infigraph-grammar-plugin = { path = "../infigraph-grammar-plugin" }
+infigraph-docs = { path = "../infigraph-docs" }
+infigraph-confluence = { path = "../infigraph-confluence" }
 anyhow.workspace = true
 serde_json.workspace = true
-clap = { version = "4", features = ["derive"] }
+clap = { version = "4", features = ["derive", "env"] }
 dirs = "5"
 ctrlc = "3"
 rayon = "1"
