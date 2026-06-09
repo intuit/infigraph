@@ -12,8 +12,11 @@ path = "src/main.rs"
 [dependencies]
 infigraph-core.workspace = true
 infigraph-languages = { path = "../infigraph-languages" }
+infigraph-docs = { path = "../infigraph-docs" }
+infigraph-confluence = { path = "../infigraph-confluence" }
 serde.workspace = true
 serde_json.workspace = true
 anyhow.workspace = true
 rayon = "1"
 tiny_http = "0.12"
+sha2 = "0.10"

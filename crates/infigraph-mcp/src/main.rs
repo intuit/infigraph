@@ -67,6 +67,559 @@ fn auto_start_watch(path: &str) -> Option<String> {
     }
 }
 
+// ---------------------------------------------------------------------------
+// Document indexing helpers and statics
+// ---------------------------------------------------------------------------
+
+fn open_doc_index(args: &Value) -> Result<infigraph_docs::DocIndex> {
+    let path = args
+        .get("path")
+        .and_then(|p| p.as_str())
+        .context("missing 'path' argument")?;
+    let mut idx = infigraph_docs::DocIndex::open(std::path::Path::new(path))?;
+    idx.init()?;
+    Ok(idx)
+}
+
+struct DocWatcherEntry {
+    stop_tx: mpsc::Sender<()>,
+    path: String,
+}
+
+static DOC_WATCHERS: Mutex<Option<HashMap<String, DocWatcherEntry>>> = Mutex::new(None);
+
+fn init_doc_watchers() {
+    let mut guard = DOC_WATCHERS.lock().unwrap();
+    if guard.is_none() {
+        *guard = Some(HashMap::new());
+    }
+}
+
+// ---------------------------------------------------------------------------
+// New tool implementations
+// ---------------------------------------------------------------------------
+
+fn tool_review(args: &Value) -> Result<String> {
+    let prism = open_prism(args)?;
+    let base_ref = args
+        .get("base_ref")
+        .and_then(|v| v.as_str())
+        .unwrap_or("HEAD~1");
+    let llm = args
+        .get("llm")
+        .and_then(|v| v.as_bool())
+        .unwrap_or(false);
+    let dry_run = args
+        .get("dry_run")
+        .and_then(|v| v.as_bool())
+        .unwrap_or(false);
+    let limit = args
+        .get("limit")
+        .and_then(|v| v.as_u64())
+        .unwrap_or(1000) as usize;
+    let context = args.get("context").and_then(|v| v.as_str());
+    let group = args.get("group").and_then(|v| v.as_str());
+
+    let store = prism
+        .store()
+        .context("not initialized -- run 'infigraph index' first")?;
+    let registry = infigraph_languages::bundled_registry()?;
+    let root = prism.root().to_path_buf();
+
+    let report = if let Some(group_name) = group {
+        let multi_reg = infigraph_core::multi::Registry::load()?;
+        infigraph_core::review::review_with_group(
+            &root,
+            base_ref,
+            limit,
+            &registry,
+            store,
+            group_name,
+            &multi_reg,
+            infigraph_languages::bundled_registry,
+        )?
+    } else {
+        infigraph_core::review::review(&root, base_ref, limit, &registry, store)?
+    };
+
+    if !llm && !dry_run {
+        return Ok(infigraph_core::review::format_review(&report));
+    }
+
+    let (prompt, result) =
+        infigraph_core::review::llm::review_with_llm(&root, &report, store, dry_run, context)?;
+
+    if dry_run {
+        return Ok(prompt);
+    }
+
+    match result {
+        Some(r) => {
+            let mut out = infigraph_core::review::format_review(&report);
+            out.push_str(&infigraph_core::review::llm::format_llm_review(&r));
+            Ok(out)
+        }
+        None => Ok(infigraph_core::review::format_review(&report)),
+    }
+}
+
+fn tool_index_docs(args: &Value) -> Result<String> {
+    let path = args
+        .get("path")
+        .and_then(|p| p.as_str())
+        .context("missing 'path'")?;
+
+    if let Some(cli) = find_infigraph_cli() {
+        let output = std::process::Command::new(&cli)
+            .args(["index-docs"])
+            .current_dir(path)
+            .output()
+            .with_context(|| format!("Failed to run {}", cli.display()))?;
+        let combined = format!(
+            "{}{}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr)
+        );
+        if !output.status.success() {
+            return Err(anyhow::anyhow!(
+                "infigraph index-docs failed:\n{}",
+                combined
+            ));
+        }
+        return Ok(combined);
+    }
+
+    let idx = open_doc_index(args)?;
+    let result = idx.index()?;
+
+    let mut out = format!(
+        "Document indexing complete.\n  Files scanned: {}\n  Files indexed: {}\n  Chunks created: {}\n",
+        result.total_files, result.indexed_files, result.total_chunks
+    );
+
+    if let Some(store) = idx.store() {
+        let stats = store.stats()?;
+        out.push_str(&format!(
+            "  Total documents in store: {}\n  Total chunks in store: {}\n",
+            stats.document_count, stats.chunk_count
+        ));
+    }
+
+    Ok(out)
+}
+
+fn tool_search_docs(args: &Value) -> Result<String> {
+    let path = args
+        .get("path")
+        .and_then(|p| p.as_str())
+        .context("missing 'path'")?;
+    let query = args
+        .get("query")
+        .and_then(|q| q.as_str())
+        .context("missing 'query'")?;
+    let limit = args
+        .get("limit")
+        .and_then(|l| l.as_u64())
+        .unwrap_or(10) as usize;
+
+    let idx = open_doc_index(args)?;
+    let store = idx.store().context("doc store not initialized")?;
+    let root = PathBuf::from(path);
+
+    let results = infigraph_docs::search::hybrid_doc_search(query, store, &root, limit, 0.5)?;
+
+    if results.is_empty() {
+        return Ok("No document results found. Run index_docs first to index documents.".to_string());
+    }
+
+    // Pre-read text files to compute line numbers from byte offsets
+    let mut file_contents: HashMap<String, String> = HashMap::new();
+    for r in &results {
+        if !file_contents.contains_key(&r.doc_file) {
+            let full_path = root.join(&r.doc_file);
+            if let Ok(content) = std::fs::read_to_string(&full_path) {
+                file_contents.insert(r.doc_file.clone(), content);
+            }
+        }
+    }
+
+    let mut out = format!(
+        "Document search: '{}' ({} results)\n\n",
+        query,
+        results.len()
+    );
+    for r in &results {
+        out.push_str(&format!("{:.3}  {}", r.score, r.doc_file));
+        if let Some(h) = &r.heading {
+            out.push_str(&format!(" > {}", h));
+        }
+
+        if let Some(content) = file_contents.get(&r.doc_file) {
+            let safe_start = {
+                let pos = r.start_offset.min(content.len());
+                content.floor_char_boundary(pos)
+            };
+            let safe_end = {
+                let pos = r.end_offset.min(content.len());
+                content.floor_char_boundary(pos)
+            };
+            let start_line = content[..safe_start].matches('\n').count() + 1;
+            let end_line = content[..safe_end].matches('\n').count() + 1;
+            out.push_str(&format!("  (lines {}-{})", start_line, end_line));
+        } else if let Some(page) = r.page {
+            out.push_str(&format!("  (page {})", page));
+        }
+
+        out.push('\n');
+        let preview: String = r.text.chars().take(200).collect();
+        out.push_str(&format!("      {}\n\n", preview.replace('\n', " ")));
+    }
+
+    Ok(out)
+}
+
+fn tool_clean_docs(args: &Value) -> Result<String> {
+    let path = args
+        .get("path")
+        .and_then(|p| p.as_str())
+        .context("missing 'path'")?;
+
+    if let Some(cli) = find_infigraph_cli() {
+        let output = std::process::Command::new(&cli)
+            .args(["clean-docs"])
+            .current_dir(path)
+            .output()
+            .with_context(|| format!("Failed to run {}", cli.display()))?;
+        let combined = format!(
+            "{}{}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr)
+        );
+        if !output.status.success() {
+            return Err(anyhow::anyhow!(
+                "infigraph clean-docs failed:\n{}",
+                combined
+            ));
+        }
+        return Ok(combined);
+    }
+
+    let mut idx = infigraph_docs::DocIndex::open(&PathBuf::from(path))?;
+    idx.clean()?;
+    Ok(
+        "Document index cleaned. Removed: docs.kuzu, docs_embeddings.bin, docs_hnsw_index."
+            .to_string(),
+    )
+}
+
+fn tool_reindex_docs(args: &Value) -> Result<String> {
+    let path = args
+        .get("path")
+        .and_then(|p| p.as_str())
+        .context("missing 'path'")?;
+
+    if let Some(cli) = find_infigraph_cli() {
+        let output = std::process::Command::new(&cli)
+            .args(["reindex-docs"])
+            .current_dir(path)
+            .output()
+            .with_context(|| format!("Failed to run {}", cli.display()))?;
+        let combined = format!(
+            "{}{}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr)
+        );
+        if !output.status.success() {
+            return Err(anyhow::anyhow!(
+                "infigraph reindex-docs failed:\n{}",
+                combined
+            ));
+        }
+        return Ok(combined);
+    }
+
+    let mut idx = infigraph_docs::DocIndex::open(&PathBuf::from(path))?;
+    let result = idx.reindex()?;
+    Ok(format!(
+        "Document full reindex complete.\n  Files scanned: {}\n  Files indexed: {}\n  Chunks created: {}\n",
+        result.total_files, result.indexed_files, result.total_chunks
+    ))
+}
+
+fn tool_index_confluence(args: &Value) -> Result<String> {
+    let path = args
+        .get("path")
+        .and_then(|p| p.as_str())
+        .context("missing 'path'")?;
+    let base_url = args
+        .get("base_url")
+        .and_then(|v| v.as_str())
+        .context("missing 'base_url'")?;
+    let space = args
+        .get("space")
+        .and_then(|v| v.as_str())
+        .context("missing 'space'")?;
+    let pat = args.get("pat").and_then(|v| v.as_str());
+    let email = args.get("email").and_then(|v| v.as_str());
+    let api_token = args.get("api_token").and_then(|v| v.as_str());
+
+    let client = if let Some(pat) = pat {
+        infigraph_confluence::ConfluenceClient::new(base_url, pat)
+    } else if let (Some(email), Some(token)) = (email, api_token) {
+        infigraph_confluence::ConfluenceClient::new_basic(base_url, email, token)
+    } else {
+        anyhow::bail!(
+            "No Confluence auth configured. Options:\n\
+             1. Set CONFLUENCE_PAT environment variable\n\
+             2. Pass 'pat' parameter directly\n\
+             3. Pass 'email' + 'api_token' for basic auth\n\
+             4. Use the Atlassian MCP connector to fetch pages, then call index_confluence_pages with the content"
+        );
+    };
+
+    let page_ids: Option<Vec<String>> = args.get("page_ids").and_then(|v| {
+        if let Some(arr) = v.as_array() {
+            Some(
+                arr.iter()
+                    .filter_map(|x| x.as_str().map(String::from))
+                    .collect(),
+            )
+        } else {
+            v.as_str().map(|s| {
+                s.split(',')
+                    .map(|x| x.trim().to_string())
+                    .filter(|x| !x.is_empty())
+                    .collect()
+            })
+        }
+    });
+
+    let follow = args
+        .get("follow_links")
+        .and_then(|v| v.as_bool())
+        .unwrap_or(false);
+    let crawl = if follow {
+        let depth = args
+            .get("follow_depth")
+            .and_then(|v| v.as_u64())
+            .unwrap_or(1) as usize;
+        let max = args
+            .get("max_pages")
+            .and_then(|v| v.as_u64())
+            .unwrap_or(100) as usize;
+        infigraph_confluence::CrawlOptions {
+            follow_links: true,
+            follow_depth: depth,
+            max_pages: max,
+            same_space_only: true,
+        }
+    } else {
+        infigraph_confluence::CrawlOptions::no_follow()
+    };
+
+    let sync = infigraph_confluence::ConfluenceSync::new(client, space);
+    let root = PathBuf::from(path);
+
+    let mut idx = infigraph_docs::DocIndex::open(&root)?;
+    idx.init()?;
+    let store = idx.store().context("DocStore not initialized")?;
+
+    let ids = page_ids.as_deref();
+    let result = sync.sync_with_options(store, &root, ids, &crawl)?;
+
+    let stats = store.stats()?;
+    Ok(format!(
+        "Confluence sync complete.\n  Space: {space}\n  Pages fetched: {}\n  Pages indexed: {}\n  Pages deleted: {}\n  Chunks created: {}\n  Links created: {}\n  Total documents in store: {}\n  Total chunks in store: {}",
+        result.pages_fetched, result.pages_indexed, result.pages_deleted, result.chunks_created,
+        result.links_created, stats.document_count, stats.chunk_count
+    ))
+}
+
+fn tool_index_confluence_pages(args: &Value) -> Result<String> {
+    let path = args
+        .get("path")
+        .and_then(|p| p.as_str())
+        .context("missing 'path'")?;
+    let space = args
+        .get("space")
+        .and_then(|v| v.as_str())
+        .context("missing 'space'")?;
+    let pages = args
+        .get("pages")
+        .and_then(|v| v.as_array())
+        .context("missing 'pages' array")?;
+
+    if pages.is_empty() {
+        return Ok("No pages provided.".to_string());
+    }
+
+    let root = PathBuf::from(path);
+    let mut idx = infigraph_docs::DocIndex::open(&root)?;
+    idx.init()?;
+    let store = idx.store().context("DocStore not initialized")?;
+
+    let source_id = format!("confluence::{}", space);
+    store.upsert_source(&source_id, "confluence", "", space)?;
+
+    let mut docs = Vec::new();
+    let mut all_chunks = Vec::new();
+
+    for page in pages {
+        let page_id = page
+            .get("page_id")
+            .and_then(|v| v.as_str())
+            .unwrap_or("unknown");
+        let title = page
+            .get("title")
+            .and_then(|v| v.as_str())
+            .unwrap_or("Untitled");
+        let content = page
+            .get("content")
+            .and_then(|v| v.as_str())
+            .unwrap_or("");
+        if content.is_empty() {
+            continue;
+        }
+
+        let file_id = format!("confluence://{}/{}", space, page_id);
+        let hash = {
+            use sha2::{Digest, Sha256};
+            let mut h = Sha256::new();
+            h.update(content.as_bytes());
+            format!("{:x}", h.finalize())
+        };
+
+        let doc = infigraph_docs::extract::ExtractedDoc {
+            file: file_id.clone(),
+            title: Some(title.to_string()),
+            content_hash: hash.clone(),
+            format: infigraph_docs::extract::DocFormat::Markdown,
+            text: content.to_string(),
+            page_count: Some(1),
+        };
+
+        let chunks = infigraph_docs::chunk::chunk_document(
+            &doc,
+            &file_id,
+            &hash,
+            infigraph_docs::chunk::ChunkStrategy::HeadingBounded,
+        );
+        all_chunks.extend(chunks);
+        docs.push(doc);
+    }
+
+    let indexed = docs.len();
+    let chunks_created = all_chunks.len();
+
+    if !docs.is_empty() {
+        let doc_refs: Vec<&infigraph_docs::extract::ExtractedDoc> = docs.iter().collect();
+        let chunk_refs: Vec<&infigraph_docs::chunk::Chunk> = all_chunks.iter().collect();
+        store.upsert_all_parquet(&doc_refs, &chunk_refs)?;
+
+        for doc in &docs {
+            store.link_doc_to_source(&doc.file, &source_id)?;
+        }
+    }
+
+    if !all_chunks.is_empty() {
+        let chunk_refs: Vec<&infigraph_docs::chunk::Chunk> = all_chunks.iter().collect();
+        let changed_files: Vec<&str> = docs.iter().map(|d| d.file.as_str()).collect();
+        infigraph_docs::embed::update_doc_embeddings(store, &root, &chunk_refs, &changed_files)?;
+    }
+
+    if !docs.is_empty() {
+        let all_doc_ids: std::collections::HashSet<String> = {
+            let existing = store.get_doc_hashes().unwrap_or_default();
+            existing.keys().cloned().collect()
+        };
+        for doc in &docs {
+            infigraph_docs::links::extract_and_link_doc(store, doc, &all_doc_ids);
+        }
+    }
+
+    let stats = store.stats()?;
+    Ok(format!(
+        "Confluence pages indexed.\n  Space: {space}\n  Pages indexed: {indexed}\n  Chunks created: {chunks_created}\n  Total documents in store: {}\n  Total chunks in store: {}",
+        stats.document_count, stats.chunk_count
+    ))
+}
+
+fn tool_watch_docs(args: &Value) -> Result<String> {
+    init_doc_watchers();
+
+    let path = args
+        .get("path")
+        .and_then(|p| p.as_str())
+        .context("missing 'path'")?;
+    let debounce_ms = args
+        .get("debounce_ms")
+        .and_then(|v| v.as_u64())
+        .unwrap_or(2000);
+
+    let root = PathBuf::from(path)
+        .canonicalize()
+        .context("invalid path")?;
+    let root_str = root.to_string_lossy().replace('\\', "/");
+
+    let (stop_tx, stop_rx) = mpsc::channel::<()>();
+    let watcher_id = format!(
+        "docwatch-{}",
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_millis()
+    );
+
+    {
+        let mut guard = DOC_WATCHERS.lock().unwrap();
+        if let Some(map) = guard.as_mut() {
+            map.insert(
+                watcher_id.clone(),
+                DocWatcherEntry {
+                    stop_tx,
+                    path: root_str.clone(),
+                },
+            );
+        }
+    }
+
+    let watcher_id_clone = watcher_id.clone();
+    let log_prefix = watcher_id[..16.min(watcher_id.len())].to_string();
+    std::thread::spawn(move || {
+        if let Err(e) =
+            infigraph_docs::watch::watch_docs(&root, debounce_ms, stop_rx, &log_prefix)
+        {
+            eprintln!("[{log_prefix}] watcher error: {e}");
+        }
+        let mut guard = DOC_WATCHERS.lock().unwrap();
+        if let Some(map) = guard.as_mut() {
+            map.remove(&watcher_id_clone);
+        }
+    });
+
+    Ok(format!(
+        "Document watcher started.\nID: {watcher_id}\nPath: {root_str}\nDebounce: {debounce_ms}ms\nUse stop_watch_docs to stop."
+    ))
+}
+
+fn tool_stop_watch_docs(args: &Value) -> Result<String> {
+    let watcher_id = args
+        .get("watcher_id")
+        .and_then(|v| v.as_str())
+        .context("missing 'watcher_id'")?;
+    let mut guard = DOC_WATCHERS.lock().unwrap();
+    if let Some(map) = guard.as_mut() {
+        if let Some(entry) = map.remove(watcher_id) {
+            let _ = entry.stop_tx.send(());
+            return Ok(format!(
+                "Document watcher {watcher_id} stopped (was watching: {}).",
+                entry.path
+            ));
+        }
+    }
+    Ok(format!("No active document watcher with ID {watcher_id}"))
+}
+
 mod web;
 
 fn main() -> Result<()> {
@@ -360,6 +913,24 @@ fn build_tools_list() -> Vec<Value> {
                 "query":{"type":"string","description":"Natural language query to search sessions (e.g. 'authentication refactoring', 'VB6 grammar debugging')"},
                 "limit":{"type":"integer","default":5,"description":"Max results to return (default: 5)"}
             })), &["path","query"]),
+        tool_def("review", "PR review: auto-detects PR type and scope. Runs: semantic diff, blast radius, affected tests, API surface, security scan, complexity, dead code, clones. Set llm=true for LLM-augmented review.",
+            json!({"path": {"type": "string"}, "base_ref": {"type": "string", "description": "Git ref (default HEAD~1)"}, "llm": {"type": "boolean"}, "dry_run": {"type": "boolean"}, "limit": {"type": "integer"}, "context": {"type": "string"}, "group": {"type": "string"}}), &["path"]),
+        tool_def("index_docs", "Index documents (PDF, DOCX, PPTX, XLSX, Markdown, TXT, RST, HTML) into a document graph. Incremental — skips unchanged files.",
+            json!({"path": {"type": "string"}}), &["path"]),
+        tool_def("search_docs", "Search indexed documents by meaning or keywords. Returns matching chunks with file, heading, page, and text snippet.",
+            json!({"path": {"type": "string"}, "query": {"type": "string"}, "limit": {"type": "integer"}}), &["path", "query"]),
+        tool_def("clean_docs", "Delete document index, embeddings, and HNSW index.",
+            json!({"path": {"type": "string"}}), &["path"]),
+        tool_def("reindex_docs", "Force full document reindex from scratch.",
+            json!({"path": {"type": "string"}}), &["path"]),
+        tool_def("index_confluence", "Fetch and index Confluence pages into the document graph. Supports incremental sync. Requires PAT or email+api_token auth.",
+            json!({"path": {"type": "string"}, "base_url": {"type": "string"}, "space": {"type": "string"}, "page_ids": {"type": "array", "items": {"type": "string"}}, "pat": {"type": "string"}, "email": {"type": "string"}, "api_token": {"type": "string"}, "follow_links": {"type": "boolean"}, "follow_depth": {"type": "integer"}, "max_pages": {"type": "integer"}}), &["path", "base_url", "space"]),
+        tool_def("index_confluence_pages", "Index pre-fetched Confluence page content. Pass array of pages with page_id, title, content fields.",
+            json!({"path": {"type": "string"}, "space": {"type": "string"}, "pages": {"type": "array", "items": {"type": "object", "properties": {"page_id": {"type": "string"}, "title": {"type": "string"}, "content": {"type": "string"}}}}}), &["path", "space", "pages"]),
+        tool_def("watch_docs", "Start background watcher that auto-reindexes changed documents.",
+            json!({"path": {"type": "string"}, "debounce_ms": {"type": "integer"}}), &["path"]),
+        tool_def("stop_watch_docs", "Stop a running document file watcher.",
+            json!({"watcher_id": {"type": "string"}}), &["watcher_id"]),
     ]
 }
 
@@ -441,6 +1012,15 @@ fn handle_tools_call(id: &Value, request: &Value) -> Value {
         "get_latest_session" => tool_get_latest_session(&args),
         "purge_sessions" => tool_purge_sessions(&args),
         "search_sessions" => tool_search_sessions(&args),
+        "review" => tool_review(&args),
+        "index_docs" => tool_index_docs(&args),
+        "search_docs" => tool_search_docs(&args),
+        "clean_docs" => tool_clean_docs(&args),
+        "reindex_docs" => tool_reindex_docs(&args),
+        "index_confluence" => tool_index_confluence(&args),
+        "index_confluence_pages" => tool_index_confluence_pages(&args),
+        "watch_docs" => tool_watch_docs(&args),
+        "stop_watch_docs" => tool_stop_watch_docs(&args),
         _ => Err(anyhow::anyhow!("Unknown tool: {tool_name}")),
     };
 
