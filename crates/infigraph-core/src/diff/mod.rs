@@ -7,7 +7,7 @@
 //! worktree, indexes it with the current language registry, and returns a
 //! structured `SymbolDiff`.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::path::Path;
 
 use anyhow::{Context, Result};
@@ -106,12 +106,79 @@ pub fn semantic_diff(
     new_ref: &str,
     registry: &LanguageRegistry,
 ) -> Result<SymbolDiff> {
-    let old_symbols = extract_ref_symbols(project_root, old_ref, registry)
+    let changed = compute_changed_files(project_root, old_ref, new_ref);
+
+    let (old_filter, new_filter) = match &changed {
+        Some(cf) => (Some(&cf.old_ref_files), Some(&cf.new_ref_files)),
+        None => (None, None),
+    };
+
+    let old_symbols = extract_ref_symbols(project_root, old_ref, registry, old_filter)
         .with_context(|| format!("failed to extract symbols for ref '{}'", old_ref))?;
-    let new_symbols = extract_ref_symbols(project_root, new_ref, registry)
+    let new_symbols = extract_ref_symbols(project_root, new_ref, registry, new_filter)
         .with_context(|| format!("failed to extract symbols for ref '{}'", new_ref))?;
 
     Ok(diff_symbol_maps(old_ref, new_ref, old_symbols, new_symbols))
+}
+
+struct ChangedFiles {
+    old_ref_files: HashSet<String>,
+    new_ref_files: HashSet<String>,
+}
+
+fn compute_changed_files(
+    project_root: &Path,
+    old_ref: &str,
+    new_ref: &str,
+) -> Option<ChangedFiles> {
+    let output = std::process::Command::new("git")
+        .args(["diff", "--name-status", "--no-renames", old_ref, new_ref])
+        .current_dir(project_root)
+        .output()
+        .ok()?;
+
+    if !output.status.success() {
+        eprintln!(
+            "infigraph: git diff --name-status failed for {}..{}, falling back to full extraction",
+            old_ref, new_ref
+        );
+        return None;
+    }
+
+    let text = String::from_utf8_lossy(&output.stdout);
+    let mut old_ref_files = HashSet::new();
+    let mut new_ref_files = HashSet::new();
+
+    for line in text.lines() {
+        let line = line.trim();
+        if line.is_empty() {
+            continue;
+        }
+        let mut parts = line.splitn(2, '\t');
+        let status = parts.next().unwrap_or("").trim();
+        let path = match parts.next() {
+            Some(p) => p.trim().to_string(),
+            None => continue,
+        };
+
+        match status {
+            "A" => {
+                new_ref_files.insert(path);
+            }
+            "D" => {
+                old_ref_files.insert(path);
+            }
+            _ => {
+                old_ref_files.insert(path.clone());
+                new_ref_files.insert(path);
+            }
+        }
+    }
+
+    Some(ChangedFiles {
+        old_ref_files,
+        new_ref_files,
+    })
 }
 
 // ---------------------------------------------------------------------------
@@ -120,34 +187,82 @@ pub fn semantic_diff(
 
 /// Extract all symbols from a git ref by using `git archive | tar -x` into a
 /// temp directory, then walking files through the language registry.
+const MAX_ARCHIVE_ARGS: usize = 500;
+
 fn extract_ref_symbols(
     project_root: &Path,
     git_ref: &str,
     registry: &LanguageRegistry,
+    file_filter: Option<&HashSet<String>>,
 ) -> Result<HashMap<String, FlatSym>> {
-    // For HEAD/working-tree we skip the archive step and read directly.
+    if let Some(filter) = file_filter {
+        if filter.is_empty() {
+            return Ok(HashMap::new());
+        }
+    }
+
     let is_working_tree = git_ref == "HEAD" || git_ref == "WORKING";
 
     if is_working_tree {
-        return extract_dir_symbols(project_root, project_root, registry);
+        return extract_dir_symbols(project_root, project_root, registry, file_filter);
     }
 
-    // Use git archive to extract the ref
     let tmp = tempfile::tempdir().context("failed to create temp dir")?;
-    let archive_output = std::process::Command::new("git")
-        .args(["archive", "--format=tar", git_ref])
-        .current_dir(project_root)
-        .output()
-        .context("git archive failed")?;
+
+    let use_filtered_archive = file_filter
+        .map(|f| f.len() <= MAX_ARCHIVE_ARGS)
+        .unwrap_or(false);
+
+    let archive_output = if use_filtered_archive {
+        let filter = file_filter.unwrap();
+        let mut args: Vec<&str> = vec!["archive", "--format=tar", git_ref, "--"];
+        args.extend(filter.iter().map(|s| s.as_str()));
+        std::process::Command::new("git")
+            .args(&args)
+            .current_dir(project_root)
+            .output()
+            .context("git archive (filtered) failed")?
+    } else {
+        std::process::Command::new("git")
+            .args(["archive", "--format=tar", git_ref])
+            .current_dir(project_root)
+            .output()
+            .context("git archive failed")?
+    };
 
     if !archive_output.status.success() {
         let err = String::from_utf8_lossy(&archive_output.stderr);
+        if use_filtered_archive {
+            eprintln!(
+                "infigraph: filtered git archive for {} failed, falling back to full archive: {}",
+                git_ref,
+                err.trim()
+            );
+            let full_output = std::process::Command::new("git")
+                .args(["archive", "--format=tar", git_ref])
+                .current_dir(project_root)
+                .output()
+                .context("git archive (full fallback) failed")?;
+            if !full_output.status.success() {
+                let err2 = String::from_utf8_lossy(&full_output.stderr);
+                anyhow::bail!("git archive {} failed: {}", git_ref, err2.trim());
+            }
+            return untar_and_extract(tmp.path(), &full_output.stdout, registry, file_filter);
+        }
         anyhow::bail!("git archive {} failed: {}", git_ref, err.trim());
     }
 
-    // Extract tar to tmp
+    untar_and_extract(tmp.path(), &archive_output.stdout, registry, file_filter)
+}
+
+fn untar_and_extract(
+    tmp_dir: &Path,
+    tar_data: &[u8],
+    registry: &LanguageRegistry,
+    file_filter: Option<&HashSet<String>>,
+) -> Result<HashMap<String, FlatSym>> {
     let mut tar = std::process::Command::new("tar")
-        .args(["-x", "-C", tmp.path().to_str().unwrap_or(".")])
+        .args(["-x", "-C", tmp_dir.to_str().unwrap_or(".")])
         .stdin(std::process::Stdio::piped())
         .spawn()
         .context("failed to spawn tar")?;
@@ -155,20 +270,21 @@ fn extract_ref_symbols(
     if let Some(stdin) = tar.stdin.take() {
         use std::io::Write;
         let mut w = stdin;
-        w.write_all(&archive_output.stdout)?;
+        w.write_all(tar_data)?;
     }
     tar.wait().context("tar wait failed")?;
 
-    extract_dir_symbols(tmp.path(), tmp.path(), registry)
+    extract_dir_symbols(tmp_dir, tmp_dir, registry, file_filter)
 }
 
 fn extract_dir_symbols(
     root: &Path,
     dir: &Path,
     registry: &LanguageRegistry,
+    file_filter: Option<&HashSet<String>>,
 ) -> Result<HashMap<String, FlatSym>> {
     let mut map = HashMap::new();
-    collect_symbols(root, dir, registry, &mut map)?;
+    collect_symbols(root, dir, registry, file_filter, &mut map)?;
     Ok(map)
 }
 
@@ -189,6 +305,7 @@ fn collect_symbols(
     root: &Path,
     dir: &Path,
     registry: &LanguageRegistry,
+    file_filter: Option<&HashSet<String>>,
     map: &mut HashMap<String, FlatSym>,
 ) -> Result<()> {
     for entry in std::fs::read_dir(dir)? {
@@ -199,7 +316,7 @@ fn collect_symbols(
 
         if path.is_dir() {
             if !SKIP_DIRS.contains(&name_str.as_ref()) && !name_str.starts_with('.') {
-                collect_symbols(root, &path, registry, map)?;
+                collect_symbols(root, &path, registry, file_filter, map)?;
             }
         } else if path.is_file() {
             let rel = path
@@ -207,6 +324,11 @@ fn collect_symbols(
                 .unwrap_or(&path)
                 .to_string_lossy()
                 .replace('\\', "/");
+            if let Some(filter) = file_filter {
+                if !filter.contains(&rel) {
+                    continue;
+                }
+            }
             let Ok(source) = std::fs::read(&path) else {
                 continue;
             };

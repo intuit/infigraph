@@ -30,6 +30,7 @@ ureq = "2"
 usearch = "2.18"
 parquet = "58.3"
 arrow = { version = "58.3", features = ["prettyprint"] }
+ignore = "0.4"
 
 [dev-dependencies]
 tree-sitter-python = "0.25"

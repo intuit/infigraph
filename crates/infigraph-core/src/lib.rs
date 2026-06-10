@@ -370,44 +370,29 @@ impl Infigraph {
     }
 
     fn collect_files(&self) -> Result<Vec<PathBuf>> {
+        use ignore::WalkBuilder;
+
         let mut files = Vec::new();
-        self.walk_dir(&self.root, &mut files)?;
-        Ok(files)
-    }
+        let walker = WalkBuilder::new(&self.root)
+            .hidden(true)
+            .add_custom_ignore_filename(".infigraphignore")
+            .git_ignore(true)
+            .filter_entry(|e| {
+                let name = e.file_name().to_string_lossy();
+                !matches!(name.as_ref(), ".infigraph" | "node_modules" | "__pycache__" | ".tox")
+            })
+            .build();
 
-    fn walk_dir(&self, dir: &Path, files: &mut Vec<PathBuf>) -> Result<()> {
-        let ignore_dirs = [
-            ".infigraph",
-            ".git",
-            "node_modules",
-            "__pycache__",
-            ".venv",
-            "venv",
-            "target",
-            "build",
-            "dist",
-            ".tox",
-        ];
-
-        for entry in std::fs::read_dir(dir)? {
-            let entry = entry?;
-            let path = entry.path();
-            let name = entry.file_name();
-            let name_str = name.to_string_lossy();
-
-            if path.is_dir() {
-                if !ignore_dirs.contains(&name_str.as_ref()) && !name_str.starts_with('.') {
-                    self.walk_dir(&path, files)?;
-                }
-            } else if path.is_file() {
-                let path_str = path.to_string_lossy();
-                if self.registry.for_file(&path_str).is_some() {
-                    files.push(path);
+        for result in walker {
+            let entry = result?;
+            if entry.file_type().map_or(false, |ft| ft.is_file()) {
+                let path = entry.path();
+                if self.registry.for_file(&path.to_string_lossy()).is_some() {
+                    files.push(path.to_path_buf());
                 }
             }
         }
-
-        Ok(())
+        Ok(files)
     }
 }
 
