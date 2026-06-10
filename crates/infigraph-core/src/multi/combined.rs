@@ -356,7 +356,7 @@ fn resolve_cross_repo(store: &GraphStore) -> Result<usize> {
 
     // Batch: collect all inheritor→target pairs to create
     let mut inh_pairs: Vec<(String, String)> = Vec::new();
-    for (_name, id_repos) in &name_to_ids {
+    for id_repos in name_to_ids.values() {
         if id_repos.len() < 2 { continue; }
         for (target_id, _) in id_repos {
             let escaped = target_id.replace('\'', "\\'");

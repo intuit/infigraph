@@ -121,7 +121,7 @@ fn map_ecosystem(eco: &str) -> &str {
             // Return the input as-is for unknown ecosystems.
             // We can't return `_other` directly because it borrows the
             // lowercased temporary. Use the original eco instead.
-            return eco;
+            eco
         }
     }
 }

@@ -195,10 +195,8 @@ impl DocIndex {
                 if !ignore_dirs.contains(&name_str.as_ref()) && !name_str.starts_with('.') {
                     self.walk_doc_dir(&path, files)?;
                 }
-            } else if path.is_file() {
-                if is_document_file(&path) {
-                    files.push(path);
-                }
+            } else if path.is_file() && is_document_file(&path) {
+                files.push(path);
             }
         }
         Ok(())

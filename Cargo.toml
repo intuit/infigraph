@@ -18,11 +18,6 @@ edition = "2021"
 license = "Apache-2.0"
 repository = "https://github.com/intuit/infigraph"
 
-# lbug (graph DB) static lib exceeds Windows MSVC 4GB image size limit in debug mode.
-# Build it optimized even in dev to stay under the limit.
-[profile.dev.package.lbug]
-opt-level = 1
-
 [workspace.dependencies]
 infigraph-core = { path = "crates/infigraph-core" }
 infigraph-languages = { path = "crates/infigraph-languages" }

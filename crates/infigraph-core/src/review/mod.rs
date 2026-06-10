@@ -295,6 +295,7 @@ pub fn review(
 
 /// Cross-repo review: runs single-repo review, then enriches with cross-repo
 /// blast radius and callers from the group's other repos.
+#[allow(clippy::too_many_arguments)]
 pub fn review_with_group(
     root: &Path,
     base_ref: &str,
@@ -629,40 +630,26 @@ fn detect_pr_type(
     // Commit message signals
     for (pr_type, score) in &mut scores {
         match pr_type {
-            PrType::BugFix => {
-                if commit_msgs.contains("fix") || commit_msgs.contains("bug") || commit_msgs.contains("patch") {
-                    *score += 3;
-                }
+            PrType::BugFix if commit_msgs.contains("fix") || commit_msgs.contains("bug") || commit_msgs.contains("patch") => {
+                *score += 3;
             }
-            PrType::Refactor => {
-                if commit_msgs.contains("refactor") || commit_msgs.contains("rename") || commit_msgs.contains("move") || commit_msgs.contains("clean") {
-                    *score += 3;
-                }
+            PrType::Refactor if commit_msgs.contains("refactor") || commit_msgs.contains("rename") || commit_msgs.contains("move") || commit_msgs.contains("clean") => {
+                *score += 3;
             }
-            PrType::Feature => {
-                if commit_msgs.contains("add") || commit_msgs.contains("new") || commit_msgs.contains("feature") || commit_msgs.contains("implement") {
-                    *score += 3;
-                }
+            PrType::Feature if commit_msgs.contains("add") || commit_msgs.contains("new") || commit_msgs.contains("feature") || commit_msgs.contains("implement") => {
+                *score += 3;
             }
-            PrType::Migration => {
-                if commit_msgs.contains("migrat") || commit_msgs.contains("upgrade") || commit_msgs.contains("convert") || commit_msgs.contains("sqlite") {
-                    *score += 5;
-                }
+            PrType::Migration if commit_msgs.contains("migrat") || commit_msgs.contains("upgrade") || commit_msgs.contains("convert") || commit_msgs.contains("sqlite") => {
+                *score += 5;
             }
-            PrType::Config => {
-                if commit_msgs.contains("config") || commit_msgs.contains("setting") || commit_msgs.contains("version bump") {
-                    *score += 3;
-                }
+            PrType::Config if commit_msgs.contains("config") || commit_msgs.contains("setting") || commit_msgs.contains("version bump") => {
+                *score += 3;
             }
-            PrType::Test => {
-                if commit_msgs.contains("test") {
-                    *score += 3;
-                }
+            PrType::Test if commit_msgs.contains("test") => {
+                *score += 3;
             }
-            PrType::Docs => {
-                if commit_msgs.contains("doc") || commit_msgs.contains("readme") {
-                    *score += 3;
-                }
+            PrType::Docs if commit_msgs.contains("doc") || commit_msgs.contains("readme") => {
+                *score += 3;
             }
             _ => {}
         }
@@ -705,7 +692,7 @@ fn detect_pr_type(
         scores.iter_mut().find(|(t, _)| *t == PrType::Refactor).unwrap().1 += 2;
     }
 
-    scores.sort_by(|a, b| b.1.cmp(&a.1));
+    scores.sort_by_key(|a| std::cmp::Reverse(a.1));
     if scores[0].1 == 0 {
         PrType::Mixed
     } else {
@@ -905,7 +892,7 @@ fn find_consistency_issues(gq: &GraphQuery, changed_symbols: &[ChangedSymbol]) -
         let structural_outliers: Vec<String> = caller_counts
             .iter()
             .filter(|(_, c)| {
-                let diff = if *c > median_count { *c - median_count } else { median_count - *c };
+                let diff = (*c).abs_diff(median_count);
                 diff > 2 && median_count > 0
             })
             .map(|(file, count)| format!("{} in {} ({} callers vs median {})", name, file, count, median_count))

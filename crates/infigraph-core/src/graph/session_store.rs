@@ -73,7 +73,7 @@ impl SessionStore {
                 }
             }
         }
-        sessions.sort_by(|a, b| b.created_at.cmp(&a.created_at));
+        sessions.sort_by_key(|s| std::cmp::Reverse(s.created_at));
         Ok(sessions)
     }
 
@@ -85,7 +85,7 @@ impl SessionStore {
 
     pub fn list_by_updated(&self) -> Result<Vec<SessionData>> {
         let mut sessions = self.list_all()?;
-        sessions.sort_by(|a, b| b.updated_at.cmp(&a.updated_at));
+        sessions.sort_by_key(|s| std::cmp::Reverse(s.updated_at));
         Ok(sessions)
     }
 
@@ -108,12 +108,12 @@ impl SessionStore {
         };
         let query = "MATCH (s:Session) RETURN s.id, s.summary, s.pending_tasks, s.decisions, \
                      s.files_touched, s.created_at, s.updated_at, s.constraints, s.assumptions, s.blockers";
-        let mut result = match conn.query(query) {
+        let result = match conn.query(query) {
             Ok(r) => r,
             Err(_) => return Vec::new(),
         };
         let mut collected = Vec::new();
-        while let Some(row) = result.next() {
+        for row in result {
             let get = |i: usize| {
                 row.get(i)
                     .map(|v| v.to_string())

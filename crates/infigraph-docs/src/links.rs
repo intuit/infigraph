@@ -117,9 +117,7 @@ fn resolve_relative_path(url: &str, doc_file: &str) -> String {
     };
 
     // Resolve relative path components
-    let full = if path.starts_with('/') {
-        path.to_string()
-    } else if dir.is_empty() {
+    let full = if path.starts_with('/') || dir.is_empty() {
         path.to_string()
     } else {
         format!("{}/{}", dir, path)

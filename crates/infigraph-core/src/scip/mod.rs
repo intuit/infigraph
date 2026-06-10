@@ -5,11 +5,11 @@ use std::sync::Arc;
 use anyhow::{Context, Result};
 use arrow::array::{Int64Array, StringArray};
 use arrow::datatypes::DataType;
-use kuzu::Connection;
 use protobuf::Message;
 use scip::types::{symbol_information, Index, SymbolRole};
 
 use crate::graph::parquet_loader;
+use crate::graph::store_util::{escape, fwd_slash_path, unwind_edges_from_pairs};
 use crate::graph::GraphStore;
 use crate::model::{Span, SymbolKind};
 
@@ -469,38 +469,6 @@ fn scip_kind_to_prism(kind: &symbol_information::Kind) -> SymbolKind {
         Variable | StaticVariable | Field | SelfParameter | Parameter => SymbolKind::Variable,
         Constant => SymbolKind::Constant,
         _ => SymbolKind::Function,
-    }
-}
-
-fn escape(s: &str) -> String {
-    s.replace('\\', "\\\\")
-        .replace('\'', "\\'")
-        .replace('\n', " ")
-        .replace('\r', "")
-        .replace('\t', " ")
-}
-
-fn fwd_slash_path(p: &Path) -> String {
-    p.to_string_lossy().replace('\\', "/")
-}
-
-fn unwind_edges_from_pairs(
-    conn: &Connection,
-    pairs: &[(&str, &str)],
-    rel_type: &str,
-    src_label: &str,
-    dst_label: &str,
-) {
-    const CHUNK: usize = 500;
-    for chunk in pairs.chunks(CHUNK) {
-        let pair_list: Vec<String> = chunk
-            .iter()
-            .map(|(a, b)| format!("{{a: '{}', b: '{}'}}", escape(a), escape(b)))
-            .collect();
-        let _ = conn.query(&format!(
-            "UNWIND [{}] AS p MATCH (a:{src_label}), (b:{dst_label}) WHERE a.id = p.a AND b.id = p.b CREATE (a)-[:{rel_type}]->(b)",
-            pair_list.join(", ")
-        ));
     }
 }
 

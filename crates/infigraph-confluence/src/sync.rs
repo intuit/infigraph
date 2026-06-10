@@ -190,6 +190,7 @@ impl ConfluenceSync {
         })
     }
 
+    #[allow(clippy::type_complexity)]
     fn crawl_links(
         &self,
         seed_pages: &[ConfluencePage],
@@ -280,6 +281,7 @@ impl ConfluenceSync {
         self.client.get_pages_in_space(&self.space_key, 1000)
     }
 
+    #[allow(clippy::type_complexity)]
     fn convert_pages(&self, pages: &[ConfluencePage]) -> (Vec<ExtractedDoc>, Vec<Chunk>, Vec<(String, Vec<PageLink>)>) {
         let mut docs = Vec::new();
         let mut all_chunks = Vec::new();

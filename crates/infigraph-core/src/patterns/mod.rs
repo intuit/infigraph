@@ -374,7 +374,7 @@ fn detect_observer(gq: &GraphQuery) -> Vec<PatternMatch> {
                     PatternParticipant {
                         role: "Notify".to_string(),
                         symbol: format!("{}::{}", parent, notify_name),
-                        file: file,
+                        file,
                     },
                 ],
                 file: reg_file.clone(),

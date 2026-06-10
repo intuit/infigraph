@@ -108,7 +108,7 @@ fn doc_path_context(file: &str) -> Option<String> {
     }
     let stem = parts.last()?
         .rsplit_once('.').map(|(s, _)| s).unwrap_or(parts.last()?);
-    let name = stem.replace('_', " ").replace('-', " ");
+    let name = stem.replace(['_', '-'], " ");
     let dirs: Vec<&str> = parts[..parts.len()-1].iter()
         .filter(|p| {
             let lower = p.to_lowercase();

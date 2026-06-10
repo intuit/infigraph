@@ -103,7 +103,7 @@ fn resolve_with_map(
             .filter(|r| r.kind == RelationKind::Imports)
             .map(|r| {
                 let raw = r.target_id
-                    .rsplit(|c| c == '/' || c == '\\' || c == '.')
+                    .rsplit(['/', '\\', '.'])
                     .next()
                     .unwrap_or(&r.target_id);
                 raw.to_lowercase()
@@ -410,7 +410,7 @@ fn resolve_inherits(
             .filter(|r| r.kind == RelationKind::Imports)
             .map(|r| {
                 let raw = r.target_id
-                    .rsplit(|c| c == '/' || c == '\\' || c == '.')
+                    .rsplit(['/', '\\', '.'])
                     .next()
                     .unwrap_or(&r.target_id);
                 raw.to_lowercase()

@@ -18,7 +18,7 @@ use crate::security;
 // ---------------------------------------------------------------------------
 
 /// Top-level config loaded from `.infigraph/check.toml`.
-#[derive(Debug, Clone, Deserialize)]
+#[derive(Debug, Clone, Default, Deserialize)]
 #[serde(default)]
 pub struct CheckConfig {
     pub security: SecurityConfig,
@@ -27,33 +27,12 @@ pub struct CheckConfig {
     pub vulnerabilities: VulnCheckConfig,
 }
 
-impl Default for CheckConfig {
-    fn default() -> Self {
-        Self {
-            security: SecurityConfig::default(),
-            complexity: ComplexityConfig::default(),
-            dead_code: DeadCodeConfig::default(),
-            vulnerabilities: VulnCheckConfig::default(),
-        }
-    }
-}
-
-#[derive(Debug, Clone, Deserialize)]
+#[derive(Debug, Clone, Default, Deserialize)]
 #[serde(default)]
 pub struct VulnCheckConfig {
     pub enabled: bool,
     pub max_critical: usize,
     pub max_high: usize,
-}
-
-impl Default for VulnCheckConfig {
-    fn default() -> Self {
-        Self {
-            enabled: false,
-            max_critical: 0,
-            max_high: 0,
-        }
-    }
 }
 
 #[derive(Debug, Clone, Deserialize)]

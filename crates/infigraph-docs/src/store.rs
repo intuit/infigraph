@@ -81,11 +81,11 @@ impl DocStore {
 
     pub fn get_doc_hashes(&self) -> Result<HashMap<String, String>> {
         let conn = self.connection()?;
-        let mut result = conn
+        let result = conn
             .query("MATCH (d:Document) RETURN d.file, d.content_hash")
             .map_err(|e| anyhow::anyhow!("query doc hashes: {e}"))?;
         let mut hashes = HashMap::new();
-        while let Some(row) = result.next() {
+        for row in result {
             if row.len() >= 2 {
                 hashes.insert(row[0].to_string(), row[1].to_string());
             }
@@ -284,14 +284,14 @@ impl DocStore {
 
     pub fn get_docs_by_source(&self, source_id: &str) -> Result<Vec<String>> {
         let conn = self.connection()?;
-        let mut result = conn
+        let result = conn
             .query(&format!(
                 "MATCH (d:Document)-[:FROM_SOURCE]->(s:Source) WHERE s.id = '{}' RETURN d.id",
                 escape_str(source_id)
             ))
             .map_err(|e| anyhow::anyhow!("query docs by source: {e}"))?;
         let mut ids = Vec::new();
-        while let Some(row) = result.next() {
+        for row in result {
             if !row.is_empty() {
                 ids.insert(ids.len(), row[0].to_string());
             }
@@ -355,11 +355,11 @@ impl DocStore {
 
     pub fn get_all_chunks(&self) -> Result<Vec<(String, String)>> {
         let conn = self.connection()?;
-        let mut result = conn
+        let result = conn
             .query("MATCH (c:Chunk) RETURN c.id, c.text")
             .map_err(|e| anyhow::anyhow!("query chunks: {e}"))?;
         let mut chunks = Vec::new();
-        while let Some(row) = result.next() {
+        for row in result {
             if row.len() >= 2 {
                 chunks.push((row[0].to_string(), row[1].to_string()));
             }
@@ -369,11 +369,11 @@ impl DocStore {
 
     pub fn get_chunk_ids(&self) -> Result<std::collections::HashSet<String>> {
         let conn = self.connection()?;
-        let mut result = conn
+        let result = conn
             .query("MATCH (c:Chunk) RETURN c.id")
             .map_err(|e| anyhow::anyhow!("query chunk ids: {e}"))?;
         let mut ids = std::collections::HashSet::new();
-        while let Some(row) = result.next() {
+        for row in result {
             if !row.is_empty() {
                 ids.insert(row[0].to_string());
             }
@@ -392,11 +392,11 @@ impl DocStore {
             "MATCH (c:Chunk) WHERE c.id IN [{}] RETURN c.id, c.doc_file, c.idx, c.heading, c.text, c.start_offset, c.end_offset, c.page",
             id_list
         );
-        let mut result = conn
+        let result = conn
             .query(&query)
             .map_err(|e| anyhow::anyhow!("chunk details: {e}"))?;
         let mut details = Vec::new();
-        while let Some(row) = result.next() {
+        for row in result {
             if row.len() >= 8 {
                 let heading_str = row[3].to_string();
                 let page_val: i64 = row[7].to_string().parse().unwrap_or(0);

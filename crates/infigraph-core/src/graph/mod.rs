@@ -3,6 +3,11 @@ mod queries;
 mod schema;
 mod session_store;
 pub mod store;
+pub(crate) mod store_util;
+mod store_write;
+mod store_bulk;
+mod store_parquet;
+mod store_bench;
 
 pub use queries::{
     ApiSymbol, CoverageRow, FileDeps, GraphQuery, HierarchyNode, ImpactRow, ReferenceRow,

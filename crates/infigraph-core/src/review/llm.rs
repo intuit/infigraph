@@ -223,7 +223,7 @@ fn collect_file_diffs(root: &Path, base_ref: &str) -> Result<HashMap<String, Str
             current_file.clear();
             current_diff.clear();
         } else if line.starts_with("+++ b/") {
-            current_file = line[6..].to_string();
+            current_file = line.strip_prefix("+++ b/").unwrap().to_string();
         }
         if !current_file.is_empty() {
             current_diff.push_str(line);
@@ -421,7 +421,7 @@ pub fn build_review_prompt(enriched: &EnrichedReport, context: Option<&str>) -> 
         enriched.enriched_symbols.iter().partition(|s| {
             !s.callers.is_empty()
                 || !s.callees.is_empty()
-                || s.complexity.map_or(false, |c| c >= 10)
+                || s.complexity.is_some_and(|c| c >= 10)
         });
     // Cap detailed symbols: prioritize by caller count + complexity
     let detail_cap = 100;
@@ -443,7 +443,7 @@ pub fn build_review_prompt(enriched: &EnrichedReport, context: Option<&str>) -> 
                 by_file.entry(s.file.as_str()).or_default().push(&s.name);
             }
             let mut sorted: Vec<_> = by_file.into_iter().collect();
-            sorted.sort_by(|a, b| b.1.len().cmp(&a.1.len()));
+            sorted.sort_by_key(|a| std::cmp::Reverse(a.1.len()));
             for (file, names) in sorted.iter().take(20) {
                 prompt.push_str(&format!("- `{}`: {} symbols\n", file, names.len()));
             }
@@ -587,7 +587,7 @@ pub fn build_review_prompt(enriched: &EnrichedReport, context: Option<&str>) -> 
                 by_file.entry(d.file.as_str()).or_default().push(&d.name);
             }
             let mut sorted: Vec<_> = by_file.into_iter().collect();
-            sorted.sort_by(|a, b| b.1.len().cmp(&a.1.len()));
+            sorted.sort_by_key(|a| std::cmp::Reverse(a.1.len()));
             for (file, names) in sorted.iter().take(20) {
                 prompt.push_str(&format!("  - `{}`: {} symbols", file, names.len()));
                 if names.len() <= 3 {

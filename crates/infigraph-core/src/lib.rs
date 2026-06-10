@@ -385,7 +385,7 @@ impl Infigraph {
 
         for result in walker {
             let entry = result?;
-            if entry.file_type().map_or(false, |ft| ft.is_file()) {
+            if entry.file_type().is_some_and(|ft| ft.is_file()) {
                 let path = entry.path();
                 if self.registry.for_file(&path.to_string_lossy()).is_some() {
                     files.push(path.to_path_buf());
