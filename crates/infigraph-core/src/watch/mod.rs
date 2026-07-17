@@ -495,12 +495,25 @@ fn should_ignore(path: &Path, ignore_dirs: &[&str]) -> bool {
     })
 }
 
+#[cfg(test)]
+static WATCH_REGISTRATION_COUNT: std::sync::atomic::AtomicUsize =
+    std::sync::atomic::AtomicUsize::new(0);
+
+#[cfg(test)]
+fn record_watch_registration() {
+    WATCH_REGISTRATION_COUNT.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+}
+
+#[cfg(not(test))]
+fn record_watch_registration() {}
+
 fn register_watch_dirs(
     watcher: &mut RecommendedWatcher,
     root: &Path,
     ignore_dirs: &[&str],
 ) -> Result<()> {
     watcher.watch(root, RecursiveMode::NonRecursive)?;
+    record_watch_registration();
     register_subdirs(watcher, root, ignore_dirs);
     Ok(())
 }
@@ -521,6 +534,34 @@ fn register_subdirs(watcher: &mut RecommendedWatcher, dir: &Path, ignore_dirs: &
             continue;
         }
         let _ = watcher.watch(&path, RecursiveMode::NonRecursive);
+        record_watch_registration();
         register_subdirs(watcher, &path, ignore_dirs);
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::sync::atomic::Ordering;
+
+    /// Regression test for issue #9 defect 2: watch registrations should
+    /// stay constant, not scale linearly with directory count.
+    #[test]
+    fn test_register_watch_dirs_scales_linearly_with_dir_count() {
+        WATCH_REGISTRATION_COUNT.store(0, Ordering::Relaxed);
+
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path();
+        for i in 0..20 {
+            std::fs::create_dir_all(root.join(format!("dir{i}"))).unwrap();
+        }
+
+        let (tx, _rx) = mpsc::channel();
+        let config = Config::default().with_poll_interval(Duration::from_millis(200));
+        let mut watcher = RecommendedWatcher::new(tx, config).unwrap();
+        register_watch_dirs(&mut watcher, root, &[]).unwrap();
+
+        let count = WATCH_REGISTRATION_COUNT.load(Ordering::Relaxed);
+        assert!(count < 5, "expected ~constant registrations, got {count} for 20 dirs");
     }
 }
