@@ -126,13 +126,14 @@ where
     let mut restart_count: u32 = 0;
 
     // Create initial watcher — factored into a closure for restart.
-    let create_watcher = |root: &Path| -> Result<(RecommendedWatcher, mpsc::Receiver<notify::Result<Event>>)> {
-        let (tx, rx) = mpsc::channel::<notify::Result<Event>>();
-        let config = Config::default().with_poll_interval(Duration::from_millis(debounce_ms));
-        let mut watcher = RecommendedWatcher::new(tx, config)?;
-        register_watch_dirs(&mut watcher, root)?;
-        Ok((watcher, rx))
-    };
+    let create_watcher =
+        |root: &Path| -> Result<(RecommendedWatcher, mpsc::Receiver<notify::Result<Event>>)> {
+            let (tx, rx) = mpsc::channel::<notify::Result<Event>>();
+            let config = Config::default().with_poll_interval(Duration::from_millis(debounce_ms));
+            let mut watcher = RecommendedWatcher::new(tx, config)?;
+            register_watch_dirs(&mut watcher, root)?;
+            Ok((watcher, rx))
+        };
 
     // Held for its Drop side effect (releases the OS watch on reassignment/scope
     // end during restart) — never read directly after creation.
