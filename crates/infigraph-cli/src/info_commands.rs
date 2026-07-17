@@ -488,7 +488,10 @@ pub(crate) fn cmd_index_docs(root: &Path) -> Result<()> {
         let chunk_refs: Vec<&infigraph_docs::chunk::Chunk> = result.new_chunks.iter().collect();
         let changed_refs: Vec<&str> = result.changed_files.iter().map(|s| s.as_str()).collect();
         let count = infigraph_docs::embed::update_doc_embeddings_remote(
-            store, &pg, &chunk_refs, &changed_refs,
+            store,
+            &pg,
+            &chunk_refs,
+            &changed_refs,
         )?;
         if count > 0 {
             println!("Saved {} doc embeddings to Postgres pgvector", count);
