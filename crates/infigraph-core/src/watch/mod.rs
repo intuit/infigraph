@@ -502,12 +502,25 @@ fn should_ignore(path: &Path, ignore_dirs: &[&str]) -> bool {
     })
 }
 
+#[cfg(test)]
+static WATCH_REGISTRATION_COUNT: std::sync::atomic::AtomicUsize =
+    std::sync::atomic::AtomicUsize::new(0);
+
+#[cfg(test)]
+fn record_watch_registration() {
+    WATCH_REGISTRATION_COUNT.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+}
+
+#[cfg(not(test))]
+fn record_watch_registration() {}
+
 fn register_watch_dirs(
     watcher: &mut RecommendedWatcher,
     root: &Path,
     ignore_dirs: &[&str],
 ) -> Result<()> {
     watcher.watch(root, RecursiveMode::NonRecursive)?;
+    record_watch_registration();
     register_subdirs(watcher, root, ignore_dirs);
     Ok(())
 }
@@ -528,6 +541,7 @@ fn register_subdirs(watcher: &mut RecommendedWatcher, dir: &Path, ignore_dirs: &
             continue;
         }
         let _ = watcher.watch(&path, RecursiveMode::NonRecursive);
+        record_watch_registration();
         register_subdirs(watcher, &path, ignore_dirs);
     }
 }
@@ -535,25 +549,33 @@ fn register_subdirs(watcher: &mut RecommendedWatcher, dir: &Path, ignore_dirs: &
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::sync::atomic::Ordering;
     use std::sync::Mutex;
 
-    /// Regression test for a macOS-specific bug: `watch_project_with_periodic`
-    /// used to compare raw filesystem-watch event paths against the caller's
-    /// `root` exactly as given. FSEvents delivers absolute, symlink-resolved
-    /// event paths, so a non-canonical `root` (e.g. a relative path, or one
-    /// that traverses a symlink) made `path.strip_prefix(root)` fail for
-    /// every event, silently dropping all changes with no error. This is the
-    /// same class of bug that made the `infigraph watch` CLI command — which
-    /// watched the unresolved `.` — appear to receive no events at all,
-    /// prompting a workaround (the kqueue backend) that caused a much larger
-    /// file-descriptor leak.
-    ///
-    /// A custom-prefixed `tempfile::TempDir` reproduces a non-canonical root
-    /// deterministically on macOS: it lives under `/var/folders/...`, itself
-    /// a symlink to `/private/var/folders/...`. (The default `TempDir::new()`
-    /// prefix starts with a dot, which the watcher's own hidden-file filter
-    /// would ignore regardless of this bug, so a custom prefix is used to
-    /// keep the test isolated to the canonicalization behavior.)
+    /// Regression test for issue #9 defect 2: watch registrations should
+    /// stay constant, not scale linearly with directory count.
+    #[test]
+    fn test_register_watch_dirs_scales_linearly_with_dir_count() {
+        WATCH_REGISTRATION_COUNT.store(0, Ordering::Relaxed);
+
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path();
+        for i in 0..20 {
+            std::fs::create_dir_all(root.join(format!("dir{i}"))).unwrap();
+        }
+
+        let (tx, _rx) = mpsc::channel();
+        let config = Config::default().with_poll_interval(Duration::from_millis(200));
+        let mut watcher = RecommendedWatcher::new(tx, config).unwrap();
+        register_watch_dirs(&mut watcher, root, &[]).unwrap();
+
+        let count = WATCH_REGISTRATION_COUNT.load(Ordering::Relaxed);
+        assert!(count < 5, "expected ~constant registrations, got {count} for 20 dirs");
+    }
+
+    /// Regression test: a non-canonical root (e.g. a relative path, or one
+    /// traversing a symlink like macOS's /var -> /private/var) must not
+    /// silently drop every watch event via a failed strip_prefix.
     #[test]
     #[cfg(target_os = "macos")]
     fn watch_project_detects_changes_through_symlinked_root() {
@@ -585,12 +607,9 @@ mod tests {
             )
         });
 
-        // Give the watcher time to register before triggering a change.
         std::thread::sleep(Duration::from_millis(300));
         std::fs::remove_file(&file_path).unwrap();
 
-        // Poll rather than a single fixed sleep: fast on a quiet machine,
-        // robust on a loaded one.
         let mut seen = false;
         for _ in 0..40 {
             std::thread::sleep(Duration::from_millis(100));
@@ -605,9 +624,7 @@ mod tests {
 
         assert!(
             seen,
-            "watch_project delivered no events for a change under a non-canonical \
-             (symlinked) root — the root.canonicalize() call in \
-             watch_project_with_periodic may have regressed"
+            "watch_project delivered no events for a change under a non-canonical (symlinked) root"
         );
     }
 }
