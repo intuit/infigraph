@@ -38,11 +38,56 @@ fn make_project(files: &[(&str, &str)]) -> (tempfile::TempDir, String) {
 
 fn stop_all_watchers() {
     let mut guard = get_watchers();
-    if let Some(map) = guard.as_mut() {
+    let stopped_paths: Vec<String> = if let Some(map) = guard.as_mut() {
         let ids: Vec<String> = map.keys().cloned().collect();
+        let mut paths = Vec::new();
         for id in ids {
             if let Some(entry) = map.remove(&id) {
+                paths.push(entry.path.clone());
                 let _ = entry.stop_tx.send(());
+            }
+        }
+        paths
+    } else {
+        Vec::new()
+    };
+    drop(guard);
+    wait_for_watch_locks_released(&stopped_paths);
+}
+
+/// A stopped watcher's thread notices `stop_rx` on its own poll cadence and
+/// may still be mid-reindex, so it doesn't release `.infigraph/watch.lock`
+/// the instant the stop signal is sent. Block (with a generous bound) until
+/// each path's lock is confirmed free, so tests that immediately re-watch
+/// the same project aren't racing the previous watcher's shutdown.
+fn wait_for_watch_locks_released(paths: &[String]) {
+    use fs2::FileExt;
+    for path in paths {
+        let lock_path = std::path::Path::new(path)
+            .join(".infigraph")
+            .join("watch.lock");
+        let deadline = Instant::now() + Duration::from_secs(5);
+        loop {
+            let file = match std::fs::OpenOptions::new()
+                .create(true)
+                .write(true)
+                .truncate(false)
+                .open(&lock_path)
+            {
+                Ok(f) => f,
+                Err(_) => break,
+            };
+            match file.try_lock_exclusive() {
+                Ok(()) => {
+                    let _ = file.unlock();
+                    break;
+                }
+                Err(_) => {
+                    if Instant::now() >= deadline {
+                        break;
+                    }
+                    std::thread::sleep(Duration::from_millis(20));
+                }
             }
         }
     }
