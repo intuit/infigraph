@@ -247,9 +247,7 @@ fn spawn_scip_child_process(root: &Path, detected_languages: &std::collections::
     };
 
     let _ = std::process::Command::new(exe)
-        .arg("scip-enrich")
-        .arg("--languages")
-        .arg(&langs)
+        .args(scip_enrich_args(&langs))
         .current_dir(root)
         .stdin(std::process::Stdio::null())
         .stdout(std::process::Stdio::null())
@@ -257,6 +255,14 @@ fn spawn_scip_child_process(root: &Path, detected_languages: &std::collections::
         .spawn();
 
     eprintln!("  Log: {}", log_path.display());
+}
+
+/// Args for respawning this binary as the hidden `scip-enrich` subcommand.
+/// `languages` is a positional argument on `Commands::ScipEnrich`, not a
+/// flag — extracted so tests can assert these parse under that definition
+/// without spawning a process.
+fn scip_enrich_args(langs: &str) -> Vec<String> {
+    vec!["scip-enrich".to_string(), langs.to_string()]
 }
 
 pub(crate) const CI_ENV_VARS: &[&str] = &[
@@ -874,6 +880,31 @@ mod tests {
     use super::*;
     use std::fs;
     use tempfile::TempDir;
+
+    /// Regression test: `spawn_scip_child_process` respawns this binary with
+    /// `scip_enrich_args(&langs)` as the argv tail. This previously hardcoded
+    /// `--languages <langs>`, but `Commands::ScipEnrich` declares `languages`
+    /// as a positional argument (no `#[arg(long)]`), so every respawned
+    /// child died instantly with a clap parse error and no SCIP indexer
+    /// (scip-typescript, scip-python, etc.) ever actually ran. Parsing the
+    /// exact args through the real `Cli` definition — rather than spawning a
+    /// process — catches any future mismatch between the two immediately.
+    #[test]
+    fn scip_enrich_args_parse_as_positional_language() {
+        use clap::Parser;
+
+        let langs = "typescript,python";
+        let mut argv = vec!["infigraph".to_string()];
+        argv.extend(scip_enrich_args(langs));
+
+        let cli = crate::Cli::try_parse_from(&argv)
+            .expect("scip_enrich_args must parse under the ScipEnrich clap definition");
+
+        assert!(
+            matches!(&cli.command, crate::Commands::ScipEnrich { languages } if languages == langs),
+            "expected Commands::ScipEnrich {{ languages: {langs:?} }}"
+        );
+    }
 
     #[test]
     fn ci_env_vars_list_complete() {
