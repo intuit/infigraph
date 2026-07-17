@@ -109,6 +109,7 @@ pub const MCP_ONLY_TOOLS: &[&str] = &[
     "index_confluence_pages", // programmatic — CLI has `index-confluence`
     "group_link_docs",        // cross-repo doc linking — runs as part of group_build
     "compress",               // agent-only — compress arbitrary text
+    "get_compression_stats",  // agent-only — no CLI equivalent
 ];
 
 pub const MCP_TOOL_NAMES: &[&str] = &[
@@ -202,6 +203,7 @@ pub const MCP_TOOL_NAMES: &[&str] = &[
     "memory_context",
     "consolidate_memory",
     "compress",
+    "get_compression_stats",
 ];
 
 pub fn allowed_tools_from_names() -> Vec<String> {
