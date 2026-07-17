@@ -555,7 +555,7 @@ mod tests {
     /// Regression test for issue #9 defect 2: watch registrations should
     /// stay constant, not scale linearly with directory count.
     #[test]
-    fn test_register_watch_dirs_scales_linearly_with_dir_count() {
+    fn test_register_watch_dirs_stays_constant_with_dir_count() {
         WATCH_REGISTRATION_COUNT.store(0, Ordering::Relaxed);
 
         let tmp = tempfile::tempdir().unwrap();
