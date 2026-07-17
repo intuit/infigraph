@@ -34,5 +34,8 @@ fn test_ui_worker_exits_after_stdin_closes() {
     }
     let _ = child.wait();
 
-    assert!(exited, "--ui worker did not exit within 5s of stdin closing");
+    assert!(
+        exited,
+        "--ui worker did not exit within 5s of stdin closing"
+    );
 }
