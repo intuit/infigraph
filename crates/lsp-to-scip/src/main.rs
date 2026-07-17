@@ -502,11 +502,10 @@ fn parse_symbol(v: &serde_json::Value) -> Option<LspSymbol> {
             .and_then(parse_range)
             .unwrap_or(range.clone());
         (range, sel)
-    } else if let Some(loc) = v.get("location") {
+    } else {
+        let loc = v.get("location")?;
         let range = parse_range(&loc["range"])?;
         (range.clone(), range)
-    } else {
-        return None;
     };
 
     Some(LspSymbol {
