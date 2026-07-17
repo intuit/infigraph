@@ -90,6 +90,13 @@ where
     MR: Fn() -> Result<crate::lang::LanguageRegistry> + Send + 'static,
     F: Fn(&crate::IndexResult) + Send + 'static,
 {
+    // Some watch backends (e.g. FSEvents on macOS) deliver absolute,
+    // symlink-resolved event paths regardless of how `root` was specified.
+    // If `root` is relative, or traverses a symlink (macOS temp dirs live
+    // under /var, itself a symlink to /private/var), `path.strip_prefix(root)`
+    // below silently fails for every event and all changes are dropped.
+    let root = &root.canonicalize().unwrap_or_else(|_| root.to_path_buf());
+
     let ignore_dirs: &[&str] = &[
         ".infigraph",
         ".git",
@@ -543,6 +550,7 @@ fn register_subdirs(watcher: &mut RecommendedWatcher, dir: &Path, ignore_dirs: &
 mod tests {
     use super::*;
     use std::sync::atomic::Ordering;
+    use std::sync::Mutex;
 
     /// Regression test for issue #9 defect 2: watch registrations should
     /// stay constant, not scale linearly with directory count.
@@ -563,5 +571,60 @@ mod tests {
 
         let count = WATCH_REGISTRATION_COUNT.load(Ordering::Relaxed);
         assert!(count < 5, "expected ~constant registrations, got {count} for 20 dirs");
+    }
+
+    /// Regression test: a non-canonical root (e.g. a relative path, or one
+    /// traversing a symlink like macOS's /var -> /private/var) must not
+    /// silently drop every watch event via a failed strip_prefix.
+    #[test]
+    #[cfg(target_os = "macos")]
+    fn watch_project_detects_changes_through_symlinked_root() {
+        let tmp = tempfile::Builder::new()
+            .prefix("infigraph-watch-test-")
+            .tempdir()
+            .unwrap();
+        let raw_root = tmp.path().to_path_buf();
+        let canonical_root = raw_root.canonicalize().unwrap();
+        assert_ne!(
+            raw_root, canonical_root,
+            "test assumption broken: TempDir root is already canonical on this machine"
+        );
+
+        let file_path = raw_root.join("watched.txt");
+        std::fs::write(&file_path, "v1").unwrap();
+
+        let events: Arc<Mutex<Vec<WatchEvent>>> = Arc::new(Mutex::new(Vec::new()));
+        let events_clone = Arc::clone(&events);
+        let (stop_tx, stop_rx) = mpsc::channel();
+
+        let handle = std::thread::spawn(move || {
+            watch_project(
+                &raw_root,
+                || Ok(crate::lang::LanguageRegistry::new()),
+                50,
+                stop_rx,
+                move |evt| events_clone.lock().unwrap().push(evt),
+            )
+        });
+
+        std::thread::sleep(Duration::from_millis(300));
+        std::fs::remove_file(&file_path).unwrap();
+
+        let mut seen = false;
+        for _ in 0..40 {
+            std::thread::sleep(Duration::from_millis(100));
+            if !events.lock().unwrap().is_empty() {
+                seen = true;
+                break;
+            }
+        }
+
+        let _ = stop_tx.send(());
+        let _ = handle.join();
+
+        assert!(
+            seen,
+            "watch_project delivered no events for a change under a non-canonical (symlinked) root"
+        );
     }
 }
