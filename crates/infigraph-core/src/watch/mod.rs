@@ -570,7 +570,10 @@ mod tests {
         register_watch_dirs(&mut watcher, root, &[]).unwrap();
 
         let count = WATCH_REGISTRATION_COUNT.load(Ordering::Relaxed);
-        assert!(count < 5, "expected ~constant registrations, got {count} for 20 dirs");
+        assert!(
+            count < 5,
+            "expected ~constant registrations, got {count} for 20 dirs"
+        );
     }
 
     /// Regression test: a non-canonical root (e.g. a relative path, or one
