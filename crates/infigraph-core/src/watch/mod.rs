@@ -126,18 +126,17 @@ where
     let mut restart_count: u32 = 0;
 
     // Create initial watcher — factored into a closure for restart.
-    let create_watcher =
-        |root: &Path,
-         ignore_dirs: &[&str]|
-         -> Result<(RecommendedWatcher, mpsc::Receiver<notify::Result<Event>>)> {
-            let (tx, rx) = mpsc::channel::<notify::Result<Event>>();
-            let config = Config::default().with_poll_interval(Duration::from_millis(debounce_ms));
-            let mut watcher = RecommendedWatcher::new(tx, config)?;
-            register_watch_dirs(&mut watcher, root, ignore_dirs)?;
-            Ok((watcher, rx))
-        };
+    let create_watcher = |root: &Path| -> Result<(RecommendedWatcher, mpsc::Receiver<notify::Result<Event>>)> {
+        let (tx, rx) = mpsc::channel::<notify::Result<Event>>();
+        let config = Config::default().with_poll_interval(Duration::from_millis(debounce_ms));
+        let mut watcher = RecommendedWatcher::new(tx, config)?;
+        register_watch_dirs(&mut watcher, root)?;
+        Ok((watcher, rx))
+    };
 
-    let (mut watcher, mut rx) = create_watcher(root, ignore_dirs)?;
+    // Held for its Drop side effect (releases the OS watch on reassignment/scope
+    // end during restart) — never read directly after creation.
+    let (mut _watcher, mut rx) = create_watcher(root)?;
 
     loop {
         if stop_rx.try_recv().is_ok() {
@@ -243,9 +242,7 @@ where
                             });
                         }
                         WatchEventKind::Created | WatchEventKind::Modified => {
-                            if path.is_dir() {
-                                register_subdirs(&mut watcher, &path, ignore_dirs);
-                            } else if filter_registry.for_file(&rel).is_some() {
+                            if !path.is_dir() && filter_registry.for_file(&rel).is_some() {
                                 batch.add(path);
                             }
                         }
@@ -274,9 +271,9 @@ where
                     backoff.as_secs()
                 );
                 std::thread::sleep(backoff);
-                match create_watcher(root, ignore_dirs) {
+                match create_watcher(root) {
                     Ok((new_watcher, new_rx)) => {
-                        watcher = new_watcher;
+                        _watcher = new_watcher;
                         rx = new_rx;
                         eprintln!("[watch] watcher restarted successfully");
                         on_event(WatchEvent {
@@ -514,36 +511,15 @@ fn record_watch_registration() {
 #[cfg(not(test))]
 fn record_watch_registration() {}
 
-fn register_watch_dirs(
-    watcher: &mut RecommendedWatcher,
-    root: &Path,
-    ignore_dirs: &[&str],
-) -> Result<()> {
-    watcher.watch(root, RecursiveMode::NonRecursive)?;
+/// Watches the whole tree under `root` with a single native recursive
+/// registration, instead of walking and registering every subdirectory
+/// individually — keeps watch-registration count (and FD usage) constant
+/// regardless of directory depth/count. Ignored directories are still
+/// excluded from processing via `should_ignore` at event time.
+fn register_watch_dirs(watcher: &mut RecommendedWatcher, root: &Path) -> Result<()> {
+    watcher.watch(root, RecursiveMode::Recursive)?;
     record_watch_registration();
-    register_subdirs(watcher, root, ignore_dirs);
     Ok(())
-}
-
-fn register_subdirs(watcher: &mut RecommendedWatcher, dir: &Path, ignore_dirs: &[&str]) {
-    let entries = match std::fs::read_dir(dir) {
-        Ok(e) => e,
-        Err(_) => return,
-    };
-    for entry in entries.flatten() {
-        let path = entry.path();
-        if !path.is_dir() {
-            continue;
-        }
-        let name = entry.file_name();
-        let name_str = name.to_string_lossy();
-        if ignore_dirs.contains(&name_str.as_ref()) || name_str.starts_with('.') {
-            continue;
-        }
-        let _ = watcher.watch(&path, RecursiveMode::NonRecursive);
-        record_watch_registration();
-        register_subdirs(watcher, &path, ignore_dirs);
-    }
 }
 
 #[cfg(test)]
@@ -552,10 +528,17 @@ mod tests {
     use std::sync::atomic::Ordering;
     use std::sync::Mutex;
 
-    /// Regression test for issue #9 defect 2: watch registrations should
-    /// stay constant, not scale linearly with directory count.
+    // Both tests in this module drive WATCH_REGISTRATION_COUNT (a shared
+    // static) through real watcher registration — serialize them so one
+    // test's reset/read doesn't race the other's increments.
+    static TEST_LOCK: Mutex<()> = Mutex::new(());
+
+    /// Regression test for issue #9 defect 2: a single recursive watch
+    /// covers the whole tree, so registration count stays at 1 regardless
+    /// of directory count.
     #[test]
     fn test_register_watch_dirs_stays_constant_with_dir_count() {
+        let _guard = TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         WATCH_REGISTRATION_COUNT.store(0, Ordering::Relaxed);
 
         let tmp = tempfile::tempdir().unwrap();
@@ -567,12 +550,12 @@ mod tests {
         let (tx, _rx) = mpsc::channel();
         let config = Config::default().with_poll_interval(Duration::from_millis(200));
         let mut watcher = RecommendedWatcher::new(tx, config).unwrap();
-        register_watch_dirs(&mut watcher, root, &[]).unwrap();
+        register_watch_dirs(&mut watcher, root).unwrap();
 
         let count = WATCH_REGISTRATION_COUNT.load(Ordering::Relaxed);
-        assert!(
-            count < 5,
-            "expected ~constant registrations, got {count} for 20 dirs"
+        assert_eq!(
+            count, 1,
+            "expected exactly 1 recursive registration regardless of directory count, got {count}"
         );
     }
 
@@ -582,6 +565,7 @@ mod tests {
     #[test]
     #[cfg(target_os = "macos")]
     fn watch_project_detects_changes_through_symlinked_root() {
+        let _guard = TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         let tmp = tempfile::Builder::new()
             .prefix("infigraph-watch-test-")
             .tempdir()
