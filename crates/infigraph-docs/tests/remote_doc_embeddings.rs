@@ -5,10 +5,10 @@
 
 #![cfg(feature = "remote")]
 
-use std::path::Path;
+use infigraph_core::meta::PostgresMetaStore;
 use infigraph_docs::chunk::Chunk;
 use infigraph_docs::store::DocStore;
-use infigraph_core::meta::PostgresMetaStore;
+use std::path::Path;
 
 fn connect_test_pg() -> Option<PostgresMetaStore> {
     let url = std::env::var("DATABASE_URL").unwrap_or_else(|_| {
@@ -71,9 +71,21 @@ fn test_doc_embeddings_remote_stores_to_pgvector() {
         page_count: None,
     };
     let chunks = vec![
-        make_chunk("test_doc.md::chunk_0", "test_doc.md", "First chunk about testing"),
-        make_chunk("test_doc.md::chunk_1", "test_doc.md", "Second chunk about embeddings"),
-        make_chunk("test_doc.md::chunk_2", "test_doc.md", "Third chunk about pgvector"),
+        make_chunk(
+            "test_doc.md::chunk_0",
+            "test_doc.md",
+            "First chunk about testing",
+        ),
+        make_chunk(
+            "test_doc.md::chunk_1",
+            "test_doc.md",
+            "Second chunk about embeddings",
+        ),
+        make_chunk(
+            "test_doc.md::chunk_2",
+            "test_doc.md",
+            "Third chunk about pgvector",
+        ),
     ];
     let doc_refs: Vec<&infigraph_docs::extract::ExtractedDoc> = vec![&doc];
     let chunk_refs: Vec<&Chunk> = chunks.iter().collect();
@@ -82,10 +94,9 @@ fn test_doc_embeddings_remote_stores_to_pgvector() {
     // Call remote embedding
     let empty_chunks: Vec<&Chunk> = vec![];
     let changed: Vec<&str> = vec!["test_doc.md"];
-    let count = infigraph_docs::embed::update_doc_embeddings_remote(
-        &store, &pg, &empty_chunks, &changed,
-    )
-    .unwrap();
+    let count =
+        infigraph_docs::embed::update_doc_embeddings_remote(&store, &pg, &empty_chunks, &changed)
+            .unwrap();
     assert!(count >= 3, "should embed at least 3 chunks, got {}", count);
 
     // Verify in pgvector
@@ -134,9 +145,11 @@ fn test_doc_embeddings_remote_incremental() {
         text: "Incremental test".into(),
         page_count: None,
     };
-    let chunks = vec![
-        make_chunk("incr_test.md::chunk_0", "incr_test.md", "Initial chunk"),
-    ];
+    let chunks = vec![make_chunk(
+        "incr_test.md::chunk_0",
+        "incr_test.md",
+        "Initial chunk",
+    )];
     let doc_refs = vec![&doc];
     let chunk_refs: Vec<&Chunk> = chunks.iter().collect();
     store.upsert_all_parquet(&doc_refs, &chunk_refs).unwrap();
@@ -144,21 +157,21 @@ fn test_doc_embeddings_remote_incremental() {
     // First run — embeds 1 chunk
     let empty: Vec<&Chunk> = vec![];
     let changed: Vec<&str> = vec!["incr_test.md"];
-    let count1 = infigraph_docs::embed::update_doc_embeddings_remote(
-        &store, &pg, &empty, &changed,
-    ).unwrap();
+    let count1 =
+        infigraph_docs::embed::update_doc_embeddings_remote(&store, &pg, &empty, &changed).unwrap();
     assert!(count1 >= 1);
 
     // Second run with no changes — should embed 0 new (already in pgvector)
     let no_changes: Vec<&str> = vec![];
-    let count2 = infigraph_docs::embed::update_doc_embeddings_remote(
-        &store, &pg, &empty, &no_changes,
-    ).unwrap();
+    let count2 =
+        infigraph_docs::embed::update_doc_embeddings_remote(&store, &pg, &empty, &no_changes)
+            .unwrap();
     // count2 includes existing count, but 0 new embeddings stored
     assert!(count2 >= 1);
 
     // Cleanup
-    pg.delete_embeddings(&["incr_test.md::chunk_0".to_string()]).unwrap();
+    pg.delete_embeddings(&["incr_test.md::chunk_0".to_string()])
+        .unwrap();
 }
 
 #[test]
@@ -174,7 +187,8 @@ fn test_doc_embeddings_remote_orphan_cleanup() {
 
     // Insert an orphan embedding directly
     let orphan_vec = vec![0.1f32; 256];
-    pg.upsert_embedding("orphan_doc.md::chunk_0", "doc_chunk", &orphan_vec).unwrap();
+    pg.upsert_embedding("orphan_doc.md::chunk_0", "doc_chunk", &orphan_vec)
+        .unwrap();
 
     let tmp = tempfile::tempdir().unwrap();
     let store = make_test_store(tmp.path());
@@ -182,9 +196,7 @@ fn test_doc_embeddings_remote_orphan_cleanup() {
 
     let empty: Vec<&Chunk> = vec![];
     let no_changes: Vec<&str> = vec![];
-    infigraph_docs::embed::update_doc_embeddings_remote(
-        &store, &pg, &empty, &no_changes,
-    ).unwrap();
+    infigraph_docs::embed::update_doc_embeddings_remote(&store, &pg, &empty, &no_changes).unwrap();
 
     // Orphan should be cleaned up
     let result = pg.get_embedding("orphan_doc.md::chunk_0").unwrap();

@@ -105,25 +105,23 @@ impl Infigraph {
             "neo4j" => {
                 anyhow::bail!("neo4j backend requested but binary compiled without `neo4j` feature")
             }
-            _ => {
-                match GraphStore::open(&self.db_path) {
-                    Ok(store) => {
-                        self.store = Some(store);
-                        Ok(())
-                    }
-                    Err(first_err) => {
-                        eprintln!(
-                            "[graph] open failed ({first_err}), wiping corrupt graph and rebuilding..."
-                        );
-                        Self::wipe_graph(&self.db_path);
-                        let store = GraphStore::open(&self.db_path).with_context(|| {
-                            format!("graph still unreadable after wipe (was: {first_err})")
-                        })?;
-                        self.store = Some(store);
-                        Ok(())
-                    }
+            _ => match GraphStore::open(&self.db_path) {
+                Ok(store) => {
+                    self.store = Some(store);
+                    Ok(())
                 }
-            }
+                Err(first_err) => {
+                    eprintln!(
+                        "[graph] open failed ({first_err}), wiping corrupt graph and rebuilding..."
+                    );
+                    Self::wipe_graph(&self.db_path);
+                    let store = GraphStore::open(&self.db_path).with_context(|| {
+                        format!("graph still unreadable after wipe (was: {first_err})")
+                    })?;
+                    self.store = Some(store);
+                    Ok(())
+                }
+            },
         }
     }
 

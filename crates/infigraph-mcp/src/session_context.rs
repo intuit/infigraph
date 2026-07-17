@@ -21,6 +21,14 @@ pub fn force_dedup_panic(enabled: bool) {
     FORCE_DEDUP_PANIC.with(|c| c.set(enabled));
 }
 
+/// Serializes tests across this crate that touch the shared `SESSION` static
+/// (or other process-global state like env vars / cwd) — `cargo test` runs
+/// tests in parallel threads within one binary by default, and this state
+/// isn't per-thread, so any test using it must hold this lock for its
+/// duration, not just the ones in this file.
+#[cfg(test)]
+pub(crate) static TEST_LOCK: Mutex<()> = Mutex::new(());
+
 #[derive(Debug, Default, Deserialize)]
 struct ConfigFile {
     #[serde(default)]
@@ -611,8 +619,6 @@ mod tests {
     use super::*;
     use serde_json::json;
     use std::sync::MutexGuard;
-
-    static TEST_LOCK: Mutex<()> = Mutex::new(());
 
     /// Isolates tests from the real repo / home config and dedup_state.json.
     struct TestEnv {

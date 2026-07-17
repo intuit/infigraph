@@ -1790,6 +1790,9 @@ mod tests {
 
     #[test]
     fn test_bypass_in_focus_symbol() {
+        let _guard = crate::session_context::TEST_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
         crate::session_context::reset_session();
         crate::session_context::record_tool_call("get_code_snippet", false);
         crate::session_context::record_focus(
@@ -1810,6 +1813,9 @@ mod tests {
 
     #[test]
     fn test_compress_pipeline_safe_recovers_from_panic() {
+        let _guard = crate::session_context::TEST_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
         crate::session_context::reset_session();
         let raw = "word ".repeat(200);
         force_compress_panic(true);
@@ -1825,6 +1831,9 @@ mod tests {
 
     #[test]
     fn test_compress_pipeline_safe_recovers_from_dedup_panic() {
+        let _guard = crate::session_context::TEST_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
         crate::session_context::reset_session();
         force_compress_panic(false);
         // Large enough to pass compress bypass / reach dedup
@@ -1845,6 +1854,9 @@ mod tests {
 
     #[test]
     fn test_focus_bypasses_compression_on_large_doc_context() {
+        let _guard = crate::session_context::TEST_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
         crate::session_context::reset_session();
         // Config Summary so compression would otherwise run
         let dir = tempfile::tempdir().unwrap();
@@ -1884,6 +1896,9 @@ mod tests {
 
     #[test]
     fn test_focus_also_skips_dedup_placeholder() {
+        let _guard = crate::session_context::TEST_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
         crate::session_context::reset_session();
         std::env::set_var("INFIGRAPH_DEDUP", "1");
         crate::session_context::record_tool_call("get_code_snippet", false);
@@ -1904,6 +1919,9 @@ mod tests {
 
     #[test]
     fn test_compress_pipeline_safe_normal_path() {
+        let _guard = crate::session_context::TEST_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
         crate::session_context::reset_session();
         force_compress_panic(false);
         crate::session_context::record_tool_call("search", false);

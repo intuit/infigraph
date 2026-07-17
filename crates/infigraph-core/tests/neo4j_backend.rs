@@ -62,12 +62,34 @@ fn fixture() -> Vec<FileExtraction> {
             language: "python".to_string(),
             content_hash: "aaa".to_string(),
             symbols: vec![
-                sym("src/main.py::main", "main", SymbolKind::Function, "src/main.py", 1, 10),
-                sym("src/main.py::helper", "helper", SymbolKind::Function, "src/main.py", 12, 20),
+                sym(
+                    "src/main.py::main",
+                    "main",
+                    SymbolKind::Function,
+                    "src/main.py",
+                    1,
+                    10,
+                ),
+                sym(
+                    "src/main.py::helper",
+                    "helper",
+                    SymbolKind::Function,
+                    "src/main.py",
+                    12,
+                    20,
+                ),
             ],
             relations: vec![
-                rel("src/main.py::main", "src/main.py::helper", RelationKind::Calls),
-                rel("src/main.py::main", "src/lib.py::process", RelationKind::Calls),
+                rel(
+                    "src/main.py::main",
+                    "src/main.py::helper",
+                    RelationKind::Calls,
+                ),
+                rel(
+                    "src/main.py::main",
+                    "src/lib.py::process",
+                    RelationKind::Calls,
+                ),
             ],
             statements: vec![],
         },
@@ -76,7 +98,12 @@ fn fixture() -> Vec<FileExtraction> {
             language: "python".to_string(),
             content_hash: "bbb".to_string(),
             symbols: vec![sym(
-                "src/lib.py::process", "process", SymbolKind::Function, "src/lib.py", 1, 15,
+                "src/lib.py::process",
+                "process",
+                SymbolKind::Function,
+                "src/lib.py",
+                1,
+                15,
             )],
             relations: vec![],
             statements: vec![],
@@ -91,12 +118,20 @@ fn fixture_namespaced(ns: &str) -> Vec<FileExtraction> {
         content_hash: "aaa".to_string(),
         symbols: vec![
             sym(
-                &format!("{ns}/src/main.py::main"), "main", SymbolKind::Function,
-                &format!("{ns}/src/main.py"), 1, 10,
+                &format!("{ns}/src/main.py::main"),
+                "main",
+                SymbolKind::Function,
+                &format!("{ns}/src/main.py"),
+                1,
+                10,
             ),
             sym(
-                &format!("{ns}/src/main.py::helper"), "helper", SymbolKind::Function,
-                &format!("{ns}/src/main.py"), 12, 20,
+                &format!("{ns}/src/main.py::helper"),
+                "helper",
+                SymbolKind::Function,
+                &format!("{ns}/src/main.py"),
+                12,
+                20,
             ),
         ],
         relations: vec![rel(
@@ -116,7 +151,9 @@ fn test_neo4j_upsert_bulk_and_stats() {
     let backend = connect();
     clear_graph(&backend);
 
-    backend.upsert_files_bulk(&fixture(), true).expect("bulk upsert");
+    backend
+        .upsert_files_bulk(&fixture(), true)
+        .expect("bulk upsert");
 
     let stats = backend.stats().expect("stats");
     assert_eq!(stats.symbols, 3, "expected 3 symbols");
@@ -143,7 +180,9 @@ fn test_neo4j_find_symbol_by_id() {
     clear_graph(&backend);
     backend.upsert_files_bulk(&fixture(), true).expect("bulk");
 
-    let sym = backend.find_symbol_by_id("src/lib.py::process").expect("query");
+    let sym = backend
+        .find_symbol_by_id("src/lib.py::process")
+        .expect("query");
     assert!(sym.is_some());
     let sym = sym.unwrap();
     assert_eq!(sym.name, "process");
@@ -186,13 +225,15 @@ fn test_neo4j_traversal_after_resolve() {
     let callees = backend.callees_of("src/main.py::main").expect("callees");
     assert!(
         callees.iter().any(|c| c.contains("helper")),
-        "main should call helper, got: {:?}", callees
+        "main should call helper, got: {:?}",
+        callees
     );
 
     let callers = backend.callers_of("src/main.py::helper").expect("callers");
     assert!(
         callers.iter().any(|c| c.contains("main")),
-        "helper should be called by main, got: {:?}", callers
+        "helper should be called by main, got: {:?}",
+        callers
     );
 }
 
@@ -216,14 +257,24 @@ fn test_neo4j_incremental_upsert() {
     clear_graph(&backend);
     let extractions = fixture();
 
-    backend.upsert_files_bulk(&extractions, true).expect("fresh");
+    backend
+        .upsert_files_bulk(&extractions, true)
+        .expect("fresh");
     let stats1 = backend.stats().expect("stats1");
 
-    backend.upsert_files_bulk(&extractions, false).expect("incremental");
+    backend
+        .upsert_files_bulk(&extractions, false)
+        .expect("incremental");
     let stats2 = backend.stats().expect("stats2");
 
-    assert_eq!(stats1.symbols, stats2.symbols, "symbol count same after re-upsert");
-    assert_eq!(stats1.files, stats2.files, "file count same after re-upsert");
+    assert_eq!(
+        stats1.symbols, stats2.symbols,
+        "symbol count same after re-upsert"
+    );
+    assert_eq!(
+        stats1.files, stats2.files,
+        "file count same after re-upsert"
+    );
 }
 
 #[test]
@@ -250,18 +301,26 @@ fn test_neo4j_namespace_isolation() {
     let repo_a = fixture_namespaced("repo-a");
     let repo_b = fixture_namespaced("repo-b");
 
-    backend.upsert_files_bulk(&repo_a, true).expect("upsert repo-a");
-    backend.upsert_files_bulk(&repo_b, false).expect("upsert repo-b");
+    backend
+        .upsert_files_bulk(&repo_a, true)
+        .expect("upsert repo-a");
+    backend
+        .upsert_files_bulk(&repo_b, false)
+        .expect("upsert repo-b");
 
     let stats = backend.stats().expect("stats");
     assert_eq!(stats.files, 2, "2 files — one per repo namespace");
     assert_eq!(stats.symbols, 4, "4 symbols — 2 per repo namespace");
 
     // Each namespace has its own symbols
-    let syms_a = backend.symbols_in_file("repo-a/src/main.py").expect("syms a");
+    let syms_a = backend
+        .symbols_in_file("repo-a/src/main.py")
+        .expect("syms a");
     assert_eq!(syms_a.len(), 2, "repo-a should have 2 symbols");
 
-    let syms_b = backend.symbols_in_file("repo-b/src/main.py").expect("syms b");
+    let syms_b = backend
+        .symbols_in_file("repo-b/src/main.py")
+        .expect("syms b");
     assert_eq!(syms_b.len(), 2, "repo-b should have 2 symbols");
 
     // Remove one namespace — other stays
@@ -288,7 +347,8 @@ fn test_neo4j_concurrent_upsert() {
             thread::spawn(move || {
                 let ns = format!("concurrent-repo-{i}");
                 let data = fixture_namespaced(&ns);
-                b.upsert_files_bulk(&data, i == 0).expect("concurrent upsert");
+                b.upsert_files_bulk(&data, i == 0)
+                    .expect("concurrent upsert");
             })
         })
         .collect();
@@ -299,5 +359,8 @@ fn test_neo4j_concurrent_upsert() {
 
     let stats = backend.stats().expect("stats");
     assert_eq!(stats.files, 4, "4 files from 4 concurrent repos");
-    assert_eq!(stats.symbols, 8, "8 symbols from 4 concurrent repos (2 each)");
+    assert_eq!(
+        stats.symbols, 8,
+        "8 symbols from 4 concurrent repos (2 each)"
+    );
 }

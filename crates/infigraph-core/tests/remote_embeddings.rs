@@ -102,7 +102,8 @@ fn test_bulk_delete_batching() {
     let embeddings: Vec<(String, Vec<f32>)> = (0..600)
         .map(|i| (format!("test::batch_del_{}", i), vec![0.5f32; 256]))
         .collect();
-    pg.upsert_embeddings_bulk(&embeddings, "test_batch_del").unwrap();
+    pg.upsert_embeddings_bulk(&embeddings, "test_batch_del")
+        .unwrap();
 
     let ids: Vec<String> = embeddings.iter().map(|(id, _)| id.clone()).collect();
     pg.delete_embeddings(&ids).unwrap();
@@ -185,13 +186,30 @@ fn test_kind_separation() {
     pg.upsert_embeddings_bulk(&sym, "symbol").unwrap();
     pg.upsert_embeddings_bulk(&doc, "doc_chunk").unwrap();
 
-    assert_eq!(pg.all_embeddings("symbol").unwrap().iter().filter(|(id, _)| id.starts_with("test::kind_")).count(), 1);
-    assert_eq!(pg.all_embeddings("doc_chunk").unwrap().iter().filter(|(id, _)| id.starts_with("test::kind_")).count(), 1);
+    assert_eq!(
+        pg.all_embeddings("symbol")
+            .unwrap()
+            .iter()
+            .filter(|(id, _)| id.starts_with("test::kind_"))
+            .count(),
+        1
+    );
+    assert_eq!(
+        pg.all_embeddings("doc_chunk")
+            .unwrap()
+            .iter()
+            .filter(|(id, _)| id.starts_with("test::kind_"))
+            .count(),
+        1
+    );
 
     // search_nearest respects kind
     let query = vec![0.1f32; 256];
     let results = pg.search_nearest(&query, "symbol", 10).unwrap();
-    assert!(results.iter().all(|(id, _)| !id.starts_with("test::kind_doc")));
+    assert!(results
+        .iter()
+        .all(|(id, _)| !id.starts_with("test::kind_doc")));
 
-    pg.delete_embeddings(&["test::kind_sym".into(), "test::kind_doc".into()]).unwrap();
+    pg.delete_embeddings(&["test::kind_sym".into(), "test::kind_doc".into()])
+        .unwrap();
 }
