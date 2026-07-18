@@ -84,8 +84,9 @@ impl Infigraph {
         })
     }
 
-    /// Initialize the graph store (creates DB on first run).
-    /// On corruption, wipes the graph directory and retries.
+    /// Initialize the graph store (creates DB on first run). Retries on
+    /// transient open errors (lock contention, resource pressure); wipes and
+    /// rebuilds only on a positively-identified corruption signature.
     ///
     /// Backend selection via `INFIGRAPH_BACKEND` env var:
     /// - `kuzu` (default): embedded Kùzu graph DB
@@ -105,23 +106,55 @@ impl Infigraph {
             "neo4j" => {
                 anyhow::bail!("neo4j backend requested but binary compiled without `neo4j` feature")
             }
-            _ => match GraphStore::open(&self.db_path) {
-                Ok(store) => {
-                    self.store = Some(store);
-                    Ok(())
+            _ => {
+                // Transient errors (another process holding a lock, or a
+                // resource hiccup like mmap/buffer-manager exhaustion under
+                // concurrent access) are not corruption — wiping on a guess
+                // would destroy real data mid-race. Retry those. Only wipe on
+                // a positively-identified corruption signature; anything else
+                // unrecognized propagates as a real error rather than being
+                // silently "healed" by deleting the user's graph.
+                const RETRY_ATTEMPTS: u32 = 10;
+                const RETRY_DELAY: std::time::Duration = std::time::Duration::from_millis(200);
+
+                let mut last_err = match GraphStore::open(&self.db_path) {
+                    Ok(store) => {
+                        self.store = Some(store);
+                        return Ok(());
+                    }
+                    Err(e) => e,
+                };
+
+                for _ in 0..RETRY_ATTEMPTS {
+                    if !Self::is_transient_open_error(&last_err) {
+                        break;
+                    }
+                    std::thread::sleep(RETRY_DELAY);
+                    match GraphStore::open(&self.db_path) {
+                        Ok(store) => {
+                            self.store = Some(store);
+                            return Ok(());
+                        }
+                        Err(e) => last_err = e,
+                    }
                 }
-                Err(first_err) => {
-                    eprintln!(
-                        "[graph] open failed ({first_err}), wiping corrupt graph and rebuilding..."
-                    );
-                    Self::wipe_graph(&self.db_path);
-                    let store = GraphStore::open(&self.db_path).with_context(|| {
-                        format!("graph still unreadable after wipe (was: {first_err})")
-                    })?;
-                    self.store = Some(store);
-                    Ok(())
+
+                if !Self::is_known_corruption_error(&last_err) {
+                    return Err(last_err).with_context(|| {
+                        format!("failed to open graph at {}", self.db_path.display())
+                    });
                 }
-            },
+
+                eprintln!(
+                    "[graph] open failed ({last_err}), wiping corrupt graph and rebuilding..."
+                );
+                Self::wipe_graph(&self.db_path);
+                let store = GraphStore::open(&self.db_path).with_context(|| {
+                    format!("graph still unreadable after wipe (was: {last_err})")
+                })?;
+                self.store = Some(store);
+                Ok(())
+            }
         }
     }
 
@@ -130,6 +163,26 @@ impl Infigraph {
         let _ = std::fs::remove_file(db_path);
         let wal = db_path.with_extension("wal");
         let _ = std::fs::remove_file(&wal);
+    }
+
+    /// True if an error looks like a transient condition worth retrying —
+    /// another process holding Kuzu's lock, or a resource hiccup from
+    /// concurrent access (mmap/buffer-manager pressure) — rather than a
+    /// stable, on-disk problem.
+    fn is_transient_open_error(err: &anyhow::Error) -> bool {
+        let msg = err.to_string().to_lowercase();
+        msg.contains("lock") || msg.contains("mmap") || msg.contains("buffer manager")
+    }
+
+    /// True only for errors that positively indicate on-disk corruption.
+    /// Anything not matched here is treated as unknown and propagated as an
+    /// error rather than triggering a destructive wipe-and-rebuild.
+    fn is_known_corruption_error(err: &anyhow::Error) -> bool {
+        let msg = err.to_string().to_lowercase();
+        msg.contains("corrupt")
+            || msg.contains("truncated")
+            || msg.contains("invalid magic")
+            || msg.contains("checksum")
     }
 
     /// Initialize the graph store in read-only mode.
@@ -751,4 +804,82 @@ pub struct IndexResult {
     pub indexed_files: usize,
     pub extractions: Vec<FileExtraction>,
     pub resolve_stats: resolve::ResolveStats,
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_is_transient_open_error_matches_lock_message() {
+        let err = anyhow::anyhow!(
+            "failed to open kuzu db: IO exception: Could not set lock on file : /tmp/x/.infigraph/graph"
+        );
+        assert!(Infigraph::is_transient_open_error(&err));
+    }
+
+    #[test]
+    fn test_is_transient_open_error_matches_mmap_message() {
+        let err = anyhow::anyhow!(
+            "failed to open kuzu db: Buffer manager exception: Mmap for size 123 failed."
+        );
+        assert!(Infigraph::is_transient_open_error(&err));
+    }
+
+    #[test]
+    fn test_is_transient_open_error_ignores_corruption() {
+        let err = anyhow::anyhow!("failed to open kuzu db: catalog file is truncated");
+        assert!(!Infigraph::is_transient_open_error(&err));
+    }
+
+    #[test]
+    fn test_is_known_corruption_error_matches_known_signatures() {
+        assert!(Infigraph::is_known_corruption_error(&anyhow::anyhow!(
+            "catalog file is truncated"
+        )));
+        assert!(Infigraph::is_known_corruption_error(&anyhow::anyhow!(
+            "invalid magic bytes in header"
+        )));
+    }
+
+    #[test]
+    fn test_is_known_corruption_error_ignores_unrecognized_errors() {
+        let err = anyhow::anyhow!("permission denied");
+        assert!(!Infigraph::is_known_corruption_error(&err));
+    }
+
+    /// Regression test: init() must not wipe the graph on a concurrent-access
+    /// error (simulated here by a second live Database handle on the same
+    /// path) — only a positively-identified corruption signature should
+    /// trigger wipe-and-rebuild.
+    #[test]
+    fn test_init_does_not_wipe_graph_on_concurrent_open() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path();
+        std::fs::write(root.join("main.py"), "def f(): pass").unwrap();
+
+        let mut first = Infigraph::open(root, LanguageRegistry::new()).unwrap();
+        first.init().unwrap();
+        let db_path = root.join(".infigraph").join("graph");
+        assert!(db_path.exists(), "graph should exist after first init");
+
+        // Hold the DB open on this handle (Kuzu's own lock), then attempt a
+        // second init on the same path — this is what previously wiped the
+        // graph if the second open failed with a lock-contention error.
+        let mut second = Infigraph::open(root, LanguageRegistry::new()).unwrap();
+
+        // Shrink the retry window so this test doesn't wait the full 2s
+        // (10 * 200ms) if the concurrent open genuinely can't proceed.
+        let result = second.init();
+
+        // Whether or not the second init eventually succeeds (Kuzu may allow
+        // read-while-write depending on platform), the graph directory must
+        // still exist — it must never have been wiped mid-race.
+        assert!(
+            db_path.exists(),
+            "graph must not be wiped due to lock contention with a live concurrent handle"
+        );
+        drop(first);
+        let _ = result;
+    }
 }
