@@ -63,6 +63,28 @@ pub struct DocStore {
 
 static DB_LOCK: Mutex<()> = Mutex::new(());
 
+/// A freshly-initialized Kuzu DB file is at least this large. A file well
+/// below this can't be a real database — most likely truncated/corrupt
+/// (e.g. torn write, disk full mid-write). Reject it before calling into
+/// Kuzu: a malformed header can make Kuzu's own parser read a bogus size
+/// field and request a huge allocation, which some allocators (observed on
+/// Linux) abort the whole process on (SIGABRT) rather than erroring —
+/// there's no Rust-level Result to catch after that happens.
+const MIN_PLAUSIBLE_DB_BYTES: u64 = 4096;
+
+fn reject_implausible_db_file(path: &Path) -> Result<()> {
+    if let Ok(meta) = std::fs::metadata(path) {
+        if meta.is_file() && meta.len() < MIN_PLAUSIBLE_DB_BYTES {
+            anyhow::bail!(
+                "file at {} is only {} bytes — too small to be a valid Kuzu database (expected at least {MIN_PLAUSIBLE_DB_BYTES})",
+                path.display(),
+                meta.len()
+            );
+        }
+    }
+    Ok(())
+}
+
 impl DocStore {
     pub fn open(path: &Path) -> Result<Self> {
         let guard = DB_LOCK
@@ -71,6 +93,7 @@ impl DocStore {
         if let Some(parent) = path.parent() {
             std::fs::create_dir_all(parent)?;
         }
+        reject_implausible_db_file(path)?;
         let db = Database::new(path, SystemConfig::default())
             .map_err(|e| anyhow::anyhow!("failed to open docs kuzu db: {e}"))?;
         let store = Self {
