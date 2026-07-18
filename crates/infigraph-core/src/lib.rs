@@ -866,20 +866,27 @@ mod tests {
         // Hold the DB open on this handle (Kuzu's own lock), then attempt a
         // second init on the same path — this is what previously wiped the
         // graph if the second open failed with a lock-contention error.
+        // Takes up to RETRY_ATTEMPTS * RETRY_DELAY (~2s) if the concurrent
+        // open can't succeed on this platform before it gives up and errors.
         let mut second = Infigraph::open(root, LanguageRegistry::new()).unwrap();
-
-        // Shrink the retry window so this test doesn't wait the full 2s
-        // (10 * 200ms) if the concurrent open genuinely can't proceed.
         let result = second.init();
 
-        // Whether or not the second init eventually succeeds (Kuzu may allow
-        // read-while-write depending on platform), the graph directory must
-        // still exist — it must never have been wiped mid-race.
+        // Whether the second init eventually succeeds (Kuzu may allow
+        // read-while-write depending on platform) or fails, the graph
+        // directory must still exist — it must never have been wiped
+        // mid-race. If it failed, that failure must be the propagated
+        // transient error, not a corruption-path outcome.
         assert!(
             db_path.exists(),
             "graph must not be wiped due to lock contention with a live concurrent handle"
         );
+        if let Err(e) = &result {
+            assert!(
+                Infigraph::is_transient_open_error(e)
+                    || e.to_string().contains("failed to open graph"),
+                "unexpected error shape from concurrent-open contention: {e}"
+            );
+        }
         drop(first);
-        let _ = result;
     }
 }
