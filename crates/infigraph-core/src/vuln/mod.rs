@@ -421,7 +421,7 @@ pub fn format_table(report: &VulnReport) -> String {
             truncate_str(&f.dep_name, 20),
             truncate_str(&f.dep_version, 12),
             truncate_str(&f.vuln_id, 18),
-            &f.severity,
+            f.severity,
             summary_truncated,
         ));
     }

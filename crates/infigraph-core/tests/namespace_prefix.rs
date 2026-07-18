@@ -120,8 +120,14 @@ fn test_namespace_file_hashes_isolated() {
     let hashes = backend.get_file_hashes().expect("hashes");
     assert!(hashes.contains_key("repo-x/src/main.py"));
     assert!(hashes.contains_key("repo-y/src/main.py"));
-    assert_eq!(hashes.get("repo-x/src/main.py").map(|s| s.as_str()), Some("hash_repo-x"));
-    assert_eq!(hashes.get("repo-y/src/main.py").map(|s| s.as_str()), Some("hash_repo-y"));
+    assert_eq!(
+        hashes.get("repo-x/src/main.py").map(|s| s.as_str()),
+        Some("hash_repo-x")
+    );
+    assert_eq!(
+        hashes.get("repo-y/src/main.py").map(|s| s.as_str()),
+        Some("hash_repo-y")
+    );
 }
 
 #[test]
@@ -138,7 +144,9 @@ fn test_namespace_remove_one_repo() {
 
     assert_eq!(backend.stats().expect("before").files, 2);
 
-    backend.remove_file("remove/src/main.py").expect("remove file");
+    backend
+        .remove_file("remove/src/main.py")
+        .expect("remove file");
 
     let stats = backend.stats().expect("after");
     assert_eq!(stats.files, 1);
@@ -148,7 +156,9 @@ fn test_namespace_remove_one_repo() {
     let syms = backend.symbols_in_file("keep/src/main.py").expect("query");
     assert_eq!(syms.len(), 2);
 
-    let syms = backend.symbols_in_file("remove/src/main.py").expect("query removed");
+    let syms = backend
+        .symbols_in_file("remove/src/main.py")
+        .expect("query removed");
     assert_eq!(syms.len(), 0);
 }
 

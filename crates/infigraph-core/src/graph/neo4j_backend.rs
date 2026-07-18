@@ -49,8 +49,7 @@ impl Neo4jBackend {
     pub fn connect_from_env() -> Result<Self> {
         let uri = std::env::var("NEO4J_URI").unwrap_or_else(|_| "127.0.0.1:7687".to_string());
         let user = std::env::var("NEO4J_USER").unwrap_or_else(|_| "neo4j".to_string());
-        let password =
-            std::env::var("NEO4J_PASSWORD").unwrap_or_else(|_| "infigraph".to_string());
+        let password = std::env::var("NEO4J_PASSWORD").unwrap_or_else(|_| "infigraph".to_string());
         Self::connect(&uri, &user, &password)
     }
 
@@ -149,23 +148,27 @@ impl Neo4jBackend {
 
     fn upsert_extraction(&self, ext: &FileExtraction) -> Result<()> {
         // File node
-        self.block_on(self.graph.run(
-            query("MERGE (f:File {id: $id}) SET f.language = $lang")
-                .param("id", ext.file.clone())
-                .param("lang", ext.language.clone()),
-        ))
+        self.block_on(
+            self.graph.run(
+                query("MERGE (f:File {id: $id}) SET f.language = $lang")
+                    .param("id", ext.file.clone())
+                    .param("lang", ext.language.clone()),
+            ),
+        )
         .map_err(|e| anyhow::anyhow!("upsert file failed: {e}"))?;
 
         // Module node
-        self.block_on(self.graph.run(
-            query(
-                "MERGE (m:Module {file: $file}) \
+        self.block_on(
+            self.graph.run(
+                query(
+                    "MERGE (m:Module {file: $file}) \
                  SET m.language = $lang, m.content_hash = $hash",
-            )
-            .param("file", ext.file.clone())
-            .param("lang", ext.language.clone())
-            .param("hash", ext.content_hash.clone()),
-        ))
+                )
+                .param("file", ext.file.clone())
+                .param("lang", ext.language.clone())
+                .param("hash", ext.content_hash.clone()),
+            ),
+        )
         .map_err(|e| anyhow::anyhow!("upsert module failed: {e}"))?;
 
         // Symbols in batches
@@ -187,7 +190,10 @@ impl Neo4jBackend {
                     m.insert("signature_hash".into(), s.signature_hash.clone());
                     m.insert("complexity".into(), s.complexity.to_string());
                     m.insert("language".into(), s.language.clone());
-                    m.insert("parameters".into(), s.parameters.clone().unwrap_or_default());
+                    m.insert(
+                        "parameters".into(),
+                        s.parameters.clone().unwrap_or_default(),
+                    );
                     m.insert(
                         "return_type".into(),
                         s.return_type.clone().unwrap_or_default(),
@@ -218,15 +224,17 @@ impl Neo4jBackend {
         if !ext.symbols.is_empty() {
             let sym_ids: Vec<String> = ext.symbols.iter().map(|s| s.id.clone()).collect();
             for chunk in sym_ids.chunks(BATCH_SIZE) {
-                self.block_on(self.graph.run(
-                    query(
-                        "UNWIND $ids AS sid \
+                self.block_on(
+                    self.graph.run(
+                        query(
+                            "UNWIND $ids AS sid \
                          MATCH (f:File {id: $file}), (s:Symbol {id: sid}) \
                          MERGE (f)-[:DEFINES]->(s)",
-                    )
-                    .param("file", ext.file.clone())
-                    .param("ids", chunk.to_vec()),
-                ))
+                        )
+                        .param("file", ext.file.clone())
+                        .param("ids", chunk.to_vec()),
+                    ),
+                )
                 .map_err(|e| anyhow::anyhow!("upsert DEFINES failed: {e}"))?;
             }
         }
@@ -281,14 +289,16 @@ impl Neo4jBackend {
                     m
                 })
                 .collect();
-            let _ = self.block_on(self.graph.run(
-                query(
-                    "UNWIND $batch AS p \
+            let _ = self.block_on(
+                self.graph.run(
+                    query(
+                        "UNWIND $batch AS p \
                      MATCH (a:Symbol {id: p.src}), (b:Symbol {id: p.tgt}) \
                      MERGE (a)-[:IMPORTS]->(b)",
-                )
-                .param("batch", pairs),
-            ));
+                    )
+                    .param("batch", pairs),
+                ),
+            );
         }
 
         // CALLS edges — both intra-file and cross-file (MATCH skips missing targets)
@@ -308,14 +318,16 @@ impl Neo4jBackend {
                     m
                 })
                 .collect();
-            let _ = self.block_on(self.graph.run(
-                query(
-                    "UNWIND $batch AS p \
+            let _ = self.block_on(
+                self.graph.run(
+                    query(
+                        "UNWIND $batch AS p \
                      MATCH (a:Symbol {id: p.src}), (b:Symbol {id: p.tgt}) \
                      MERGE (a)-[:CALLS]->(b)",
-                )
-                .param("batch", pairs),
-            ));
+                    )
+                    .param("batch", pairs),
+                ),
+            );
         }
 
         Ok(())
@@ -340,9 +352,12 @@ impl Neo4jBackend {
         // Create folder nodes
         let folder_list: Vec<String> = folders.into_iter().collect();
         for chunk in folder_list.chunks(BATCH_SIZE) {
-            self.block_on(self.graph.run(
-                query("UNWIND $folders AS f MERGE (d:Folder {id: f})").param("folders", chunk.to_vec()),
-            ))
+            self.block_on(
+                self.graph.run(
+                    query("UNWIND $folders AS f MERGE (d:Folder {id: f})")
+                        .param("folders", chunk.to_vec()),
+                ),
+            )
             .map_err(|e| anyhow::anyhow!("upsert folders failed: {e}"))?;
         }
 
@@ -357,14 +372,16 @@ impl Neo4jBackend {
                     m
                 })
                 .collect();
-            let _ = self.block_on(self.graph.run(
-                query(
-                    "UNWIND $batch AS p \
+            let _ = self.block_on(
+                self.graph.run(
+                    query(
+                        "UNWIND $batch AS p \
                      MATCH (d:Folder {id: p.parent}), (f:File {id: p.child}) \
                      MERGE (d)-[:CONTAINS]->(f)",
-                )
-                .param("batch", pairs),
-            ));
+                    )
+                    .param("batch", pairs),
+                ),
+            );
         }
 
         Ok(())
@@ -630,12 +647,7 @@ impl GraphBackend for Neo4jBackend {
         )?;
         Ok(rows
             .iter()
-            .filter_map(|r| {
-                Some((
-                    r.get::<String>("file").ok()?,
-                    r.get::<String>("name").ok()?,
-                ))
-            })
+            .filter_map(|r| Some((r.get::<String>("file").ok()?, r.get::<String>("name").ok()?)))
             .collect())
     }
 
@@ -688,9 +700,7 @@ impl GraphBackend for Neo4jBackend {
     }
 
     fn get_type_hierarchy(&self, id: &str, max_depth: u32) -> Result<TypeHierarchy> {
-        let root = self
-            .find_symbol_by_id(id)?
-            .context("symbol not found")?;
+        let root = self.find_symbol_by_id(id)?.context("symbol not found")?;
 
         let ancestor_rows = self.run_query(
             query(&format!(
@@ -804,8 +814,7 @@ impl GraphBackend for Neo4jBackend {
             .map(|r| {
                 // Neo4j rows are key-value; extract all values as strings
                 // This is a best-effort conversion for raw queries
-                let bolt_map: HashMap<String, String> =
-                    r.to().unwrap_or_default();
+                let bolt_map: HashMap<String, String> = r.to().unwrap_or_default();
                 bolt_map.into_values().collect()
             })
             .collect())
@@ -879,10 +888,7 @@ impl GraphBackend for Neo4jBackend {
              WHERE test.file CONTAINS 'test' AND NOT target.file CONTAINS 'test' \
              MERGE (target)<-[:TESTED_BY]-(test)",
         )?;
-        let count = self.count_query(
-            "MATCH ()-[r:TESTED_BY]->() RETURN count(r) AS c",
-            "c",
-        )?;
+        let count = self.count_query("MATCH ()-[r:TESTED_BY]->() RETURN count(r) AS c", "c")?;
         Ok(count as usize)
     }
 
@@ -905,10 +911,11 @@ impl GraphBackend for Neo4jBackend {
         let all_symbols = self.get_all_symbols()?;
         let mut symbol_map: HashMap<String, Vec<(String, String, String)>> = HashMap::new();
         for (name, id, file, kind) in &all_symbols {
-            symbol_map
-                .entry(name.clone())
-                .or_default()
-                .push((id.clone(), file.clone(), kind.clone()));
+            symbol_map.entry(name.clone()).or_default().push((
+                id.clone(),
+                file.clone(),
+                kind.clone(),
+            ));
         }
 
         let mut resolved = 0usize;
@@ -969,14 +976,16 @@ impl GraphBackend for Neo4jBackend {
                     m
                 })
                 .collect();
-            let _ = self.block_on(self.graph.run(
-                query(
-                    "UNWIND $batch AS p \
+            let _ = self.block_on(
+                self.graph.run(
+                    query(
+                        "UNWIND $batch AS p \
                      MATCH (a:Symbol {id: p.src}), (b:Symbol {id: p.tgt}) \
                      MERGE (a)-[:CALLS]->(b)",
-                )
-                .param("batch", batch),
-            ));
+                    )
+                    .param("batch", batch),
+                ),
+            );
         }
 
         // Resolve INHERITS edges
@@ -1001,14 +1010,16 @@ impl GraphBackend for Neo4jBackend {
                             m.insert("tgt".into(), best.0.clone());
                             m
                         }];
-                        let _ = self.block_on(self.graph.run(
-                            query(
-                                "UNWIND $batch AS p \
+                        let _ = self.block_on(
+                            self.graph.run(
+                                query(
+                                    "UNWIND $batch AS p \
                                  MATCH (a:Symbol {id: p.src}), (b:Symbol {id: p.tgt}) \
                                  MERGE (a)-[:INHERITS]->(b)",
-                            )
-                            .param("batch", batch),
-                        ));
+                                )
+                                .param("batch", batch),
+                            ),
+                        );
                         inherits_resolved += 1;
                     }
                 }

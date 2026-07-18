@@ -56,12 +56,35 @@ pub struct GraphStore {
     lock_path: PathBuf,
 }
 
+/// A freshly-initialized Kuzu DB file is at least this large. A file well
+/// below this can't be a real database — most likely truncated/corrupt
+/// (e.g. torn write, disk full mid-write). Reject it before calling into
+/// Kuzu: a malformed header can make Kuzu's own parser read a bogus size
+/// field and request a huge allocation, which some allocators (observed on
+/// Linux) abort the whole process on (SIGABRT) rather than erroring —
+/// there's no Rust-level Result to catch after that happens.
+const MIN_PLAUSIBLE_DB_BYTES: u64 = 4096;
+
+fn reject_implausible_db_file(path: &Path) -> Result<()> {
+    if let Ok(meta) = std::fs::metadata(path) {
+        if meta.is_file() && meta.len() < MIN_PLAUSIBLE_DB_BYTES {
+            anyhow::bail!(
+                "file at {} is truncated/corrupt: only {} bytes, expected at least {MIN_PLAUSIBLE_DB_BYTES} for a valid Kuzu database",
+                path.display(),
+                meta.len()
+            );
+        }
+    }
+    Ok(())
+}
+
 impl GraphStore {
     /// Open or create a Kuzu database at the given path.
     pub fn open(path: &Path) -> Result<Self> {
         if let Some(parent) = path.parent() {
             std::fs::create_dir_all(parent)?;
         }
+        reject_implausible_db_file(path)?;
         let lock_path = path.with_extension("lock");
         let db = Database::new(path, SystemConfig::default())
             .map_err(|e| anyhow::anyhow!("failed to open kuzu db: {e}"))?;
@@ -73,6 +96,7 @@ impl GraphStore {
     /// Open an existing Kuzu database in read-only mode.
     /// Safe for concurrent access while a watcher is writing.
     pub fn open_read_only(path: &Path) -> Result<Self> {
+        reject_implausible_db_file(path)?;
         let lock_path = path.with_extension("lock");
         let config = SystemConfig::default()
             .read_only(true)
@@ -259,4 +283,46 @@ fn count_query(conn: &Connection, query: &str) -> Result<u64> {
         }
     }
     Ok(0)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Regression test: opening a truncated/garbage file must return a
+    /// clean error, not crash the process. On Linux, handing a tiny
+    /// malformed file straight to Kuzu can make its parser read a bogus
+    /// size field from the garbage bytes and abort on an implausible
+    /// allocation request (observed: ~92GB) before any Rust Result exists
+    /// to catch it.
+    #[test]
+    fn test_open_rejects_truncated_file_without_crashing() {
+        let tmp = tempfile::tempdir().unwrap();
+        let path = tmp.path().join("corrupt.kuzu");
+        std::fs::write(&path, b"not a real kuzu database").unwrap();
+
+        match GraphStore::open(&path) {
+            Ok(_) => panic!("opening a truncated file should error, not succeed"),
+            Err(e) => {
+                let msg = e.to_string().to_lowercase();
+                assert!(
+                    msg.contains("truncated") || msg.contains("corrupt"),
+                    "error should be classifiable as corruption, got: {msg}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn test_open_read_only_rejects_truncated_file_without_crashing() {
+        let tmp = tempfile::tempdir().unwrap();
+        let path = tmp.path().join("corrupt.kuzu");
+        std::fs::write(&path, b"not a real kuzu database").unwrap();
+
+        let result = GraphStore::open_read_only(&path);
+        assert!(
+            result.is_err(),
+            "opening a truncated file read-only should error, not succeed"
+        );
+    }
 }

@@ -277,9 +277,15 @@ fn run() -> Result<()> {
             );
         }
         if !mcp_mode && !serve_mode {
-            loop {
-                std::thread::sleep(std::time::Duration::from_secs(3600));
+            // Not an MCP session — nothing to dispatch, but still block on
+            // stdin so this exits once its (supervising) parent goes away
+            // instead of running forever with no way to signal shutdown.
+            let mut discard = String::new();
+            while io::stdin().read_line(&mut discard).unwrap_or(0) > 0 {
+                discard.clear();
             }
+            mcp_log("INFO", "--ui: stdin closed, exiting");
+            return Ok(());
         }
     }
 
@@ -356,13 +362,6 @@ fn run() -> Result<()> {
     }
 
     mcp_log("INFO", "stdin loop exited");
-
-    // If UI mode is active, keep process alive after stdin EOF (web server still serving)
-    if ui_enabled {
-        loop {
-            std::thread::sleep(std::time::Duration::from_secs(3600));
-        }
-    }
 
     Ok(())
 }

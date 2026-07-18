@@ -127,17 +127,17 @@ where
 
     // Create initial watcher — factored into a closure for restart.
     let create_watcher =
-        |root: &Path,
-         ignore_dirs: &[&str]|
-         -> Result<(RecommendedWatcher, mpsc::Receiver<notify::Result<Event>>)> {
+        |root: &Path| -> Result<(RecommendedWatcher, mpsc::Receiver<notify::Result<Event>>)> {
             let (tx, rx) = mpsc::channel::<notify::Result<Event>>();
             let config = Config::default().with_poll_interval(Duration::from_millis(debounce_ms));
             let mut watcher = RecommendedWatcher::new(tx, config)?;
-            register_watch_dirs(&mut watcher, root, ignore_dirs)?;
+            register_watch_dirs(&mut watcher, root)?;
             Ok((watcher, rx))
         };
 
-    let (mut watcher, mut rx) = create_watcher(root, ignore_dirs)?;
+    // Held for its Drop side effect (releases the OS watch on reassignment/scope
+    // end during restart) — never read directly after creation.
+    let (mut _watcher, mut rx) = create_watcher(root)?;
 
     loop {
         if stop_rx.try_recv().is_ok() {
@@ -243,9 +243,7 @@ where
                             });
                         }
                         WatchEventKind::Created | WatchEventKind::Modified => {
-                            if path.is_dir() {
-                                register_subdirs(&mut watcher, &path, ignore_dirs);
-                            } else if filter_registry.for_file(&rel).is_some() {
+                            if !path.is_dir() && filter_registry.for_file(&rel).is_some() {
                                 batch.add(path);
                             }
                         }
@@ -274,9 +272,9 @@ where
                     backoff.as_secs()
                 );
                 std::thread::sleep(backoff);
-                match create_watcher(root, ignore_dirs) {
+                match create_watcher(root) {
                     Ok((new_watcher, new_rx)) => {
-                        watcher = new_watcher;
+                        _watcher = new_watcher;
                         rx = new_rx;
                         eprintln!("[watch] watcher restarted successfully");
                         on_event(WatchEvent {
@@ -502,61 +500,73 @@ fn should_ignore(path: &Path, ignore_dirs: &[&str]) -> bool {
     })
 }
 
-fn register_watch_dirs(
-    watcher: &mut RecommendedWatcher,
-    root: &Path,
-    ignore_dirs: &[&str],
-) -> Result<()> {
-    watcher.watch(root, RecursiveMode::NonRecursive)?;
-    register_subdirs(watcher, root, ignore_dirs);
-    Ok(())
+#[cfg(test)]
+static WATCH_REGISTRATION_COUNT: std::sync::atomic::AtomicUsize =
+    std::sync::atomic::AtomicUsize::new(0);
+
+#[cfg(test)]
+fn record_watch_registration() {
+    WATCH_REGISTRATION_COUNT.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
 }
 
-fn register_subdirs(watcher: &mut RecommendedWatcher, dir: &Path, ignore_dirs: &[&str]) {
-    let entries = match std::fs::read_dir(dir) {
-        Ok(e) => e,
-        Err(_) => return,
-    };
-    for entry in entries.flatten() {
-        let path = entry.path();
-        if !path.is_dir() {
-            continue;
-        }
-        let name = entry.file_name();
-        let name_str = name.to_string_lossy();
-        if ignore_dirs.contains(&name_str.as_ref()) || name_str.starts_with('.') {
-            continue;
-        }
-        let _ = watcher.watch(&path, RecursiveMode::NonRecursive);
-        register_subdirs(watcher, &path, ignore_dirs);
-    }
+#[cfg(not(test))]
+fn record_watch_registration() {}
+
+/// Watches the whole tree under `root` with a single native recursive
+/// registration, instead of walking and registering every subdirectory
+/// individually — keeps watch-registration count (and FD usage) constant
+/// regardless of directory depth/count. Ignored directories are still
+/// excluded from processing via `should_ignore` at event time.
+fn register_watch_dirs(watcher: &mut RecommendedWatcher, root: &Path) -> Result<()> {
+    watcher.watch(root, RecursiveMode::Recursive)?;
+    record_watch_registration();
+    Ok(())
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::sync::atomic::Ordering;
     use std::sync::Mutex;
 
-    /// Regression test for a macOS-specific bug: `watch_project_with_periodic`
-    /// used to compare raw filesystem-watch event paths against the caller's
-    /// `root` exactly as given. FSEvents delivers absolute, symlink-resolved
-    /// event paths, so a non-canonical `root` (e.g. a relative path, or one
-    /// that traverses a symlink) made `path.strip_prefix(root)` fail for
-    /// every event, silently dropping all changes with no error. This is the
-    /// same class of bug that made the `infigraph watch` CLI command — which
-    /// watched the unresolved `.` — appear to receive no events at all,
-    /// prompting a workaround (the kqueue backend) that caused a much larger
-    /// file-descriptor leak.
-    ///
-    /// A custom-prefixed `tempfile::TempDir` reproduces a non-canonical root
-    /// deterministically on macOS: it lives under `/var/folders/...`, itself
-    /// a symlink to `/private/var/folders/...`. (The default `TempDir::new()`
-    /// prefix starts with a dot, which the watcher's own hidden-file filter
-    /// would ignore regardless of this bug, so a custom prefix is used to
-    /// keep the test isolated to the canonicalization behavior.)
+    // Both tests in this module drive WATCH_REGISTRATION_COUNT (a shared
+    // static) through real watcher registration — serialize them so one
+    // test's reset/read doesn't race the other's increments.
+    static TEST_LOCK: Mutex<()> = Mutex::new(());
+
+    /// Regression test for issue #9 defect 2: a single recursive watch
+    /// covers the whole tree, so registration count stays at 1 regardless
+    /// of directory count.
+    #[test]
+    fn test_register_watch_dirs_stays_constant_with_dir_count() {
+        let _guard = TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        WATCH_REGISTRATION_COUNT.store(0, Ordering::Relaxed);
+
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path();
+        for i in 0..20 {
+            std::fs::create_dir_all(root.join(format!("dir{i}"))).unwrap();
+        }
+
+        let (tx, _rx) = mpsc::channel();
+        let config = Config::default().with_poll_interval(Duration::from_millis(200));
+        let mut watcher = RecommendedWatcher::new(tx, config).unwrap();
+        register_watch_dirs(&mut watcher, root).unwrap();
+
+        let count = WATCH_REGISTRATION_COUNT.load(Ordering::Relaxed);
+        assert_eq!(
+            count, 1,
+            "expected exactly 1 recursive registration regardless of directory count, got {count}"
+        );
+    }
+
+    /// Regression test: a non-canonical root (e.g. a relative path, or one
+    /// traversing a symlink like macOS's /var -> /private/var) must not
+    /// silently drop every watch event via a failed strip_prefix.
     #[test]
     #[cfg(target_os = "macos")]
     fn watch_project_detects_changes_through_symlinked_root() {
+        let _guard = TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         let tmp = tempfile::Builder::new()
             .prefix("infigraph-watch-test-")
             .tempdir()
@@ -585,12 +595,9 @@ mod tests {
             )
         });
 
-        // Give the watcher time to register before triggering a change.
         std::thread::sleep(Duration::from_millis(300));
         std::fs::remove_file(&file_path).unwrap();
 
-        // Poll rather than a single fixed sleep: fast on a quiet machine,
-        // robust on a loaded one.
         let mut seen = false;
         for _ in 0..40 {
             std::thread::sleep(Duration::from_millis(100));
@@ -605,9 +612,7 @@ mod tests {
 
         assert!(
             seen,
-            "watch_project delivered no events for a change under a non-canonical \
-             (symlinked) root — the root.canonicalize() call in \
-             watch_project_with_periodic may have regressed"
+            "watch_project delivered no events for a change under a non-canonical (symlinked) root"
         );
     }
 }

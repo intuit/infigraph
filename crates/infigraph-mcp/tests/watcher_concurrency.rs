@@ -34,14 +34,19 @@ fn make_project(files: &[(&str, &str)]) -> (tempfile::TempDir, String) {
 
 fn stop_all_watchers() {
     let mut guard = get_watchers();
-    if let Some(map) = guard.as_mut() {
+    let stopped_paths: Vec<String> = if let Some(map) = guard.as_mut() {
         let ids: Vec<String> = map.keys().cloned().collect();
+        let mut paths = Vec::new();
         for id in ids {
             if let Some(entry) = map.remove(&id) {
+                paths.push(entry.path.clone());
                 let _ = entry.stop_tx.send(());
             }
         }
-    }
+        paths
+    } else {
+        Vec::new()
+    };
     drop(guard);
     let mut doc_guard = get_doc_watchers();
     if let Some(map) = doc_guard.as_mut() {
@@ -49,6 +54,46 @@ fn stop_all_watchers() {
         for id in ids {
             if let Some(entry) = map.remove(&id) {
                 let _ = entry.stop_tx.send(());
+            }
+        }
+    }
+    drop(doc_guard);
+    wait_for_watch_locks_released(&stopped_paths);
+}
+
+/// A stopped watcher's thread notices `stop_rx` on its own poll cadence and
+/// may still be mid-reindex, so it doesn't release `.infigraph/watch.lock`
+/// the instant the stop signal is sent. Block (with a generous bound) until
+/// each path's lock is confirmed free, so tests that immediately re-watch
+/// the same project aren't racing the previous watcher's shutdown.
+fn wait_for_watch_locks_released(paths: &[String]) {
+    use fs2::FileExt;
+    for path in paths {
+        let lock_path = std::path::Path::new(path)
+            .join(".infigraph")
+            .join("watch.lock");
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        loop {
+            let file = match std::fs::OpenOptions::new()
+                .create(true)
+                .write(true)
+                .truncate(false)
+                .open(&lock_path)
+            {
+                Ok(f) => f,
+                Err(_) => break,
+            };
+            match file.try_lock_exclusive() {
+                Ok(()) => {
+                    let _ = file.unlock();
+                    break;
+                }
+                Err(_) => {
+                    if std::time::Instant::now() >= deadline {
+                        break;
+                    }
+                    std::thread::sleep(std::time::Duration::from_millis(20));
+                }
             }
         }
     }
@@ -402,6 +447,40 @@ fn test_mcp_starts_when_no_cli_lock() {
     assert!(
         result.is_some(),
         "should start when no CLI lock, got None for path: {path}"
+    );
+}
+
+/// Regression test: two `tool_watch_project` calls for the same path — as
+/// two different MCP worker processes would each make independently, with
+/// no shared in-process state — must not both succeed. Before this fix,
+/// `tool_watch_project` never acquired `.infigraph/watch.lock` itself (only
+/// `auto_start_watch`'s `cli_watcher_holds_lock` pre-check read it, and only
+/// to detect a CLI-held lock), so nothing gated a second MCP-started watcher
+/// on the same project — every worker built its own duplicate watcher set.
+/// Calling `tool_watch_project` directly here (bypassing `auto_start_watch`'s
+/// own in-process `is_watching` map, which would otherwise mask this) proves
+/// the dedup now comes from the lock itself, not from in-process state that
+/// a second worker process wouldn't share.
+#[test]
+fn test_second_watch_project_call_declines_when_already_watching() {
+    let _guard = WATCHER_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+    let _cleanup = WatcherCleanup;
+    stop_all_watchers();
+    init_watchers();
+    let (_dir, path) = make_project(&[("main.py", "def hello(): pass")]);
+
+    let first = tool_watch_project(&json!({"path": &path}));
+    assert!(first.is_ok(), "first watcher should start: {first:?}");
+
+    let second = tool_watch_project(&json!({"path": &path}));
+    assert!(
+        second.is_err(),
+        "a second watch_project call for an already-watched path must decline, not start a duplicate watcher"
+    );
+    let err = second.unwrap_err().to_string();
+    assert!(
+        err.contains("already running"),
+        "expected an 'already running' decline message, got: {err}"
     );
 }
 

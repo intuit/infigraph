@@ -12,8 +12,8 @@ use infigraph_core::meta::PostgresMetaStore;
 use infigraph_core::multi::{Contract, ContractKind, Group, Registry, RepoEntry};
 
 fn connect() -> PostgresMetaStore {
-    let store = PostgresMetaStore::connect_from_env()
-        .expect("Postgres connection — is Docker running?");
+    let store =
+        PostgresMetaStore::connect_from_env().expect("Postgres connection — is Docker running?");
     store.init_schema().expect("schema init");
     store
 }
@@ -99,7 +99,9 @@ fn test_postgres_upsert_repo() {
     // Update
     let mut updated = entry.clone();
     updated.symbol_count = 100;
-    store.upsert_repo("test-repo", &updated).expect("upsert update");
+    store
+        .upsert_repo("test-repo", &updated)
+        .expect("upsert update");
 
     let registry = store.load_registry().expect("load");
     assert_eq!(registry.repos["test-repo"].symbol_count, 100);
@@ -123,7 +125,9 @@ fn test_postgres_group_add_remove() {
     let store = connect();
 
     // Setup: repo + group must exist
-    store.upsert_repo("gr-repo", &sample_entry("gr-repo")).expect("repo");
+    store
+        .upsert_repo("gr-repo", &sample_entry("gr-repo"))
+        .expect("repo");
     store.create_group("gr-test").expect("group");
 
     store.group_add("gr-test", "gr-repo").expect("add");
@@ -149,22 +153,34 @@ fn test_postgres_file_hashes() {
     hashes.insert("src/main.py".to_string(), "abc123".to_string());
     hashes.insert("src/lib.py".to_string(), "def456".to_string());
 
-    store.upsert_file_hashes("hash-repo", &hashes).expect("upsert");
+    store
+        .upsert_file_hashes("hash-repo", &hashes)
+        .expect("upsert");
 
     let loaded = store.get_file_hashes("hash-repo").expect("load");
-    assert_eq!(loaded.get("src/main.py").map(|s| s.as_str()), Some("abc123"));
+    assert_eq!(
+        loaded.get("src/main.py").map(|s| s.as_str()),
+        Some("abc123")
+    );
     assert_eq!(loaded.get("src/lib.py").map(|s| s.as_str()), Some("def456"));
 
     // Update one
     let mut update = HashMap::new();
     update.insert("src/main.py".to_string(), "updated".to_string());
-    store.upsert_file_hashes("hash-repo", &update).expect("update");
+    store
+        .upsert_file_hashes("hash-repo", &update)
+        .expect("update");
 
     let loaded = store.get_file_hashes("hash-repo").expect("reload");
-    assert_eq!(loaded.get("src/main.py").map(|s| s.as_str()), Some("updated"));
+    assert_eq!(
+        loaded.get("src/main.py").map(|s| s.as_str()),
+        Some("updated")
+    );
 
     // Delete
-    store.delete_file_hashes("hash-repo", &["src/lib.py".to_string()]).expect("delete");
+    store
+        .delete_file_hashes("hash-repo", &["src/lib.py".to_string()])
+        .expect("delete");
     let loaded = store.get_file_hashes("hash-repo").expect("after delete");
     assert!(!loaded.contains_key("src/lib.py"));
 }
@@ -217,7 +233,9 @@ fn test_postgres_session_crud() {
 
     // Delete
     store.delete_session("test-session-001").expect("delete");
-    let loaded = store.load_session("test-session-001").expect("after delete");
+    let loaded = store
+        .load_session("test-session-001")
+        .expect("after delete");
     assert!(loaded.is_none());
 }
 
@@ -231,9 +249,13 @@ fn test_registry_load_save_postgres_mode() {
     let store = connect();
 
     // Pre-populate via direct store access
-    store.upsert_repo("env-test-repo", &sample_entry("env-test-repo")).expect("setup");
+    store
+        .upsert_repo("env-test-repo", &sample_entry("env-test-repo"))
+        .expect("setup");
     store.create_group("env-test-group").expect("setup group");
-    store.group_add("env-test-group", "env-test-repo").expect("setup add");
+    store
+        .group_add("env-test-group", "env-test-repo")
+        .expect("setup add");
 
     // Set env var and load via Registry::load()
     std::env::set_var("INFIGRAPH_BACKEND", "neo4j");

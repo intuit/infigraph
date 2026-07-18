@@ -450,10 +450,15 @@ pub fn tool_group_build(args: &Value) -> Result<String> {
             if let Some(store) = idx.store() {
                 let pg = infigraph_core::meta::PostgresMetaStore::connect_from_env()?;
                 pg.init_schema()?;
-                let chunk_refs: Vec<&infigraph_docs::chunk::Chunk> = result.new_chunks.iter().collect();
-                let changed_refs: Vec<&str> = result.changed_files.iter().map(|s| s.as_str()).collect();
+                let chunk_refs: Vec<&infigraph_docs::chunk::Chunk> =
+                    result.new_chunks.iter().collect();
+                let changed_refs: Vec<&str> =
+                    result.changed_files.iter().map(|s| s.as_str()).collect();
                 let _ = infigraph_docs::embed::update_doc_embeddings_remote(
-                    store, &pg, &chunk_refs, &changed_refs,
+                    store,
+                    &pg,
+                    &chunk_refs,
+                    &changed_refs,
                 )?;
             }
         }
@@ -462,7 +467,8 @@ pub fn tool_group_build(args: &Value) -> Result<String> {
     if is_remote {
         out.push_str(&format!(
             "Step 5/5 — Indexed docs for {} repos, {} BFS discoveries, embeddings in pgvector\n",
-            group.repos.len(), bfs_discovered
+            group.repos.len(),
+            bfs_discovered
         ));
     } else {
         let doc_stats = infigraph_docs::combined::build_combined_docs(&registry, group_name)?;
