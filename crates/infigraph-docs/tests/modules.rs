@@ -825,6 +825,7 @@ fn test_bfs_skips_symlinks() {
     let doc_root = repo.join("docs");
     let mut idx = DocIndex::open(&doc_root).unwrap();
     idx.init().unwrap();
+    #[allow(unused_variables)]
     let result = idx.index().unwrap();
 
     #[cfg(unix)]
