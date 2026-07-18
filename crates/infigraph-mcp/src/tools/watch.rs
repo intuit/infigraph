@@ -65,15 +65,19 @@ pub fn is_watching(path: &str) -> bool {
 }
 
 pub fn auto_start_watch(path: &str) -> Option<String> {
-    auto_start_watch_inner(path, false)
+    auto_start_watch_inner(path)
 }
 
+/// Same as `auto_start_watch` — kept as a distinct name for call sites that
+/// start a watcher as a side effect of another operation (indexing, search)
+/// rather than as the primary intent, but it must still respect the
+/// disabled-watchers guard like every other watcher-starting path.
 pub fn auto_start_watch_opportunistic(path: &str) -> Option<String> {
-    auto_start_watch_inner(path, true)
+    auto_start_watch_inner(path)
 }
 
-fn auto_start_watch_inner(path: &str, skip_disabled_check: bool) -> Option<String> {
-    if !skip_disabled_check && watchers_disabled() {
+fn auto_start_watch_inner(path: &str) -> Option<String> {
+    if watchers_disabled() {
         return None;
     }
     let root = std::path::PathBuf::from(path).canonicalize().ok()?;
