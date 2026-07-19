@@ -508,14 +508,47 @@ fn parse_range(range: &[i32], file: &str) -> Span {
     }
 }
 
+/// Extract the display name of the last descriptor in a SCIP symbol string.
+///
+/// SCIP symbols end with a chain of `<name><suffix>` descriptors (suffix is one
+/// of `.` term, `#` type, `/` namespace, `:` macro, or `(...)`.` method with an
+/// optional disambiguator) and the suffix is the literal last character, e.g.
+/// `rust-analyzer cargo sittir-core 0.0.0 is_allowed_node_key().` or `.../crate/`.
+/// The suffix must be stripped *before* looking for the name, otherwise it reads
+/// as trailing empty text.
 fn scip_sym_to_name(scip_sym: &str) -> String {
-    scip_sym
-        .rsplit_once('`')
-        .map(|(_, n)| n)
-        .or_else(|| scip_sym.rsplit(['#', '.', '/']).next())
-        .unwrap_or(scip_sym)
-        .trim_matches(|c| c == '(' || c == ')' || c == '`')
-        .to_string()
+    let mut s = scip_sym.trim_end();
+
+    // Strip a trailing method terminator, then its `(...)` disambiguator group.
+    if let Some(rest) = s.strip_suffix('.') {
+        s = rest;
+    }
+    if s.ends_with(')') {
+        if let Some(open) = s.rfind('(') {
+            s = &s[..open];
+        }
+    }
+
+    // Strip a single trailing suffix marker (type/namespace/macro/term).
+    let s = s.trim_end_matches(['#', '/', ':', '.']);
+
+    // Backtick-quoted descriptor name: `Name`
+    if let Some(rest) = s.strip_suffix('`') {
+        if let Some(start) = rest.rfind('`') {
+            return rest[start + 1..].to_string();
+        }
+    }
+
+    // Bare identifier: trailing run of alphanumeric/underscore characters.
+    let ident_start = s
+        .rfind(|c: char| !(c.is_alphanumeric() || c == '_'))
+        .map(|i| i + 1)
+        .unwrap_or(0);
+    if ident_start < s.len() {
+        s[ident_start..].to_string()
+    } else {
+        scip_sym.to_string()
+    }
 }
 
 fn scip_kind_to_prism(kind: &symbol_information::Kind) -> SymbolKind {
@@ -703,5 +736,39 @@ mod tests {
             .query("MATCH (a:Symbol)-[:INHERITS]->(b:Symbol) RETURN a.name, b.name")
             .unwrap();
         assert!(rows.into_iter().next().is_none());
+    }
+
+    #[test]
+    fn scip_sym_to_name_strips_trailing_suffix_markers() {
+        // Real rust-analyzer output: suffix char is the literal last byte.
+        assert_eq!(
+            scip_sym_to_name("rust-analyzer cargo sittir-core 0.0.0 crate/"),
+            "crate"
+        );
+        assert_eq!(
+            scip_sym_to_name("rust-analyzer cargo sittir-core 0.0.0 K_IDENTIFIER."),
+            "K_IDENTIFIER"
+        );
+        assert_eq!(
+            scip_sym_to_name("rust-analyzer cargo sittir-core 0.0.0 is_allowed_node_key()."),
+            "is_allowed_node_key"
+        );
+        assert_eq!(
+            scip_sym_to_name("rust-analyzer cargo sittir-core 0.0.0 SomeTrait#method()."),
+            "method"
+        );
+    }
+
+    #[test]
+    fn scip_sym_to_name_handles_backtick_quoted_descriptors() {
+        // Real scip-typescript output: file-path descriptors are backtick-quoted.
+        assert_eq!(
+            scip_sym_to_name("scip-typescript npm test 1.0.0 `test.ts`/Animal#"),
+            "Animal"
+        );
+        assert_eq!(
+            scip_sym_to_name("scip-python python test-pkg 1.0.0 `test`/Animal#"),
+            "Animal"
+        );
     }
 }
