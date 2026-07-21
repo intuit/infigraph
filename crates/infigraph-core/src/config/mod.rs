@@ -2,7 +2,7 @@ use anyhow::Result;
 use serde::Serialize;
 use std::path::Path;
 
-use crate::graph::GraphStore;
+use crate::graph::GraphBackend;
 
 #[derive(Debug, Clone, Serialize)]
 pub struct ConfigBinding {
@@ -100,13 +100,9 @@ static CONDITIONAL_PATTERNS: &[ConditionalPattern] = &[
     },
 ];
 
-pub fn detect_config_bindings(store: &GraphStore) -> Result<Vec<ConfigBinding>> {
-    let _lock = store.write_lock()?;
-    let conn = store.connection()?;
-
-    let result = conn
-        .query("MATCH (s:Symbol) WHERE s.docstring IS NOT NULL AND s.docstring <> '' RETURN s.id, s.docstring, s.file")
-        .map_err(|e| anyhow::anyhow!("query failed: {e}"))?;
+pub fn detect_config_bindings(backend: &dyn GraphBackend) -> Result<Vec<ConfigBinding>> {
+    let result = backend
+        .raw_query("MATCH (s:Symbol) WHERE s.docstring IS NOT NULL AND s.docstring <> '' RETURN s.id, s.docstring, s.file")?;
 
     let mut bindings = Vec::new();
 
@@ -138,7 +134,7 @@ pub fn detect_config_bindings(store: &GraphStore) -> Result<Vec<ConfigBinding>> 
     }
 
     if !bindings.is_empty() {
-        write_config_bindings(store, &bindings)?;
+        write_config_bindings(backend, &bindings)?;
     }
 
     Ok(bindings)
@@ -218,13 +214,8 @@ fn extract_profile(detail: &str, kind: &str) -> String {
     }
 }
 
-fn write_config_bindings(store: &GraphStore, bindings: &[ConfigBinding]) -> Result<()> {
-    let conn = store.connection()?;
-
-    conn.query("BEGIN TRANSACTION")
-        .map_err(|e| anyhow::anyhow!("begin txn: {e}"))?;
-
-    let _ = conn.query("MATCH (c:ConfigBinding) DETACH DELETE c");
+fn write_config_bindings(backend: &dyn GraphBackend, bindings: &[ConfigBinding]) -> Result<()> {
+    let _ = backend.raw_query("MATCH (c:ConfigBinding) DETACH DELETE c");
 
     for b in bindings {
         let id = format!("{}::{}::{}", b.symbol_id, b.kind, b.key);
@@ -236,16 +227,13 @@ fn write_config_bindings(store: &GraphStore, bindings: &[ConfigBinding]) -> Resu
         let src_esc = crate::escape_str(&b.source_file);
         let sym_esc = crate::escape_str(&b.symbol_id);
 
-        let _ = conn.query(&format!(
+        let _ = backend.raw_query(&format!(
             "CREATE (c:ConfigBinding {{id: '{id_esc}', kind: '{kind_esc}', key: '{key_esc}', value: '{val_esc}', `profile`: '{profile_esc}', source_file: '{src_esc}'}})"
         ));
-        let _ = conn.query(&format!(
+        let _ = backend.raw_query(&format!(
             "MATCH (s:Symbol), (c:ConfigBinding) WHERE s.id = '{sym_esc}' AND c.id = '{id_esc}' CREATE (s)-[:HAS_CONFIG]->(c)"
         ));
     }
-
-    conn.query("COMMIT")
-        .map_err(|e| anyhow::anyhow!("commit txn: {e}"))?;
 
     Ok(())
 }

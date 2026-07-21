@@ -8,8 +8,7 @@ use std::collections::HashMap;
 
 use anyhow::{Context, Result};
 
-use crate::graph::GraphQuery;
-use kuzu::Connection;
+use crate::graph::GraphBackend;
 
 /// Statistics returned after clustering.
 #[derive(Debug)]
@@ -50,11 +49,9 @@ impl std::fmt::Display for ClusterStats {
 /// 1. Queries all CALLS edges to build an undirected adjacency list.
 /// 2. Runs single-level Louvain (iterative modularity optimization).
 /// 3. Creates Cluster nodes and MEMBER_OF edges in the graph.
-pub fn detect_clusters(conn: &Connection) -> Result<ClusterStats> {
-    let gq = GraphQuery::new(conn);
-
+pub fn detect_clusters(backend: &dyn GraphBackend) -> Result<ClusterStats> {
     // Step 1: Fetch all CALLS edges as (source_id, target_id) pairs.
-    let edge_rows = gq.raw_query("MATCH (a:Symbol)-[:CALLS]->(b:Symbol) RETURN a.id, b.id")?;
+    let edge_rows = backend.raw_query("MATCH (a:Symbol)-[:CALLS]->(b:Symbol) RETURN a.id, b.id")?;
 
     // Build node index: map symbol ID -> dense integer index.
     let mut id_to_idx: HashMap<String, usize> = HashMap::new();
@@ -71,7 +68,7 @@ pub fn detect_clusters(conn: &Connection) -> Result<ClusterStats> {
     }
 
     // Also include isolated symbols (no CALLS edges) so they appear in their own clusters.
-    let all_symbols = gq.raw_query(
+    let all_symbols = backend.raw_query(
         "MATCH (s:Symbol) WHERE s.kind IN ['Function', 'Method', 'Class'] RETURN s.id",
     )?;
     for row in &all_symbols {
@@ -119,7 +116,7 @@ pub fn detect_clusters(conn: &Connection) -> Result<ClusterStats> {
     if total_weight == 0.0 {
         // No edges: each node is its own cluster.
         let assignments: Vec<usize> = (0..n).collect();
-        let stats = store_clusters(conn, &idx_to_id, &assignments, 0.0)?;
+        let stats = store_clusters(backend, &idx_to_id, &assignments, 0.0)?;
         return Ok(stats);
     }
 
@@ -204,7 +201,7 @@ pub fn detect_clusters(conn: &Connection) -> Result<ClusterStats> {
     let modularity = compute_modularity(&community, &edge_weight, &degree, m);
 
     // Step 3: Store results in the graph.
-    let stats = store_clusters(conn, &idx_to_id, &community, modularity)?;
+    let stats = store_clusters(backend, &idx_to_id, &community, modularity)?;
     Ok(stats)
 }
 
@@ -233,14 +230,13 @@ fn compute_modularity(
 /// Store cluster results into the graph: create Cluster nodes and MEMBER_OF edges.
 /// Clears any existing Cluster/MEMBER_OF data first.
 fn store_clusters(
-    conn: &Connection,
+    backend: &dyn GraphBackend,
     idx_to_id: &[String],
     community: &[usize],
     modularity: f64,
 ) -> Result<ClusterStats> {
-    // Clear existing cluster data.
-    let _ = conn.query("MATCH (s:Symbol)-[r:MEMBER_OF]->(c:Cluster) DELETE r");
-    let _ = conn.query("MATCH (c:Cluster) DELETE c");
+    let _ = backend.raw_query("MATCH (s:Symbol)-[r:MEMBER_OF]->(c:Cluster) DELETE r");
+    let _ = backend.raw_query("MATCH (c:Cluster) DELETE c");
 
     // Build community -> members map, renumbering communities to be contiguous.
     let mut comm_members: HashMap<usize, Vec<usize>> = HashMap::new();
@@ -279,7 +275,8 @@ fn store_clusters(
             escape(&cluster_name),
             escape(&description),
         );
-        conn.query(&create_cluster)
+        backend
+            .raw_query(&create_cluster)
             .with_context(|| format!("failed to create cluster node: {}", cluster_id))?;
 
         // Create MEMBER_OF edges.
@@ -290,7 +287,7 @@ fn store_clusters(
                 escape(sym_id),
                 escape(&cluster_id),
             );
-            let _ = conn.query(&create_edge);
+            let _ = backend.raw_query(&create_edge);
         }
 
         cluster_sizes.push(members.len());

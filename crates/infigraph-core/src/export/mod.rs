@@ -4,7 +4,7 @@ use std::io::Write;
 
 use anyhow::Result;
 
-use crate::graph::GraphQuery;
+use crate::graph::GraphBackend;
 
 /// Escape a string for use in a Cypher string literal (single-quoted).
 fn cypher_escape(s: &str) -> String {
@@ -36,12 +36,12 @@ fn json_escape(s: &str) -> String {
 /// CREATE (s:Symbol {id: '...', name: '...', kind: '...', ...});
 /// CREATE (s1)-[:CALLS]->(s2);
 /// ```
-pub fn export_cypher<W: Write>(gq: &GraphQuery, writer: &mut W) -> Result<()> {
+pub fn export_cypher<W: Write>(backend: &dyn GraphBackend, writer: &mut W) -> Result<()> {
     writeln!(writer, "// Infigraph graph export — Neo4j Cypher")?;
     writeln!(writer)?;
 
     // ── Module nodes ──
-    let modules = gq.raw_query("MATCH (m:Module) RETURN m.id, m.name, m.file, m.language")?;
+    let modules = backend.raw_query("MATCH (m:Module) RETURN m.id, m.name, m.file, m.language")?;
     writeln!(writer, "// Modules ({} nodes)", modules.len())?;
     for row in &modules {
         let id = cypher_escape(&row[0]);
@@ -56,7 +56,7 @@ pub fn export_cypher<W: Write>(gq: &GraphQuery, writer: &mut W) -> Result<()> {
     writeln!(writer)?;
 
     // ── Symbol nodes ──
-    let symbols = gq.raw_query(
+    let symbols = backend.raw_query(
         "MATCH (s:Symbol) RETURN s.id, s.name, s.kind, s.file, s.start_line, s.end_line, s.language, s.visibility, s.parent, s.docstring",
     )?;
     writeln!(writer, "// Symbols ({} nodes)", symbols.len())?;
@@ -80,7 +80,8 @@ pub fn export_cypher<W: Write>(gq: &GraphQuery, writer: &mut W) -> Result<()> {
 
     // ── Edges ──
     // CONTAINS (Module -> Symbol)
-    let contains = gq.raw_query("MATCH (m:Module)-[:CONTAINS]->(s:Symbol) RETURN m.id, s.id")?;
+    let contains =
+        backend.raw_query("MATCH (m:Module)-[:CONTAINS]->(s:Symbol) RETURN m.id, s.id")?;
     writeln!(writer, "// CONTAINS edges ({} edges)", contains.len())?;
     for row in &contains {
         let src = cypher_escape(&row[0]);
@@ -93,7 +94,7 @@ pub fn export_cypher<W: Write>(gq: &GraphQuery, writer: &mut W) -> Result<()> {
     writeln!(writer)?;
 
     // CALLS (Symbol -> Symbol)
-    let calls = gq.raw_query("MATCH (a:Symbol)-[:CALLS]->(b:Symbol) RETURN a.id, b.id")?;
+    let calls = backend.raw_query("MATCH (a:Symbol)-[:CALLS]->(b:Symbol) RETURN a.id, b.id")?;
     writeln!(writer, "// CALLS edges ({} edges)", calls.len())?;
     for row in &calls {
         let src = cypher_escape(&row[0]);
@@ -106,7 +107,8 @@ pub fn export_cypher<W: Write>(gq: &GraphQuery, writer: &mut W) -> Result<()> {
     writeln!(writer)?;
 
     // INHERITS (Symbol -> Symbol)
-    let inherits = gq.raw_query("MATCH (a:Symbol)-[:INHERITS]->(b:Symbol) RETURN a.id, b.id")?;
+    let inherits =
+        backend.raw_query("MATCH (a:Symbol)-[:INHERITS]->(b:Symbol) RETURN a.id, b.id")?;
     writeln!(writer, "// INHERITS edges ({} edges)", inherits.len())?;
     for row in &inherits {
         let src = cypher_escape(&row[0]);
@@ -119,7 +121,8 @@ pub fn export_cypher<W: Write>(gq: &GraphQuery, writer: &mut W) -> Result<()> {
     writeln!(writer)?;
 
     // TESTED_BY (Symbol -> Symbol)
-    let tested_by = gq.raw_query("MATCH (a:Symbol)-[:TESTED_BY]->(b:Symbol) RETURN a.id, b.id")?;
+    let tested_by =
+        backend.raw_query("MATCH (a:Symbol)-[:TESTED_BY]->(b:Symbol) RETURN a.id, b.id")?;
     writeln!(writer, "// TESTED_BY edges ({} edges)", tested_by.len())?;
     for row in &tested_by {
         let src = cypher_escape(&row[0]);
@@ -136,7 +139,7 @@ pub fn export_cypher<W: Write>(gq: &GraphQuery, writer: &mut W) -> Result<()> {
 /// Write GraphML XML format (compatible with Gephi/yEd).
 ///
 /// Includes all node properties as `<data>` elements with declared `<key>` definitions.
-pub fn export_graphml<W: Write>(gq: &GraphQuery, writer: &mut W) -> Result<()> {
+pub fn export_graphml<W: Write>(backend: &dyn GraphBackend, writer: &mut W) -> Result<()> {
     writeln!(writer, r#"<?xml version="1.0" encoding="UTF-8"?>"#)?;
     writeln!(
         writer,
@@ -196,7 +199,7 @@ pub fn export_graphml<W: Write>(gq: &GraphQuery, writer: &mut W) -> Result<()> {
     writeln!(writer, r#"  <graph id="infigraph" edgedefault="directed">"#)?;
 
     // ── Module nodes ──
-    let modules = gq.raw_query("MATCH (m:Module) RETURN m.id, m.name, m.file, m.language")?;
+    let modules = backend.raw_query("MATCH (m:Module) RETURN m.id, m.name, m.file, m.language")?;
     for row in &modules {
         let id = xml_escape(&row[0]);
         let name = xml_escape(&row[1]);
@@ -211,7 +214,7 @@ pub fn export_graphml<W: Write>(gq: &GraphQuery, writer: &mut W) -> Result<()> {
     }
 
     // ── Symbol nodes ──
-    let symbols = gq.raw_query(
+    let symbols = backend.raw_query(
         "MATCH (s:Symbol) RETURN s.id, s.name, s.kind, s.file, s.start_line, s.end_line, s.language, s.visibility, s.parent, s.docstring",
     )?;
     for row in &symbols {
@@ -257,7 +260,8 @@ pub fn export_graphml<W: Write>(gq: &GraphQuery, writer: &mut W) -> Result<()> {
     // ── Edges ──
     let mut edge_id: u64 = 0;
 
-    let contains = gq.raw_query("MATCH (m:Module)-[:CONTAINS]->(s:Symbol) RETURN m.id, s.id")?;
+    let contains =
+        backend.raw_query("MATCH (m:Module)-[:CONTAINS]->(s:Symbol) RETURN m.id, s.id")?;
     for row in &contains {
         let src = xml_escape(&row[0]);
         let dst = xml_escape(&row[1]);
@@ -268,7 +272,7 @@ pub fn export_graphml<W: Write>(gq: &GraphQuery, writer: &mut W) -> Result<()> {
         edge_id += 1;
     }
 
-    let calls = gq.raw_query("MATCH (a:Symbol)-[:CALLS]->(b:Symbol) RETURN a.id, b.id")?;
+    let calls = backend.raw_query("MATCH (a:Symbol)-[:CALLS]->(b:Symbol) RETURN a.id, b.id")?;
     for row in &calls {
         let src = xml_escape(&row[0]);
         let dst = xml_escape(&row[1]);
@@ -279,7 +283,8 @@ pub fn export_graphml<W: Write>(gq: &GraphQuery, writer: &mut W) -> Result<()> {
         edge_id += 1;
     }
 
-    let inherits = gq.raw_query("MATCH (a:Symbol)-[:INHERITS]->(b:Symbol) RETURN a.id, b.id")?;
+    let inherits =
+        backend.raw_query("MATCH (a:Symbol)-[:INHERITS]->(b:Symbol) RETURN a.id, b.id")?;
     for row in &inherits {
         let src = xml_escape(&row[0]);
         let dst = xml_escape(&row[1]);
@@ -290,7 +295,8 @@ pub fn export_graphml<W: Write>(gq: &GraphQuery, writer: &mut W) -> Result<()> {
         edge_id += 1;
     }
 
-    let tested_by = gq.raw_query("MATCH (a:Symbol)-[:TESTED_BY]->(b:Symbol) RETURN a.id, b.id")?;
+    let tested_by =
+        backend.raw_query("MATCH (a:Symbol)-[:TESTED_BY]->(b:Symbol) RETURN a.id, b.id")?;
     for row in &tested_by {
         let src = xml_escape(&row[0]);
         let dst = xml_escape(&row[1]);
@@ -311,18 +317,21 @@ pub fn export_graphml<W: Write>(gq: &GraphQuery, writer: &mut W) -> Result<()> {
 ///
 /// Each node has `id`, `type` (Module/Symbol), and all relevant properties.
 /// Each edge has `source`, `target`, and `label`.
-pub fn export_json<W: Write>(gq: &GraphQuery, writer: &mut W) -> Result<()> {
+pub fn export_json<W: Write>(backend: &dyn GraphBackend, writer: &mut W) -> Result<()> {
     // ── Collect nodes ──
-    let modules = gq.raw_query("MATCH (m:Module) RETURN m.id, m.name, m.file, m.language")?;
-    let symbols = gq.raw_query(
+    let modules = backend.raw_query("MATCH (m:Module) RETURN m.id, m.name, m.file, m.language")?;
+    let symbols = backend.raw_query(
         "MATCH (s:Symbol) RETURN s.id, s.name, s.kind, s.file, s.start_line, s.end_line, s.language, s.visibility, s.parent, s.docstring",
     )?;
 
     // ── Collect edges ──
-    let contains = gq.raw_query("MATCH (m:Module)-[:CONTAINS]->(s:Symbol) RETURN m.id, s.id")?;
-    let calls = gq.raw_query("MATCH (a:Symbol)-[:CALLS]->(b:Symbol) RETURN a.id, b.id")?;
-    let inherits = gq.raw_query("MATCH (a:Symbol)-[:INHERITS]->(b:Symbol) RETURN a.id, b.id")?;
-    let tested_by = gq.raw_query("MATCH (a:Symbol)-[:TESTED_BY]->(b:Symbol) RETURN a.id, b.id")?;
+    let contains =
+        backend.raw_query("MATCH (m:Module)-[:CONTAINS]->(s:Symbol) RETURN m.id, s.id")?;
+    let calls = backend.raw_query("MATCH (a:Symbol)-[:CALLS]->(b:Symbol) RETURN a.id, b.id")?;
+    let inherits =
+        backend.raw_query("MATCH (a:Symbol)-[:INHERITS]->(b:Symbol) RETURN a.id, b.id")?;
+    let tested_by =
+        backend.raw_query("MATCH (a:Symbol)-[:TESTED_BY]->(b:Symbol) RETURN a.id, b.id")?;
 
     // Build output using manual JSON to avoid adding serde_json as a dependency
     // (infigraph-core already has serde_json)

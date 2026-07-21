@@ -9,6 +9,13 @@ use infigraph_languages::bundled_registry;
 
 use super::watch::auto_start_watch_opportunistic as auto_start_watch;
 
+#[cfg(feature = "remote")]
+fn is_remote_mode() -> bool {
+    std::env::var("INFIGRAPH_BACKEND")
+        .map(|v| v == "neo4j")
+        .unwrap_or(false)
+}
+
 pub fn tool_group_list(_args: &Value) -> Result<String> {
     let registry = Registry::load()?;
 
@@ -45,11 +52,17 @@ pub fn tool_group_create(args: &Value) -> Result<String> {
         .get("name")
         .and_then(|n| n.as_str())
         .context("missing 'name' argument")?;
+    let org = args
+        .get("org")
+        .and_then(|o| o.as_str())
+        .map(|s| s.to_string())
+        .unwrap_or_else(infigraph_core::multi::default_org);
 
     let mut registry = Registry::load()?;
-    registry.create_group(name)?;
+    let key = infigraph_core::multi::qualified_group_name(&org, name);
+    registry.create_group_with_org(name, &org)?;
 
-    Ok(format!("Group '{}' created.", name))
+    Ok(format!("Group '{}' created.", key))
 }
 
 pub fn tool_group_add(args: &Value) -> Result<String> {
@@ -266,6 +279,15 @@ pub fn tool_group_link_docs(args: &Value) -> Result<String> {
         .and_then(|g| g.as_str())
         .context("missing 'group_name' argument")?;
 
+    #[cfg(feature = "remote")]
+    if is_remote_mode() {
+        return Ok(format!(
+            "Skipped combined doc store for group '{}' — in remote mode, \
+             docs are stored in shared Neo4j. Use search_docs or group_search_docs instead.",
+            group_name
+        ));
+    }
+
     let registry = Registry::load()?;
     let stats = infigraph_docs::combined::build_combined_docs(&registry, group_name)?;
 
@@ -294,6 +316,27 @@ pub fn tool_group_search(args: &Value) -> Result<String> {
     let limit = args.get("limit").and_then(|l| l.as_u64()).unwrap_or(20) as usize;
     let alpha = args.get("alpha").and_then(|a| a.as_f64()).unwrap_or(0.3) as f32;
     let deep = args.get("deep").and_then(|d| d.as_bool()).unwrap_or(false);
+
+    #[cfg(feature = "remote")]
+    if is_remote_mode() {
+        let registry = Registry::load()?;
+        let group = registry
+            .groups
+            .get(group_name)
+            .context(format!("group '{}' not found", group_name))?;
+        let first_repo = group
+            .repos
+            .first()
+            .and_then(|r| registry.repos.get(r))
+            .context("group has no repos")?;
+        let search_args = serde_json::json!({
+            "path": first_repo.path.to_string_lossy(),
+            "query": query,
+            "limit": limit,
+            "alpha": alpha,
+        });
+        return super::search::tool_search(&search_args);
+    }
 
     if deep {
         return combined::combined_search_deep(group_name, query, limit, alpha);
@@ -336,6 +379,26 @@ pub fn tool_group_search_docs(args: &Value) -> Result<String> {
         .context("missing 'query' argument")?;
     let limit = args.get("limit").and_then(|l| l.as_u64()).unwrap_or(10) as usize;
     let alpha = args.get("alpha").and_then(|a| a.as_f64()).unwrap_or(0.5) as f32;
+
+    #[cfg(feature = "remote")]
+    if is_remote_mode() {
+        let registry = Registry::load()?;
+        let group = registry
+            .groups
+            .get(group_name)
+            .context(format!("group '{}' not found", group_name))?;
+        let first_repo = group
+            .repos
+            .first()
+            .and_then(|r| registry.repos.get(r))
+            .context("group has no repos")?;
+        let search_args = serde_json::json!({
+            "path": first_repo.path.to_string_lossy(),
+            "query": query,
+            "limit": limit,
+        });
+        return super::docs::tool_search_docs(&search_args);
+    }
 
     let results = infigraph_docs::combined::combined_doc_search(group_name, query, limit, alpha)?;
     if results.is_empty() {
@@ -448,7 +511,7 @@ pub fn tool_group_build(args: &Value) -> Result<String> {
         #[cfg(feature = "remote")]
         if is_remote {
             if let Some(store) = idx.store() {
-                let pg = infigraph_core::meta::PostgresMetaStore::connect_from_env()?;
+                let pg = infigraph_core::meta::PostgresMetaStore::connect_from_env_cached()?;
                 pg.init_schema()?;
                 let chunk_refs: Vec<&infigraph_docs::chunk::Chunk> =
                     result.new_chunks.iter().collect();
@@ -485,13 +548,15 @@ pub fn tool_group_build(args: &Value) -> Result<String> {
         ));
     }
 
-    // Start watchers + CLAUDE.md
-    if let Some(group) = registry.groups.get(group_name) {
-        for repo_name in &group.repos {
-            if let Some(entry) = registry.repos.get(repo_name) {
-                let p = entry.path.to_string_lossy();
-                auto_start_watch(&p);
-                let _ = infigraph_core::claude_md::ensure_project_claude_md(&entry.path);
+    // Start watchers + CLAUDE.md (skip watchers in remote mode — reindex via webhooks)
+    if !is_remote {
+        if let Some(group) = registry.groups.get(group_name) {
+            for repo_name in &group.repos {
+                if let Some(entry) = registry.repos.get(repo_name) {
+                    let p = entry.path.to_string_lossy();
+                    auto_start_watch(&p);
+                    let _ = infigraph_core::claude_md::ensure_project_claude_md(&entry.path);
+                }
             }
         }
     }

@@ -26,10 +26,19 @@ pdf_oxide = "0.3"
 calamine = "0.35"
 zip = "2"
 quick-xml = "0.37"
-notify = { version = "6", features = ["macos_kqueue"] }
+notify = "6"
 chrono = "0.4.45"
 fs2 = "0.4.3"
 
+[dependencies.neo4rs]
+version = "0.8"
+optional = true
+
+[dependencies.tokio]
+version = "1"
+features = ["rt-multi-thread"]
+optional = true
+
 [features]
 default = []
-remote = ["infigraph-core/remote"]
+remote = ["infigraph-core/remote", "neo4rs", "tokio"]

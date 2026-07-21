@@ -2,7 +2,7 @@ use std::path::Path;
 
 use anyhow::{Context, Result};
 
-use crate::graph::GraphQuery;
+use crate::graph::GraphBackend;
 
 /// Node data for the visualization.
 struct VizNode {
@@ -26,9 +26,9 @@ struct VizEdge {
 /// The HTML uses vis.js loaded from a CDN. Nodes are colored by kind, edges by relationship type.
 /// Features a left sidebar with search, filters, and file tree; a right panel with node details
 /// including callers/callees; and professional dark-themed styling.
-pub fn generate_html(gq: &GraphQuery, output_path: &Path) -> Result<String> {
-    let nodes = query_nodes(gq)?;
-    let edges = query_edges(gq)?;
+pub fn generate_html(backend: &dyn GraphBackend, output_path: &Path) -> Result<String> {
+    let nodes = query_nodes(backend)?;
+    let edges = query_edges(backend)?;
 
     let nodes_json = build_nodes_json(&nodes);
     let edges_json = build_edges_json(&edges);
@@ -51,12 +51,12 @@ pub fn generate_html(gq: &GraphQuery, output_path: &Path) -> Result<String> {
 /// Traverses `depth` hops of CALLS/INHERITS/CONTAINS edges in both directions,
 /// collecting only the reachable nodes and edges. The root symbol is highlighted.
 pub fn generate_symbol_html(
-    gq: &GraphQuery,
+    backend: &dyn GraphBackend,
     symbol_id: &str,
     depth: u32,
     output_path: &Path,
 ) -> Result<String> {
-    let (nodes, edges) = query_symbol_subgraph(gq, symbol_id, depth)?;
+    let (nodes, edges) = query_symbol_subgraph(backend, symbol_id, depth)?;
 
     if nodes.is_empty() {
         anyhow::bail!("symbol not found: {symbol_id}");
@@ -78,8 +78,8 @@ pub fn generate_symbol_html(
     Ok(output_path.to_string_lossy().to_string())
 }
 
-fn query_nodes(gq: &GraphQuery) -> Result<Vec<VizNode>> {
-    let rows = gq.raw_query(
+fn query_nodes(backend: &dyn GraphBackend) -> Result<Vec<VizNode>> {
+    let rows = backend.raw_query(
         "MATCH (s:Symbol) RETURN s.id, s.name, s.kind, s.file, s.start_line, s.end_line",
     )?;
 
@@ -99,11 +99,11 @@ fn query_nodes(gq: &GraphQuery) -> Result<Vec<VizNode>> {
     Ok(nodes)
 }
 
-fn query_edges(gq: &GraphQuery) -> Result<Vec<VizEdge>> {
+fn query_edges(backend: &dyn GraphBackend) -> Result<Vec<VizEdge>> {
     let mut edges = Vec::new();
 
     // CALLS edges
-    let call_rows = gq.raw_query("MATCH (a:Symbol)-[:CALLS]->(b:Symbol) RETURN a.id, b.id")?;
+    let call_rows = backend.raw_query("MATCH (a:Symbol)-[:CALLS]->(b:Symbol) RETURN a.id, b.id")?;
     for row in &call_rows {
         if row.len() >= 2 {
             edges.push(VizEdge {
@@ -116,7 +116,7 @@ fn query_edges(gq: &GraphQuery) -> Result<Vec<VizEdge>> {
 
     // INHERITS edges
     let inherit_rows =
-        gq.raw_query("MATCH (a:Symbol)-[:INHERITS]->(b:Symbol) RETURN a.id, b.id")?;
+        backend.raw_query("MATCH (a:Symbol)-[:INHERITS]->(b:Symbol) RETURN a.id, b.id")?;
     for row in &inherit_rows {
         if row.len() >= 2 {
             edges.push(VizEdge {
@@ -129,7 +129,7 @@ fn query_edges(gq: &GraphQuery) -> Result<Vec<VizEdge>> {
 
     // CONTAINS edges (Module -> Symbol)
     let contains_rows =
-        gq.raw_query("MATCH (m:Module)-[:CONTAINS]->(s:Symbol) RETURN m.id, s.id")?;
+        backend.raw_query("MATCH (m:Module)-[:CONTAINS]->(s:Symbol) RETURN m.id, s.id")?;
     for row in &contains_rows {
         if row.len() >= 2 {
             edges.push(VizEdge {
@@ -146,7 +146,7 @@ fn query_edges(gq: &GraphQuery) -> Result<Vec<VizEdge>> {
 /// BFS from `symbol_id` up to `depth` hops, following CALLS/INHERITS in both directions
 /// and CONTAINS outward. Returns only reachable nodes + edges between them.
 fn query_symbol_subgraph(
-    gq: &GraphQuery,
+    backend: &dyn GraphBackend,
     symbol_id: &str,
     depth: u32,
 ) -> Result<(Vec<VizNode>, Vec<VizEdge>)> {
@@ -165,7 +165,7 @@ fn query_symbol_subgraph(
 
         // Outgoing CALLS
         let q = format!("MATCH (a:Symbol)-[:CALLS]->(b:Symbol) WHERE a.id = '{esc}' RETURN b.id");
-        if let Ok(rows) = gq.raw_query(&q) {
+        if let Ok(rows) = backend.raw_query(&q) {
             for row in &rows {
                 if let Some(nid) = row.first() {
                     if visited.insert(nid.clone()) {
@@ -176,7 +176,7 @@ fn query_symbol_subgraph(
         }
         // Incoming CALLS (callers)
         let q = format!("MATCH (a:Symbol)-[:CALLS]->(b:Symbol) WHERE b.id = '{esc}' RETURN a.id");
-        if let Ok(rows) = gq.raw_query(&q) {
+        if let Ok(rows) = backend.raw_query(&q) {
             for row in &rows {
                 if let Some(nid) = row.first() {
                     if visited.insert(nid.clone()) {
@@ -187,7 +187,7 @@ fn query_symbol_subgraph(
         }
         // INHERITS both directions
         let q = format!("MATCH (a:Symbol)-[:INHERITS]->(b:Symbol) WHERE a.id = '{esc}' OR b.id = '{esc}' RETURN a.id, b.id");
-        if let Ok(rows) = gq.raw_query(&q) {
+        if let Ok(rows) = backend.raw_query(&q) {
             for row in &rows {
                 for nid in row {
                     if visited.insert(nid.clone()) {
@@ -205,7 +205,7 @@ fn query_symbol_subgraph(
         let q = format!(
             "MATCH (s:Symbol) WHERE s.id = '{esc}' RETURN s.id, s.name, s.kind, s.file, s.start_line, s.end_line"
         );
-        if let Ok(rows) = gq.raw_query(&q) {
+        if let Ok(rows) = backend.raw_query(&q) {
             for row in &rows {
                 if row.len() >= 6 {
                     nodes.push(VizNode {
@@ -225,7 +225,7 @@ fn query_symbol_subgraph(
     let mut edges = Vec::new();
     let id_set: HashSet<&str> = visited.iter().map(|s| s.as_str()).collect();
 
-    let call_rows = gq.raw_query("MATCH (a:Symbol)-[:CALLS]->(b:Symbol) RETURN a.id, b.id")?;
+    let call_rows = backend.raw_query("MATCH (a:Symbol)-[:CALLS]->(b:Symbol) RETURN a.id, b.id")?;
     for row in &call_rows {
         if row.len() >= 2 && id_set.contains(row[0].as_str()) && id_set.contains(row[1].as_str()) {
             edges.push(VizEdge {
@@ -236,7 +236,7 @@ fn query_symbol_subgraph(
         }
     }
     let inherit_rows =
-        gq.raw_query("MATCH (a:Symbol)-[:INHERITS]->(b:Symbol) RETURN a.id, b.id")?;
+        backend.raw_query("MATCH (a:Symbol)-[:INHERITS]->(b:Symbol) RETURN a.id, b.id")?;
     for row in &inherit_rows {
         if row.len() >= 2 && id_set.contains(row[0].as_str()) && id_set.contains(row[1].as_str()) {
             edges.push(VizEdge {

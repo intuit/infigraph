@@ -1,11 +1,10 @@
 use std::collections::HashMap;
 
 use anyhow::Result;
-use kuzu::Connection;
 use rayon::prelude::*;
 
 use crate::embed;
-use crate::graph::GraphQuery;
+use crate::graph::GraphBackend;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Category {
@@ -131,14 +130,13 @@ struct SymbolInfo {
 }
 
 pub fn analyze(
-    conn: &Connection,
+    backend: &dyn GraphBackend,
     embeddings_path: Option<&std::path::Path>,
     target: Option<&str>,
     focus: Focus,
     limit: usize,
 ) -> Result<Vec<Recommendation>> {
-    let gq = GraphQuery::new(conn);
-    let symbols = load_symbols(&gq, target)?;
+    let symbols = load_symbols(backend, target)?;
 
     if symbols.is_empty() {
         return Ok(vec![]);
@@ -157,15 +155,15 @@ pub fn analyze(
     }
 
     if run_all || focus == Focus::Coupling {
-        analyze_coupling(&gq, &symbols, &mut recommendations)?;
+        analyze_coupling(backend, &symbols, &mut recommendations)?;
     }
 
     if run_all || focus == Focus::Duplication {
-        analyze_duplication(&gq, &symbols, embeddings_path, &mut recommendations)?;
+        analyze_duplication(backend, &symbols, embeddings_path, &mut recommendations)?;
     }
 
     if run_all {
-        analyze_dead_code(&gq, &symbols, &mut recommendations)?;
+        analyze_dead_code(backend, &symbols, &mut recommendations)?;
     }
 
     recommendations.sort_by_key(|r| std::cmp::Reverse(r.priority()));
@@ -174,7 +172,7 @@ pub fn analyze(
     Ok(recommendations)
 }
 
-fn load_symbols(gq: &GraphQuery, target: Option<&str>) -> Result<Vec<SymbolInfo>> {
+fn load_symbols(backend: &dyn GraphBackend, target: Option<&str>) -> Result<Vec<SymbolInfo>> {
     let query = if let Some(t) = target {
         format!(
             "MATCH (s:Symbol) WHERE s.file CONTAINS '{}' RETURN s.id, s.name, s.kind, s.file, s.complexity, s.start_line, s.end_line ORDER BY s.file, s.start_line",
@@ -184,7 +182,7 @@ fn load_symbols(gq: &GraphQuery, target: Option<&str>) -> Result<Vec<SymbolInfo>
         "MATCH (s:Symbol) WHERE s.kind IN ['Function', 'Method', 'Class', 'Struct', 'Interface', 'Test'] RETURN s.id, s.name, s.kind, s.file, s.complexity, s.start_line, s.end_line ORDER BY s.file, s.start_line".to_string()
     };
 
-    let rows = gq.raw_query(&query)?;
+    let rows = backend.raw_query(&query)?;
     Ok(rows
         .into_iter()
         .map(|r| SymbolInfo {
@@ -278,7 +276,7 @@ fn analyze_complexity(symbols: &[SymbolInfo], recs: &mut Vec<Recommendation>) {
 }
 
 fn analyze_coupling(
-    gq: &GraphQuery,
+    backend: &dyn GraphBackend,
     symbols: &[SymbolInfo],
     recs: &mut Vec<Recommendation>,
 ) -> Result<()> {
@@ -293,10 +291,10 @@ fn analyze_coupling(
     }
 
     let fan_out_query = "MATCH (s:Symbol)-[:CALLS]->(t:Symbol) WHERE s.kind IN ['Function', 'Method'] RETURN s.id, count(DISTINCT t) ORDER BY count(DISTINCT t) DESC";
-    let fan_out_rows = gq.raw_query(fan_out_query)?;
+    let fan_out_rows = backend.raw_query(fan_out_query)?;
 
     let fan_in_query = "MATCH (s:Symbol)<-[:CALLS]-(t:Symbol) WHERE s.kind IN ['Function', 'Method'] RETURN s.id, count(DISTINCT t) ORDER BY count(DISTINCT t) DESC";
-    let fan_in_rows = gq.raw_query(fan_in_query)?;
+    let fan_in_rows = backend.raw_query(fan_in_query)?;
 
     let sym_lookup: HashMap<&str, &SymbolInfo> =
         symbols.iter().map(|s| (s.id.as_str(), s)).collect();
@@ -350,7 +348,7 @@ fn analyze_coupling(
 }
 
 fn analyze_duplication(
-    _gq: &GraphQuery,
+    _backend: &dyn GraphBackend,
     symbols: &[SymbolInfo],
     embeddings_path: Option<&std::path::Path>,
     recs: &mut Vec<Recommendation>,
@@ -432,11 +430,11 @@ fn analyze_duplication(
 }
 
 fn analyze_dead_code(
-    gq: &GraphQuery,
+    backend: &dyn GraphBackend,
     symbols: &[SymbolInfo],
     recs: &mut Vec<Recommendation>,
 ) -> Result<()> {
-    let rows = gq.raw_query(
+    let rows = backend.raw_query(
         "MATCH (s:Symbol) WHERE s.kind IN ['Function', 'Method'] AND NOT EXISTS { MATCH ()-[:CALLS]->(s) } RETURN s.id, s.name, s.file",
     )?;
 

@@ -1,7 +1,6 @@
 use serde_json::{json, Value};
 
 use infigraph_core::embed;
-use infigraph_core::graph::GraphQuery;
 
 use super::open_prism;
 
@@ -26,17 +25,12 @@ pub(crate) fn api_search(params: &Value) -> Value {
 
     match open_prism(params) {
         Ok(prism) => {
-            let store = match prism.store() {
-                Some(s) => s,
+            let backend = match prism.backend() {
+                Some(b) => b,
                 None => return json!({"error": "not initialized"}),
             };
-            let conn = match store.connection() {
-                Ok(c) => c,
-                Err(e) => return json!({"error": e.to_string()}),
-            };
-            let gq = GraphQuery::new(&conn);
 
-            let rows = match gq
+            let rows = match backend
                 .raw_query("MATCH (s:Symbol) RETURN s.id, s.name, s.kind, s.file, s.docstring")
             {
                 Ok(r) => r,
@@ -115,16 +109,11 @@ pub(crate) fn api_query(params: &Value) -> Value {
 
     match open_prism(params) {
         Ok(prism) => {
-            let store = match prism.store() {
-                Some(s) => s,
+            let backend = match prism.backend() {
+                Some(b) => b,
                 None => return json!({"error": "not initialized"}),
             };
-            let conn = match store.connection() {
-                Ok(c) => c,
-                Err(e) => return json!({"error": e.to_string()}),
-            };
-            let gq = GraphQuery::new(&conn);
-            match gq.raw_query(cypher) {
+            match backend.raw_query(cypher) {
                 Ok(rows) => json!({"rows": rows}),
                 Err(e) => json!({"error": e.to_string()}),
             }
@@ -138,16 +127,11 @@ pub(crate) fn api_symbols(params: &Value) -> Value {
 
     match open_prism(params) {
         Ok(prism) => {
-            let store = match prism.store() {
-                Some(s) => s,
+            let backend = match prism.backend() {
+                Some(b) => b,
                 None => return json!({"error": "not initialized"}),
             };
-            let conn = match store.connection() {
-                Ok(c) => c,
-                Err(e) => return json!({"error": e.to_string()}),
-            };
-            let gq = GraphQuery::new(&conn);
-            let symbols = gq.symbols_in_file(file).unwrap_or_default();
+            let symbols = backend.symbols_in_file(file).unwrap_or_default();
 
             let items: Vec<Value> = symbols
                 .iter()
@@ -168,19 +152,14 @@ pub(crate) fn api_symbol_context(params: &Value) -> Value {
 
     match open_prism(params) {
         Ok(prism) => {
-            let store = match prism.store() {
-                Some(s) => s,
+            let backend = match prism.backend() {
+                Some(b) => b,
                 None => return json!({"error": "not initialized"}),
             };
-            let conn = match store.connection() {
-                Ok(c) => c,
-                Err(e) => return json!({"error": e.to_string()}),
-            };
-            let gq = GraphQuery::new(&conn);
 
-            let detail = gq.find_symbol_by_id(symbol_id).ok().flatten();
-            let callers = gq.callers_of(symbol_id).unwrap_or_default();
-            let callees = gq.callees_of(symbol_id).unwrap_or_default();
+            let detail = backend.find_symbol_by_id(symbol_id).ok().flatten();
+            let callers = backend.callers_of(symbol_id).unwrap_or_default();
+            let callees = backend.callees_of(symbol_id).unwrap_or_default();
 
             json!({
                 "symbol": detail.map(|d| json!({
@@ -203,17 +182,12 @@ pub(crate) fn api_snippet(params: &Value) -> Value {
 
     match open_prism(params) {
         Ok(prism) => {
-            let store = match prism.store() {
-                Some(s) => s,
+            let backend = match prism.backend() {
+                Some(b) => b,
                 None => return json!({"error": "not initialized"}),
             };
-            let conn = match store.connection() {
-                Ok(c) => c,
-                Err(e) => return json!({"error": e.to_string()}),
-            };
-            let gq = GraphQuery::new(&conn);
 
-            match gq.find_symbol_by_id(symbol_id) {
+            match backend.find_symbol_by_id(symbol_id) {
                 Ok(Some(detail)) => {
                     let file_path = prism.root().join(&detail.file);
                     let snippet = infigraph_core::search::read_lines_from_file(

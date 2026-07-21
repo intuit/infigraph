@@ -10,11 +10,9 @@ pub(crate) fn cmd_search(root: &Path, query: &str, limit: usize, alpha: f32) -> 
     let mut prism = Infigraph::open(root, registry)?;
     prism.init()?;
 
-    let store = prism.store().context("graph not initialized")?;
-    let conn = store.connection()?;
-    let gq = infigraph_core::graph::GraphQuery::new(&conn);
-
-    let rows = gq.raw_query("MATCH (s:Symbol) RETURN s.id, s.name, s.kind, s.file, s.docstring")?;
+    let backend = prism.backend().context("graph not initialized")?;
+    let rows =
+        backend.raw_query("MATCH (s:Symbol) RETURN s.id, s.name, s.kind, s.file, s.docstring")?;
 
     if rows.is_empty() {
         println!("No symbols found. Run 'infigraph index' first.");
@@ -136,11 +134,8 @@ pub(crate) fn cmd_snippet(root: &Path, symbol_id: &str) -> Result<()> {
     let mut prism = Infigraph::open(root, registry)?;
     prism.init()?;
 
-    let store = prism.store().context("graph not initialized")?;
-    let conn = store.connection()?;
-    let gq = infigraph_core::graph::GraphQuery::new(&conn);
-
-    let detail = gq
+    let backend = prism.backend().context("graph not initialized")?;
+    let detail = backend
         .find_symbol_by_id(symbol_id)?
         .context(format!("symbol '{}' not found in graph", symbol_id))?;
 
@@ -164,11 +159,8 @@ pub(crate) fn cmd_find_refs(root: &Path, symbol: &str) -> Result<()> {
     let registry = bundled_registry()?;
     let mut prism = Infigraph::open(root, registry)?;
     prism.init()?;
-    let store = prism.store().context("graph not initialized")?;
-    let conn = store.connection()?;
-    let gq = infigraph_core::graph::GraphQuery::new(&conn);
-
-    let refs = gq.find_all_references(symbol)?;
+    let backend = prism.backend().context("graph not initialized")?;
+    let refs = backend.find_all_references(symbol)?;
     if refs.is_empty() {
         println!("No references found for '{}'", symbol);
         return Ok(());

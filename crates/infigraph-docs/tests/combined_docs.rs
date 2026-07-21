@@ -61,6 +61,7 @@ fn registry(repo_a: &std::path::Path, repo_b: &std::path::Path) -> Registry {
                 languages: Vec::new(),
                 symbol_count: 0,
                 module_count: 0,
+                last_indexed_commit: None,
             },
         );
     }
@@ -69,6 +70,7 @@ fn registry(repo_a: &std::path::Path, repo_b: &std::path::Path) -> Registry {
         "fleet".to_string(),
         Group {
             name: "fleet".to_string(),
+            org: String::new(),
             repos: vec!["repo-a".to_string(), "server".to_string()],
             contracts: Vec::new(),
         },
@@ -299,6 +301,7 @@ fn single_repo_registry(repo: &std::path::Path) -> Registry {
             languages: Vec::new(),
             symbol_count: 0,
             module_count: 0,
+            last_indexed_commit: None,
         },
     );
     let mut groups = HashMap::new();
@@ -306,6 +309,7 @@ fn single_repo_registry(repo: &std::path::Path) -> Registry {
         "single".to_string(),
         Group {
             name: "single".to_string(),
+            org: String::new(),
             repos: vec!["solo".to_string()],
             contracts: Vec::new(),
         },

@@ -53,7 +53,6 @@ pub struct Infigraph {
     root: PathBuf,
     db_path: PathBuf,
     registry: LanguageRegistry,
-    store: Option<GraphStore>,
     backend_kind: BackendKind,
     /// When set, all file paths and symbol IDs are prefixed with `{namespace}/`.
     /// Used for multi-repo indexing into a shared Neo4j DB to prevent collisions.
@@ -62,8 +61,10 @@ pub struct Infigraph {
 
 /// Which graph backend is active.
 enum BackendKind {
-    /// Embedded Kùzu (default). GraphStore lives in `self.store`.
-    Kuzu,
+    /// Embedded Kùzu (default).
+    Kuzu(graph::KuzuBackend),
+    /// Not yet initialized — `init()` or `init_read_only()` must be called.
+    Uninit,
     /// Remote Neo4j sidecar via Bolt.
     #[cfg(feature = "neo4j")]
     Neo4j(graph::Neo4jBackend),
@@ -78,8 +79,7 @@ impl Infigraph {
             root,
             db_path,
             registry,
-            store: None,
-            backend_kind: BackendKind::Kuzu,
+            backend_kind: BackendKind::Uninit,
             namespace: None,
         })
     }
@@ -105,9 +105,9 @@ impl Infigraph {
             "neo4j" => {
                 anyhow::bail!("neo4j backend requested but binary compiled without `neo4j` feature")
             }
-            _ => match GraphStore::open(&self.db_path) {
-                Ok(store) => {
-                    self.store = Some(store);
+            _ => match graph::KuzuBackend::open(&self.db_path) {
+                Ok(kb) => {
+                    self.backend_kind = BackendKind::Kuzu(kb);
                     Ok(())
                 }
                 Err(first_err) => {
@@ -115,10 +115,10 @@ impl Infigraph {
                         "[graph] open failed ({first_err}), wiping corrupt graph and rebuilding..."
                     );
                     Self::wipe_graph(&self.db_path);
-                    let store = GraphStore::open(&self.db_path).with_context(|| {
+                    let kb = graph::KuzuBackend::open(&self.db_path).with_context(|| {
                         format!("graph still unreadable after wipe (was: {first_err})")
                     })?;
-                    self.store = Some(store);
+                    self.backend_kind = BackendKind::Kuzu(kb);
                     Ok(())
                 }
             },
@@ -134,211 +134,37 @@ impl Infigraph {
 
     /// Initialize the graph store in read-only mode.
     /// Safe for concurrent access while a watcher writes.
+    ///
+    /// Respects `INFIGRAPH_BACKEND` env var:
+    /// - `neo4j`: connects to remote Neo4j sidecar (no local DB)
+    /// - default: opens embedded Kùzu in read-only mode
     pub fn init_read_only(&mut self) -> Result<()> {
-        let store = GraphStore::open_read_only(&self.db_path)?;
-        self.store = Some(store);
-        Ok(())
+        let backend_env = std::env::var("INFIGRAPH_BACKEND").unwrap_or_else(|_| "kuzu".into());
+
+        match backend_env.as_str() {
+            #[cfg(feature = "neo4j")]
+            "neo4j" => {
+                let neo = graph::Neo4jBackend::connect_from_env()?;
+                self.backend_kind = BackendKind::Neo4j(neo);
+                Ok(())
+            }
+            #[cfg(not(feature = "neo4j"))]
+            "neo4j" => {
+                anyhow::bail!("neo4j backend requested but binary compiled without `neo4j` feature")
+            }
+            _ => {
+                let kb = graph::KuzuBackend::open_read_only(&self.db_path)?;
+                self.backend_kind = BackendKind::Kuzu(kb);
+                Ok(())
+            }
+        }
     }
 
     /// Index all supported files in the project, building the graph.
     /// Skips files whose content hash matches the stored hash (incremental).
     pub fn index(&self) -> Result<IndexResult> {
-        // Neo4j backend: clean trait-based path
-        if let Some(backend) = self.backend() {
-            return self.index_via_backend(backend);
-        }
-
-        // Kuzu backend: existing Kuzu-specific path
-        let store = self.store.as_ref().context("call init() first")?;
-
-        let files = self.collect_files()?;
-        let total = files.len();
-
-        // Load existing hashes for incremental skip
-        let existing_hashes = store.get_file_hashes().unwrap_or_default();
-
-        // Parse all files in parallel; skip unchanged ones
-        let done = std::sync::atomic::AtomicUsize::new(0);
-        let extractions: Vec<FileExtraction> = files
-            .par_iter()
-            .filter_map(|path| {
-                let rel_path = path
-                    .strip_prefix(&self.root)
-                    .ok()?
-                    .to_string_lossy()
-                    .replace('\\', "/");
-                let source = std::fs::read(path).ok()?;
-                // Skip if hash unchanged
-                let hash = {
-                    let mut h = Sha256::new();
-                    h.update(&source);
-                    format!("{:x}", h.finalize())
-                };
-                let n = done.fetch_add(1, std::sync::atomic::Ordering::Relaxed) + 1;
-                let pct = n * 100 / total;
-                let prev_pct = (n - 1) * 100 / total;
-                if (pct / 25) > (prev_pct / 25) || n == total {
-                    eprintln!("Parsing: {}/{} ({}%)", n, total, pct);
-                }
-                if existing_hashes.get(&rel_path).map(|s| s.as_str()) == Some(hash.as_str()) {
-                    return None; // unchanged
-                }
-                let pack = self.registry.for_file_with_content(&rel_path, &source)?;
-                extract::extract_file(&rel_path, &source, pack).ok()
-            })
-            .collect();
-
-        let indexed = extractions.len();
-
-        // Write all changed files — use CSV bulk load for fresh index or large batches,
-        // fall back to per-file UNWIND only for small incremental updates.
-        let use_csv = !extractions.is_empty() && (existing_hashes.is_empty() || indexed > 100);
-        let _write_lock = if !extractions.is_empty() {
-            Some(store.write_lock()?)
-        } else {
-            None
-        };
-
-        let write_start = std::time::Instant::now();
-        if !extractions.is_empty() {
-            eprintln!(
-                "Writing: {} files ({} mode)",
-                indexed,
-                if use_csv { "bulk-parquet" } else { "per-file" }
-            );
-            if use_csv {
-                if !existing_hashes.is_empty() {
-                    let conn = store.connection()?;
-                    conn.query("BEGIN TRANSACTION")
-                        .context("failed to begin delete transaction")?;
-                    let file_list: Vec<String> = extractions
-                        .iter()
-                        .map(|e| format!("'{}'", escape_str(&e.file)))
-                        .collect();
-                    let files_in = file_list.join(", ");
-                    let _ = conn.query(&format!(
-                        "MATCH (f:File)-[:DEFINES]->(s:Symbol)-[:HAS_STATEMENT]->(st:Statement) WHERE f.id IN [{}] DETACH DELETE st",
-                        files_in
-                    ));
-                    let _ = conn.query(&format!(
-                        "MATCH (s:Symbol) WHERE s.file IN [{}] DETACH DELETE s",
-                        files_in
-                    ));
-                    let _ = conn.query(&format!(
-                        "MATCH (m:Module) WHERE m.file IN [{}] DETACH DELETE m",
-                        files_in
-                    ));
-                    let _ = conn.query(&format!(
-                        "MATCH (f:File) WHERE f.id IN [{}] DETACH DELETE f",
-                        files_in
-                    ));
-                    conn.query("COMMIT")
-                        .context("failed to commit delete transaction")?;
-                }
-                let conn = store.connection()?;
-                store.upsert_all_parquet_conn(&conn, &extractions)?;
-            } else {
-                let conn = store.connection()?;
-                conn.query("BEGIN TRANSACTION")
-                    .context("failed to begin index transaction")?;
-                let file_list: Vec<String> = extractions
-                    .iter()
-                    .map(|e| format!("'{}'", escape_str(&e.file)))
-                    .collect();
-                let files_in = file_list.join(", ");
-                let _ = conn.query(&format!(
-                    "MATCH (f:File)-[:DEFINES]->(s:Symbol)-[:HAS_STATEMENT]->(st:Statement) WHERE f.id IN [{}] DETACH DELETE st",
-                    files_in
-                ));
-                let _ = conn.query(&format!(
-                    "MATCH (s:Symbol) WHERE s.file IN [{}] DETACH DELETE s",
-                    files_in
-                ));
-                let _ = conn.query(&format!(
-                    "MATCH (m:Module) WHERE m.file IN [{}] DETACH DELETE m",
-                    files_in
-                ));
-                let _ = conn.query(&format!(
-                    "MATCH (f:File) WHERE f.id IN [{}] DETACH DELETE f",
-                    files_in
-                ));
-                for extraction in &extractions {
-                    store.upsert_file_conn_no_delete(&conn, extraction)?;
-                }
-                conn.query("COMMIT")
-                    .context("failed to commit index transaction")?;
-                let file_paths: Vec<&str> = extractions.iter().map(|e| e.file.as_str()).collect();
-                store.upsert_folders_bulk_conn(&conn, &file_paths)?;
-            }
-        }
-
-        if use_csv {
-            let file_paths: Vec<&str> = extractions.iter().map(|e| e.file.as_str()).collect();
-            let conn = store.connection()?;
-            store.upsert_folders_bulk_conn(&conn, &file_paths)?;
-        }
-
-        if !extractions.is_empty() {
-            eprintln!("Write complete: {}s", write_start.elapsed().as_secs());
-        }
-
-        // Prune stale files: remove entries for files that no longer exist on disk
-        {
-            let current_files: std::collections::HashSet<String> = files
-                .iter()
-                .filter_map(|p| {
-                    p.strip_prefix(&self.root)
-                        .ok()
-                        .map(|r| r.to_string_lossy().replace('\\', "/"))
-                })
-                .collect();
-            let stale: Vec<String> = existing_hashes
-                .keys()
-                .filter(|k| !current_files.contains(k.as_str()))
-                .cloned()
-                .collect();
-            if !stale.is_empty() {
-                eprintln!("[index] pruning {} stale file(s) from graph", stale.len());
-                let conn = store.connection()?;
-                for f in &stale {
-                    let _ = store.remove_file_conn(&conn, f);
-                }
-            }
-        }
-
-        // resolve runs under the same write lock (creates CALLS/INHERITS edges)
-        if !extractions.is_empty() {
-            eprintln!("Resolving: calls + inheritance for {} files", indexed);
-        }
-        let resolve_start = std::time::Instant::now();
-        let resolve_stats = resolve::resolve_calls_incremental(store, &extractions, None)
-            .unwrap_or_else(|e| {
-                eprintln!("warning: call resolution failed: {e}");
-                resolve::ResolveStats {
-                    total_calls: 0,
-                    resolved: 0,
-                    unresolved: 0,
-                    learned_resolved: 0,
-                    inherits_resolved: 0,
-                }
-            });
-        if !extractions.is_empty() {
-            eprintln!(
-                "Resolve complete: {}s ({} resolved, {} unresolved)",
-                resolve_start.elapsed().as_secs(),
-                resolve_stats.resolved,
-                resolve_stats.unresolved
-            );
-        }
-
-        drop(_write_lock);
-
-        Ok(IndexResult {
-            total_files: total,
-            indexed_files: indexed,
-            extractions,
-            resolve_stats,
-        })
+        let backend = self.backend().context("call init() first")?;
+        self.index_via_backend(backend)
     }
 
     /// Backend-agnostic index path (used for Neo4j and future backends).
@@ -453,26 +279,24 @@ impl Infigraph {
 
     /// Get graph statistics.
     pub fn stats(&self) -> Result<graph::GraphStats> {
-        if let Some(backend) = self.backend() {
-            return backend.stats();
-        }
-        let store = self.store.as_ref().context("call init() first")?;
-        store.stats()
+        self.backend().context("call init() first")?.stats()
     }
 
     /// Access the underlying graph store (for direct Kùzu queries).
-    /// Returns None when using Neo4j backend.
+    /// Returns None when using Neo4j backend or before init.
     pub fn store(&self) -> Option<&GraphStore> {
-        self.store.as_ref()
+        match &self.backend_kind {
+            BackendKind::Kuzu(kb) => Some(kb.inner()),
+            _ => None,
+        }
     }
 
     /// Access the graph backend (works for all backend types).
+    /// Returns None only before init() / init_read_only().
     pub fn backend(&self) -> Option<&dyn graph::GraphBackend> {
         match &self.backend_kind {
-            BackendKind::Kuzu => {
-                // No KuzuBackend stored separately — callers use store() for Kuzu
-                None
-            }
+            BackendKind::Kuzu(kb) => Some(kb),
+            BackendKind::Uninit => None,
             #[cfg(feature = "neo4j")]
             BackendKind::Neo4j(neo) => Some(neo),
         }
@@ -512,12 +336,9 @@ impl Infigraph {
             .for_file_with_content(&rel, &source)
             .with_context(|| format!("no language for {rel}"))?;
         let extraction = extract::extract_file(&rel, &source, pack)?;
-        if let Some(backend) = self.backend() {
-            return backend.upsert_file(&extraction);
-        }
-        let store = self.store.as_ref().context("call init() first")?;
-        store.upsert_file(&extraction)?;
-        Ok(())
+        self.backend()
+            .context("call init() first")?
+            .upsert_file(&extraction)
     }
 
     /// Index a batch of files by path, returning an IndexResult with all extractions.
@@ -567,79 +388,13 @@ impl Infigraph {
 
         let indexed = extractions.len();
 
-        // Route through GraphBackend when available (Neo4j mode)
-        if let Some(backend) = self.backend() {
-            if !extractions.is_empty() {
-                let existing_hashes = backend.get_file_hashes().unwrap_or_default();
-                backend.upsert_files_bulk(&extractions, existing_hashes.is_empty())?;
-            }
-            let resolve_stats = backend
-                .resolve_calls(&extractions, None)
-                .unwrap_or_else(|e| {
-                    eprintln!("warning: call resolution failed: {e}");
-                    resolve::ResolveStats {
-                        total_calls: 0,
-                        resolved: 0,
-                        unresolved: 0,
-                        learned_resolved: 0,
-                        inherits_resolved: 0,
-                    }
-                });
-            return Ok(IndexResult {
-                total_files: paths.len(),
-                indexed_files: indexed,
-                extractions,
-                resolve_stats,
-            });
-        }
-
-        // Kùzu path (existing)
-        let store = self.store.as_ref().context("call init() first")?;
-
-        let _write_lock = if !extractions.is_empty() {
-            Some(store.write_lock()?)
-        } else {
-            None
-        };
-
+        let backend = self.backend().context("call init() first")?;
         if !extractions.is_empty() {
-            let conn = store.connection()?;
-            conn.query("BEGIN TRANSACTION")
-                .context("failed to begin batch delete transaction")?;
-            let file_list: Vec<String> = extractions
-                .iter()
-                .map(|e| format!("'{}'", escape_str(&e.file)))
-                .collect();
-            let files_in = file_list.join(", ");
-            let _ = conn.query(&format!(
-                "MATCH (f:File)-[:DEFINES]->(s:Symbol)-[:HAS_STATEMENT]->(st:Statement) WHERE f.id IN [{files_in}] DETACH DELETE st"
-            ));
-            let _ = conn.query(&format!(
-                "MATCH (s:Symbol) WHERE s.file IN [{files_in}] DETACH DELETE s"
-            ));
-            let _ = conn.query(&format!(
-                "MATCH (m:Module) WHERE m.file IN [{files_in}] DETACH DELETE m"
-            ));
-            let _ = conn.query(&format!(
-                "MATCH (f:File) WHERE f.id IN [{files_in}] DETACH DELETE f"
-            ));
-            conn.query("COMMIT")
-                .context("failed to commit batch delete transaction")?;
-
-            if indexed > 10 {
-                let conn = store.connection()?;
-                store.upsert_all_parquet_conn(&conn, &extractions)?;
-            } else {
-                let conn = store.connection()?;
-                store.upsert_all_bulk(&conn, &extractions)?;
-            }
-
-            let file_paths: Vec<&str> = extractions.iter().map(|e| e.file.as_str()).collect();
-            let conn = store.connection()?;
-            store.upsert_folders_bulk_conn(&conn, &file_paths)?;
+            let existing_hashes = backend.get_file_hashes().unwrap_or_default();
+            backend.upsert_files_bulk(&extractions, existing_hashes.is_empty())?;
         }
-
-        let resolve_stats = resolve::resolve_calls_incremental(store, &extractions, None)
+        let resolve_stats = backend
+            .resolve_calls(&extractions, None)
             .unwrap_or_else(|e| {
                 eprintln!("warning: call resolution failed: {e}");
                 resolve::ResolveStats {
@@ -650,8 +405,6 @@ impl Infigraph {
                     inherits_resolved: 0,
                 }
             });
-
-        drop(_write_lock);
 
         Ok(IndexResult {
             total_files: paths.len(),
@@ -676,11 +429,9 @@ impl Infigraph {
         } else {
             path.to_string_lossy().replace('\\', "/")
         };
-        if let Some(backend) = self.backend() {
-            return backend.remove_file(&rel);
-        }
-        let store = self.store.as_ref().context("call init() first")?;
-        store.remove_file(&rel)
+        self.backend()
+            .context("call init() first")?
+            .remove_file(&rel)
     }
 
     /// Remove all indexed files whose relative path starts with the given prefix.
@@ -699,21 +450,18 @@ impl Infigraph {
         } else {
             format!("{rel}/")
         };
-        if let Some(backend) = self.backend() {
-            let rows = backend.raw_query(&format!(
-                "MATCH (f:File) WHERE f.id STARTS WITH '{}' RETURN f.id",
-                prefix.replace('\'', "\\'")
-            ))?;
-            let count = rows.len();
-            for row in &rows {
-                if let Some(file_id) = row.first() {
-                    let _ = backend.remove_file(file_id);
-                }
+        let backend = self.backend().context("call init() first")?;
+        let rows = backend.raw_query(&format!(
+            "MATCH (f:File) WHERE f.id STARTS WITH '{}' RETURN f.id",
+            prefix.replace('\'', "\\'")
+        ))?;
+        let count = rows.len();
+        for row in &rows {
+            if let Some(file_id) = row.first() {
+                let _ = backend.remove_file(file_id);
             }
-            return Ok(count);
         }
-        let store = self.store.as_ref().context("call init() first")?;
-        store.remove_files_by_prefix(&prefix)
+        Ok(count)
     }
 
     fn collect_files(&self) -> Result<Vec<PathBuf>> {
@@ -734,7 +482,10 @@ impl Infigraph {
             .build();
 
         for result in walker {
-            let entry = result?;
+            let entry = match result {
+                Ok(e) => e,
+                Err(_) => continue,
+            };
             if entry.file_type().is_some_and(|ft| ft.is_file()) {
                 let path = entry.path();
                 if self.registry.for_file(&path.to_string_lossy()).is_some() {

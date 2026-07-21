@@ -1,20 +1,14 @@
 use anyhow::{Context, Result};
 use serde_json::Value;
 
-use infigraph_core::graph::GraphStore;
+use super::super::helpers::open_prism;
 
 pub fn tool_detect_reflection(args: &Value) -> Result<String> {
-    let path = args
-        .get("path")
-        .and_then(|p| p.as_str())
-        .context("missing 'path'")?;
-    let root = std::path::PathBuf::from(path)
-        .canonicalize()
-        .context("invalid path")?;
-    let db_path = root.join(".infigraph").join("graph");
-    let store = GraphStore::open(&db_path)?;
+    let prism = open_prism(args)?;
+    let root = prism.root().to_path_buf();
+    let backend = prism.backend().context("not initialized")?;
 
-    let sites = infigraph_core::reflection::detect_reflection_sites(&store, &root)?;
+    let sites = infigraph_core::reflection::detect_reflection_sites(backend, &root)?;
 
     let mechanism_filter = args
         .get("mechanism")

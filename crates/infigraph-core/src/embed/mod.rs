@@ -413,16 +413,14 @@ pub fn load_embeddings(path: &Path) -> Result<Vec<(String, Vec<f32>)>> {
 /// Loads existing embeddings, re-embeds symbols in `changed_files`, removes orphans,
 /// and saves back. If `changed_files` is empty, treats all symbols as changed (full rebuild).
 pub fn update_embeddings(
-    store: &crate::graph::GraphStore,
+    backend: &dyn crate::graph::GraphBackend,
     root: &Path,
     changed_files: &[&str],
 ) -> Result<usize> {
     use rayon::prelude::*;
     use std::sync::Arc;
 
-    let conn = store.connection()?;
-    let gq = crate::graph::GraphQuery::new(&conn);
-    let rows = gq.raw_query("MATCH (s:Symbol) RETURN s.id, s.name, s.kind, s.file, s.docstring, s.language, s.parameters, s.return_type")?;
+    let rows = backend.raw_query("MATCH (s:Symbol) RETURN s.id, s.name, s.kind, s.file, s.docstring, s.language, s.parameters, s.return_type")?;
     if rows.is_empty() {
         return Ok(0);
     }
@@ -501,6 +499,9 @@ pub fn update_embeddings(
 }
 
 /// Update embeddings for remote mode — reads symbols from GraphBackend, stores in Postgres pgvector.
+///
+/// Scoped: when `changed_files` is non-empty, only fetches symbols from those files for embedding.
+/// Orphan cleanup uses a lightweight ID-only query instead of fetching all vectors.
 #[cfg(feature = "postgres")]
 pub fn update_embeddings_remote(
     backend: &dyn crate::graph::GraphBackend,
@@ -510,30 +511,48 @@ pub fn update_embeddings_remote(
     use rayon::prelude::*;
     use std::sync::Arc;
 
-    let rows = backend.raw_query("MATCH (s:Symbol) RETURN s.id, s.name, s.kind, s.file, s.docstring, s.language, s.parameters, s.return_type")?;
-    if rows.is_empty() {
+    let existing_ids: std::collections::HashSet<String> = pg
+        .all_embedding_ids("symbol")
+        .unwrap_or_default()
+        .into_iter()
+        .collect();
+
+    // Fetch only symbols from changed files (or all on first index / full reindex)
+    let rows = if changed_files.is_empty() || existing_ids.is_empty() {
+        backend.raw_query(
+            "MATCH (s:Symbol) RETURN s.id, s.name, s.kind, s.file, s.docstring, s.language, s.parameters, s.return_type",
+        )?
+    } else {
+        let file_list = changed_files
+            .iter()
+            .map(|f| format!("'{}'", f.replace('\'', "\\'")))
+            .collect::<Vec<_>>()
+            .join(", ");
+        backend.raw_query(&format!(
+            "MATCH (s:Symbol) WHERE s.file IN [{}] \
+             RETURN s.id, s.name, s.kind, s.file, s.docstring, s.language, s.parameters, s.return_type",
+            file_list
+        ))?
+    };
+
+    if rows.is_empty() && existing_ids.is_empty() {
         return Ok(0);
     }
 
-    let existing_ids: std::collections::HashSet<String> = pg
-        .all_embeddings("symbol")
-        .unwrap_or_default()
-        .into_iter()
-        .map(|(id, _)| id)
-        .collect();
-
     let changed_set: std::collections::HashSet<&str> = changed_files.iter().copied().collect();
-
     let to_embed: Vec<(String, String)> = rows
         .iter()
         .filter_map(|row| {
             let id = &row[0];
-            let file = row.get(3).map(|s| s.as_str()).unwrap_or("");
-            if !changed_set.is_empty() && !changed_set.contains(file) && existing_ids.contains(id) {
-                return None;
+            if existing_ids.contains(id) && !changed_set.is_empty() {
+                let file = row.get(3).map(|s| s.as_str()).unwrap_or("");
+                if !changed_set.contains(file) {
+                    return None;
+                }
             }
             let name = &row[1];
             let kind = &row[2];
+            let file = row.get(3).map(|s| s.as_str()).unwrap_or("");
             let doc = row.get(4).map(|s| s.as_str()).unwrap_or("");
             let lang = row.get(5).map(|s| s.as_str()).unwrap_or("");
             let params = row.get(6).map(|s| s.as_str()).unwrap_or("");
@@ -567,8 +586,12 @@ pub fn update_embeddings_remote(
     let count = all.len();
     pg.upsert_embeddings_bulk(&all, "symbol")?;
 
-    // Clean up orphan embeddings
-    let valid_ids: std::collections::HashSet<String> = rows.iter().map(|r| r[0].clone()).collect();
+    // Clean up orphan embeddings — cheap ID-only query from Neo4j
+    let valid_ids: std::collections::HashSet<String> = backend
+        .raw_query("MATCH (s:Symbol) RETURN s.id")?
+        .into_iter()
+        .filter_map(|r| r.into_iter().next())
+        .collect();
     let orphans: Vec<String> = existing_ids
         .into_iter()
         .filter(|id| !valid_ids.contains(id))

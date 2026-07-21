@@ -1,14 +1,10 @@
 use anyhow::Result;
 
-use crate::graph::{store::GraphStore, GraphQuery};
+use crate::graph::GraphBackend;
 
-pub fn promote_bridges_to_calls(store: &GraphStore) -> Result<usize> {
-    let _lock = store.write_lock()?;
-    let conn = store.connection()?;
-    let gq = GraphQuery::new(&conn);
-
+pub fn promote_bridges_to_calls(backend: &dyn GraphBackend) -> Result<usize> {
     let query = "MATCH (a:Symbol)-[b:BRIDGE_TO]->(t:Symbol) RETURN a.id, t.id, b.bridge_kind";
-    let bridges = gq.raw_query(query)?;
+    let bridges = backend.raw_query(query)?;
 
     let mut promoted = 0;
     for row in &bridges {
@@ -23,7 +19,7 @@ pub fn promote_bridges_to_calls(store: &GraphStore) -> Result<usize> {
             source_id.replace('\'', "\\'"),
             target_id.replace('\'', "\\'"),
         );
-        let existing = gq.raw_query(&check).unwrap_or_default();
+        let existing = backend.raw_query(&check).unwrap_or_default();
         if !existing.is_empty() {
             continue;
         }
@@ -33,7 +29,7 @@ pub fn promote_bridges_to_calls(store: &GraphStore) -> Result<usize> {
             source_id.replace('\'', "\\'"),
             target_id.replace('\'', "\\'"),
         );
-        if gq.raw_query(&insert).is_ok() {
+        if backend.raw_query(&insert).is_ok() {
             promoted += 1;
         }
     }

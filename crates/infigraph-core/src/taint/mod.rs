@@ -11,7 +11,7 @@ use anyhow::Result;
 use rayon::prelude::*;
 use serde::Serialize;
 
-use crate::graph::GraphStore;
+use crate::graph::GraphBackend;
 use sinks::{TAINT_SANITIZERS, TAINT_SINKS};
 use sources::TAINT_SOURCES;
 
@@ -25,11 +25,12 @@ pub struct FuncInfo {
     pub end_line: u32,
 }
 
-pub fn build_source_cache(store: &GraphStore, root: &Path) -> Result<(Vec<FuncInfo>, SourceCache)> {
-    let conn = store.connection()?;
-    let result = conn
-        .query("MATCH (s:Symbol) WHERE s.kind IN ['Function', 'Method', 'Test'] AND s.file IS NOT NULL RETURN s.id, s.file, s.start_line, s.end_line")
-        .map_err(|e| anyhow::anyhow!("query failed: {e}"))?;
+pub fn build_source_cache(
+    backend: &dyn GraphBackend,
+    root: &Path,
+) -> Result<(Vec<FuncInfo>, SourceCache)> {
+    let result = backend
+        .raw_query("MATCH (s:Symbol) WHERE s.kind IN ['Function', 'Method', 'Test'] AND s.file IS NOT NULL RETURN s.id, s.file, s.start_line, s.end_line")?;
 
     let mut functions = Vec::new();
     let mut files_needed: HashSet<String> = HashSet::new();
@@ -83,13 +84,9 @@ pub struct TaintFlow {
     pub sanitizer: Option<String>,
 }
 
-pub fn detect_taint_flows(store: &GraphStore, root: &Path) -> Result<Vec<TaintFlow>> {
-    let _lock = store.write_lock()?;
-    let conn = store.connection()?;
-
-    let result = conn
-        .query("MATCH (s:Symbol) WHERE s.kind IN ['Function', 'Method', 'Test'] AND s.file IS NOT NULL RETURN s.id, s.file, s.start_line, s.end_line")
-        .map_err(|e| anyhow::anyhow!("query failed: {e}"))?;
+pub fn detect_taint_flows(backend: &dyn GraphBackend, root: &Path) -> Result<Vec<TaintFlow>> {
+    let result = backend
+        .raw_query("MATCH (s:Symbol) WHERE s.kind IN ['Function', 'Method', 'Test'] AND s.file IS NOT NULL RETURN s.id, s.file, s.start_line, s.end_line")?;
 
     let mut functions: Vec<(String, String, u32, u32)> = Vec::new();
     for row in result {
@@ -130,18 +127,17 @@ pub fn detect_taint_flows(store: &GraphStore, root: &Path) -> Result<Vec<TaintFl
     }
 
     if !all_flows.is_empty() {
-        write_taint_flows(store, &all_flows)?;
+        write_taint_flows(backend, &all_flows)?;
     }
 
     Ok(all_flows)
 }
 
 pub fn detect_taint_flows_with_cache(
-    store: &GraphStore,
+    backend: &dyn GraphBackend,
     functions: &[FuncInfo],
     cache: &SourceCache,
 ) -> Result<Vec<TaintFlow>> {
-    let _lock = store.write_lock()?;
     let mut all_flows = Vec::new();
 
     for func in functions {
@@ -161,7 +157,7 @@ pub fn detect_taint_flows_with_cache(
     }
 
     if !all_flows.is_empty() {
-        write_taint_flows(store, &all_flows)?;
+        write_taint_flows(backend, &all_flows)?;
     }
 
     Ok(all_flows)
@@ -421,13 +417,8 @@ fn find_sanitizer_name(lines: &[String], current_offset: usize, category: &str) 
     None
 }
 
-fn write_taint_flows(store: &GraphStore, flows: &[TaintFlow]) -> Result<()> {
-    let conn = store.connection()?;
-
-    conn.query("BEGIN TRANSACTION")
-        .map_err(|e| anyhow::anyhow!("begin txn: {e}"))?;
-
-    let _ = conn.query("MATCH ()-[r:TAINT_FLOW]->() DELETE r");
+fn write_taint_flows(backend: &dyn GraphBackend, flows: &[TaintFlow]) -> Result<()> {
+    let _ = backend.raw_query("MATCH ()-[r:TAINT_FLOW]->() DELETE r");
 
     for flow in flows {
         if flow.sanitized {
@@ -439,15 +430,11 @@ fn write_taint_flows(store: &GraphStore, flows: &[TaintFlow]) -> Result<()> {
         let path_str = flow.path.join(" -> ");
         let path_esc = crate::escape_str(&path_str);
 
-        // Self-edge: function taints itself (intra-procedural)
-        let _ = conn.query(&format!(
+        let _ = backend.raw_query(&format!(
             "MATCH (s:Symbol) WHERE s.id = '{sym_esc}' \
              CREATE (s)-[:TAINT_FLOW {{source_kind: '{src_esc}', sink_kind: '{sink_esc}', path: '{path_esc}'}}]->(s)"
         ));
     }
-
-    conn.query("COMMIT")
-        .map_err(|e| anyhow::anyhow!("commit txn: {e}"))?;
 
     Ok(())
 }

@@ -14,8 +14,80 @@ use serde_json::{json, Value};
 use sha2::Sha256;
 use tiny_http::{Header, Response, Server};
 
+use std::sync::Mutex;
+use std::time::{SystemTime, UNIX_EPOCH};
+
 static READY: AtomicBool = AtomicBool::new(true);
 static REINDEXING: AtomicBool = AtomicBool::new(false);
+static WEBHOOK_STATUS: Mutex<Option<WebhookStatus>> = Mutex::new(None);
+
+#[derive(Clone, serde::Serialize)]
+struct WebhookStatus {
+    reindexing: bool,
+    last_repo: String,
+    last_result: String,
+    last_completed_epoch: u64,
+}
+
+#[derive(Debug, PartialEq)]
+enum WebhookDecision {
+    Reject401,
+    BadJson400,
+    Ignored {
+        reason: String,
+    },
+    AlreadyReindexing,
+    Accepted {
+        repo: String,
+        clone_dir: String,
+        group: String,
+        bin: String,
+    },
+}
+
+fn decide_webhook(body: &str, signature: Option<&str>, reindexing: bool) -> WebhookDecision {
+    if !validate_webhook_signature(body, signature) {
+        return WebhookDecision::Reject401;
+    }
+
+    let event: Value = match serde_json::from_str(body) {
+        Ok(v) => v,
+        Err(_) => return WebhookDecision::BadJson400,
+    };
+
+    let repo_name = event
+        .pointer("/repository/name")
+        .and_then(|v| v.as_str())
+        .unwrap_or("")
+        .to_string();
+    let ref_str = event.get("ref").and_then(|v| v.as_str()).unwrap_or("");
+    let default_branch = event
+        .pointer("/repository/default_branch")
+        .and_then(|v| v.as_str())
+        .unwrap_or("main");
+
+    let expected_ref = format!("refs/heads/{}", default_branch);
+    if ref_str != expected_ref {
+        return WebhookDecision::Ignored {
+            reason: "non-default branch".to_string(),
+        };
+    }
+
+    if reindexing {
+        return WebhookDecision::AlreadyReindexing;
+    }
+
+    let clone_dir = std::env::var("CLONE_DIR").unwrap_or_else(|_| "/app/data/repos".to_string());
+    let group = std::env::var("GROUP_NAME").unwrap_or_else(|_| "org".to_string());
+    let bin = std::env::var("INFIGRAPH_BIN").unwrap_or_else(|_| "/app/infigraph".to_string());
+
+    WebhookDecision::Accepted {
+        repo: repo_name,
+        clone_dir,
+        group,
+        bin,
+    }
+}
 
 pub fn set_ready(val: bool) {
     READY.store(val, Ordering::SeqCst);
@@ -125,6 +197,19 @@ pub fn start_mcp_http_server(port: u16, is_primary: bool, health_path: &str) -> 
             if method == "POST" && route == "/webhook/reindex" {
                 let resp = handle_webhook_reindex(&mut request);
                 let _ = request.respond(resp);
+                continue;
+            }
+
+            if method == "GET" && route == "/webhook/status" {
+                let status = WEBHOOK_STATUS
+                    .lock()
+                    .ok()
+                    .and_then(|s| s.clone())
+                    .map(|s| json!(s))
+                    .unwrap_or(
+                        json!({"reindexing": false, "last_repo": null, "last_result": null}),
+                    );
+                let _ = request.respond(serve_json_status(200, status));
                 continue;
             }
 
@@ -265,85 +350,124 @@ fn handle_webhook_reindex(request: &mut tiny_http::Request) -> Response<std::io:
         })
         .map(|h| h.value.as_str().to_string());
 
-    if !validate_webhook_signature(&body, signature.as_deref()) {
-        return serve_json_status(401, json!({"error": "Invalid signature"}));
-    }
+    let reindexing = REINDEXING.load(Ordering::SeqCst);
+    let decision = decide_webhook(&body, signature.as_deref(), reindexing);
 
-    let event: Value = match serde_json::from_str(&body) {
-        Ok(v) => v,
-        Err(_) => return serve_json_status(400, json!({"error": "Invalid JSON"})),
-    };
-
-    let repo_name = event
-        .pointer("/repository/name")
-        .and_then(|v| v.as_str())
-        .unwrap_or("")
-        .to_string();
-    let ref_str = event.get("ref").and_then(|v| v.as_str()).unwrap_or("");
-    let default_branch = event
-        .pointer("/repository/default_branch")
-        .and_then(|v| v.as_str())
-        .unwrap_or("main");
-
-    let expected_ref = format!("refs/heads/{}", default_branch);
-    if ref_str != expected_ref {
-        return serve_json_status(
-            200,
-            json!({"status": "ignored", "reason": "non-default branch"}),
-        );
-    }
-
-    if REINDEXING
-        .compare_exchange(false, true, Ordering::SeqCst, Ordering::SeqCst)
-        .is_err()
-    {
-        return serve_json_status(
+    match decision {
+        WebhookDecision::Reject401 => serve_json_status(401, json!({"error": "Invalid signature"})),
+        WebhookDecision::BadJson400 => serve_json_status(400, json!({"error": "Invalid JSON"})),
+        WebhookDecision::Ignored { reason } => {
+            serve_json_status(200, json!({"status": "ignored", "reason": reason}))
+        }
+        WebhookDecision::AlreadyReindexing => serve_json_status(
             200,
             json!({"status": "queued", "reason": "reindex already in progress"}),
-        );
-    }
+        ),
+        WebhookDecision::Accepted {
+            repo,
+            clone_dir,
+            group,
+            bin,
+        } => {
+            if REINDEXING
+                .compare_exchange(false, true, Ordering::SeqCst, Ordering::SeqCst)
+                .is_err()
+            {
+                return serve_json_status(
+                    200,
+                    json!({"status": "queued", "reason": "reindex already in progress"}),
+                );
+            }
 
-    let clone_dir = std::env::var("CLONE_DIR").unwrap_or_else(|_| "/app/data/repos".to_string());
-    let group = std::env::var("GROUP_NAME").unwrap_or_else(|_| "org".to_string());
-    let infigraph_bin =
-        std::env::var("INFIGRAPH_BIN").unwrap_or_else(|_| "/app/infigraph".to_string());
+            crate::mcp_log("INFO", &format!("webhook: reindex triggered for {repo}"));
 
-    let repo_name_log = repo_name.clone();
-    crate::mcp_log(
-        "INFO",
-        &format!("webhook: reindex triggered for {repo_name_log}"),
-    );
+            if let Ok(mut status) = WEBHOOK_STATUS.lock() {
+                *status = Some(WebhookStatus {
+                    reindexing: true,
+                    last_repo: repo.clone(),
+                    last_result: "in_progress".to_string(),
+                    last_completed_epoch: 0,
+                });
+            }
 
-    let repo_name_response = repo_name.clone();
-    thread::spawn(move || {
-        let repo_path = format!("{}/{}", clone_dir, repo_name);
+            let repo_response = repo.clone();
+            thread::spawn(move || {
+                let repo_path = format!("{}/{}", clone_dir, repo);
+                let mut result = "success";
 
-        if std::path::Path::new(&repo_path).join(".git").exists() {
-            crate::mcp_log("INFO", &format!("webhook: pulling {repo_name}"));
-            let _ = Command::new("git")
-                .args(["-C", &repo_path, "pull", "--ff-only"])
-                .status();
+                if std::path::Path::new(&repo_path).join(".git").exists() {
+                    crate::mcp_log("INFO", &format!("webhook: pulling {repo}"));
+                    match Command::new("git")
+                        .args(["-C", &repo_path, "pull", "--ff-only"])
+                        .status()
+                    {
+                        Ok(s) if s.success() => {}
+                        Ok(s) => {
+                            crate::mcp_log(
+                                "ERROR",
+                                &format!("webhook: git pull failed (exit {s})"),
+                            );
+                            result = "partial_failure";
+                        }
+                        Err(e) => {
+                            crate::mcp_log(
+                                "ERROR",
+                                &format!("webhook: git pull spawn failed: {e}"),
+                            );
+                            result = "partial_failure";
+                        }
+                    }
+                }
+
+                crate::mcp_log("INFO", &format!("webhook: indexing {repo}"));
+                match Command::new(&bin)
+                    .arg("index")
+                    .current_dir(&repo_path)
+                    .status()
+                {
+                    Ok(s) if s.success() => {}
+                    Ok(s) => {
+                        crate::mcp_log("ERROR", &format!("webhook: index failed (exit {s})"));
+                        result = "partial_failure";
+                    }
+                    Err(e) => {
+                        crate::mcp_log("ERROR", &format!("webhook: index spawn failed: {e}"));
+                        result = "partial_failure";
+                    }
+                }
+
+                crate::mcp_log("INFO", &format!("webhook: rebuilding group {group}"));
+                match Command::new(&bin).args(["group", "build", &group]).status() {
+                    Ok(s) if s.success() => {}
+                    Ok(s) => {
+                        crate::mcp_log("ERROR", &format!("webhook: group build failed (exit {s})"));
+                        result = "partial_failure";
+                    }
+                    Err(e) => {
+                        crate::mcp_log("ERROR", &format!("webhook: group build spawn failed: {e}"));
+                        result = "partial_failure";
+                    }
+                }
+
+                crate::mcp_log("INFO", &format!("webhook: reindex complete ({result})"));
+                REINDEXING.store(false, Ordering::SeqCst);
+
+                if let Ok(mut status) = WEBHOOK_STATUS.lock() {
+                    *status = Some(WebhookStatus {
+                        reindexing: false,
+                        last_repo: repo,
+                        last_result: result.to_string(),
+                        last_completed_epoch: SystemTime::now()
+                            .duration_since(UNIX_EPOCH)
+                            .map(|d| d.as_secs())
+                            .unwrap_or(0),
+                    });
+                }
+            });
+
+            serve_json_status(200, json!({"status": "accepted", "repo": repo_response}))
         }
-
-        crate::mcp_log("INFO", &format!("webhook: indexing {repo_name}"));
-        let _ = Command::new(&infigraph_bin)
-            .arg("index")
-            .current_dir(&repo_path)
-            .status();
-
-        crate::mcp_log("INFO", &format!("webhook: rebuilding group {group}"));
-        let _ = Command::new(&infigraph_bin)
-            .args(["group", "build", &group])
-            .status();
-
-        crate::mcp_log("INFO", "webhook: reindex complete");
-        REINDEXING.store(false, Ordering::SeqCst);
-    });
-
-    serve_json_status(
-        200,
-        json!({"status": "accepted", "repo": repo_name_response}),
-    )
+    }
 }
 
 fn validate_webhook_signature(body: &str, signature: Option<&str>) -> bool {
@@ -472,6 +596,323 @@ mod tests {
         assert_ne!(
             status, 200,
             "/health should not match when health_path is /health/full"
+        );
+    }
+
+    // --- HMAC signature validation tests ---
+
+    fn compute_hmac(secret: &str, body: &str) -> String {
+        use hmac::{Hmac, Mac};
+        use sha2::Sha256;
+        type HmacSha256 = Hmac<Sha256>;
+        let mut mac = HmacSha256::new_from_slice(secret.as_bytes()).unwrap();
+        mac.update(body.as_bytes());
+        format!("sha256={}", hex::encode(mac.finalize().into_bytes()))
+    }
+
+    #[test]
+    fn test_valid_signature_accepted() {
+        let _guard = TEST_LOCK.lock().unwrap();
+        let secret = "test-secret-123";
+        let body = r#"{"ref":"refs/heads/main"}"#;
+        unsafe {
+            std::env::set_var("WEBHOOK_SECRET", secret);
+        }
+        let sig = compute_hmac(secret, body);
+        assert!(validate_webhook_signature(body, Some(&sig)));
+        unsafe {
+            std::env::remove_var("WEBHOOK_SECRET");
+        }
+    }
+
+    #[test]
+    fn test_wrong_signature_rejected() {
+        let _guard = TEST_LOCK.lock().unwrap();
+        unsafe {
+            std::env::set_var("WEBHOOK_SECRET", "real-secret");
+        }
+        let sig = compute_hmac("wrong-secret", "body");
+        assert!(!validate_webhook_signature("body", Some(&sig)));
+        unsafe {
+            std::env::remove_var("WEBHOOK_SECRET");
+        }
+    }
+
+    #[test]
+    fn test_missing_signature_rejected() {
+        let _guard = TEST_LOCK.lock().unwrap();
+        unsafe {
+            std::env::set_var("WEBHOOK_SECRET", "some-secret");
+        }
+        assert!(!validate_webhook_signature("body", None));
+        unsafe {
+            std::env::remove_var("WEBHOOK_SECRET");
+        }
+    }
+
+    #[test]
+    fn test_no_secret_configured_passes() {
+        let _guard = TEST_LOCK.lock().unwrap();
+        unsafe {
+            std::env::remove_var("WEBHOOK_SECRET");
+        }
+        assert!(validate_webhook_signature("body", None));
+        assert!(validate_webhook_signature("body", Some("anything")));
+    }
+
+    #[test]
+    fn test_missing_sha256_prefix_rejected() {
+        let _guard = TEST_LOCK.lock().unwrap();
+        unsafe {
+            std::env::set_var("WEBHOOK_SECRET", "secret");
+        }
+        assert!(!validate_webhook_signature("body", Some("abcdef1234")));
+        unsafe {
+            std::env::remove_var("WEBHOOK_SECRET");
+        }
+    }
+
+    #[test]
+    fn test_non_hex_signature_rejected() {
+        let _guard = TEST_LOCK.lock().unwrap();
+        unsafe {
+            std::env::set_var("WEBHOOK_SECRET", "secret");
+        }
+        assert!(!validate_webhook_signature(
+            "body",
+            Some("sha256=notvalidhex!!!")
+        ));
+        unsafe {
+            std::env::remove_var("WEBHOOK_SECRET");
+        }
+    }
+
+    // --- decide_webhook tests ---
+
+    fn push_event(repo: &str, ref_str: &str, default_branch: &str) -> String {
+        serde_json::json!({
+            "ref": ref_str,
+            "repository": {
+                "name": repo,
+                "default_branch": default_branch
+            }
+        })
+        .to_string()
+    }
+
+    #[test]
+    fn test_bad_json_returns_bad_json() {
+        let _guard = TEST_LOCK.lock().unwrap();
+        unsafe {
+            std::env::remove_var("WEBHOOK_SECRET");
+        }
+        let decision = decide_webhook("not valid json {{{", None, false);
+        assert_eq!(decision, WebhookDecision::BadJson400);
+    }
+
+    #[test]
+    fn test_non_default_branch_ignored() {
+        let _guard = TEST_LOCK.lock().unwrap();
+        unsafe {
+            std::env::remove_var("WEBHOOK_SECRET");
+        }
+        let body = push_event("my-repo", "refs/heads/feature-x", "main");
+        let decision = decide_webhook(&body, None, false);
+        assert_eq!(
+            decision,
+            WebhookDecision::Ignored {
+                reason: "non-default branch".to_string()
+            }
+        );
+    }
+
+    #[test]
+    fn test_default_branch_push_accepted() {
+        let _guard = TEST_LOCK.lock().unwrap();
+        unsafe {
+            std::env::remove_var("WEBHOOK_SECRET");
+        }
+        let body = push_event("skills-registry", "refs/heads/main", "main");
+        let decision = decide_webhook(&body, None, false);
+        match decision {
+            WebhookDecision::Accepted { repo, .. } => {
+                assert_eq!(repo, "skills-registry");
+            }
+            other => panic!("expected Accepted, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn test_already_reindexing_queued() {
+        let _guard = TEST_LOCK.lock().unwrap();
+        unsafe {
+            std::env::remove_var("WEBHOOK_SECRET");
+        }
+        let body = push_event("my-repo", "refs/heads/main", "main");
+        let decision = decide_webhook(&body, None, true);
+        assert_eq!(decision, WebhookDecision::AlreadyReindexing);
+    }
+
+    #[test]
+    fn test_missing_repo_name_uses_empty() {
+        let _guard = TEST_LOCK.lock().unwrap();
+        unsafe {
+            std::env::remove_var("WEBHOOK_SECRET");
+        }
+        let body = r#"{"ref": "refs/heads/main", "repository": {"default_branch": "main"}}"#;
+        let decision = decide_webhook(body, None, false);
+        match decision {
+            WebhookDecision::Accepted { repo, .. } => {
+                assert_eq!(repo, "");
+            }
+            other => panic!("expected Accepted, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn test_custom_default_branch() {
+        let _guard = TEST_LOCK.lock().unwrap();
+        unsafe {
+            std::env::remove_var("WEBHOOK_SECRET");
+        }
+        let body = push_event("my-repo", "refs/heads/develop", "develop");
+        let decision = decide_webhook(&body, None, false);
+        match decision {
+            WebhookDecision::Accepted { repo, .. } => {
+                assert_eq!(repo, "my-repo");
+            }
+            other => panic!("expected Accepted, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn test_reject401_on_bad_signature() {
+        let _guard = TEST_LOCK.lock().unwrap();
+        unsafe {
+            std::env::set_var("WEBHOOK_SECRET", "real-secret");
+        }
+        let body = push_event("repo", "refs/heads/main", "main");
+        let decision = decide_webhook(&body, Some("sha256=0000"), false);
+        assert_eq!(decision, WebhookDecision::Reject401);
+        unsafe {
+            std::env::remove_var("WEBHOOK_SECRET");
+        }
+    }
+
+    // --- Integration tests (HTTP round-trip) ---
+
+    fn http_post(port: u16, path: &str, body: &str, headers: &[(&str, &str)]) -> (u16, String) {
+        let mut stream = TcpStream::connect(format!("127.0.0.1:{}", port)).unwrap();
+        let mut header_str = String::new();
+        for (k, v) in headers {
+            header_str.push_str(&format!("{}: {}\r\n", k, v));
+        }
+        write!(
+            stream,
+            "POST {} HTTP/1.1\r\nHost: 127.0.0.1\r\nConnection: close\r\nContent-Length: {}\r\n{}\r\n{}",
+            path,
+            body.len(),
+            header_str,
+            body
+        )
+        .unwrap();
+        let mut response = String::new();
+        stream.read_to_string(&mut response).unwrap();
+        let status = response
+            .lines()
+            .next()
+            .and_then(|l| l.split_whitespace().nth(1))
+            .and_then(|s| s.parse().ok())
+            .unwrap_or(0);
+        let body = response.split("\r\n\r\n").nth(1).unwrap_or("").to_string();
+        (status, body)
+    }
+
+    #[test]
+    fn test_webhook_post_valid_returns_200_accepted() {
+        let _guard = TEST_LOCK.lock().unwrap();
+        unsafe {
+            std::env::remove_var("WEBHOOK_SECRET");
+        }
+        REINDEXING.store(false, Ordering::SeqCst);
+        let port = free_port();
+        set_ready(true);
+        assert!(start_mcp_http_server(port, false, "/health"));
+        thread::sleep(std::time::Duration::from_millis(100));
+
+        let body = push_event("test-repo", "refs/heads/main", "main");
+        let (status, resp_body) = http_post(port, "/webhook/reindex", &body, &[]);
+        assert_eq!(status, 200);
+        assert!(resp_body.contains("accepted"), "body: {}", resp_body);
+        assert!(resp_body.contains("test-repo"), "body: {}", resp_body);
+
+        // Wait briefly then reset REINDEXING (background thread will fail on missing binary, that's fine)
+        thread::sleep(std::time::Duration::from_millis(200));
+        REINDEXING.store(false, Ordering::SeqCst);
+    }
+
+    #[test]
+    fn test_webhook_post_bad_sig_returns_401() {
+        let _guard = TEST_LOCK.lock().unwrap();
+        unsafe {
+            std::env::set_var("WEBHOOK_SECRET", "my-secret");
+        }
+        REINDEXING.store(false, Ordering::SeqCst);
+        let port = free_port();
+        set_ready(true);
+        assert!(start_mcp_http_server(port, false, "/health"));
+        thread::sleep(std::time::Duration::from_millis(100));
+
+        let body = push_event("test-repo", "refs/heads/main", "main");
+        let (status, resp_body) = http_post(
+            port,
+            "/webhook/reindex",
+            &body,
+            &[(
+                "X-Hub-Signature-256",
+                "sha256=0000000000000000000000000000000000000000000000000000000000000000",
+            )],
+        );
+        assert_eq!(status, 401, "body: {}", resp_body);
+        unsafe {
+            std::env::remove_var("WEBHOOK_SECRET");
+        }
+    }
+
+    #[test]
+    fn test_webhook_status_endpoint() {
+        let _guard = TEST_LOCK.lock().unwrap();
+        let port = free_port();
+        set_ready(true);
+        assert!(start_mcp_http_server(port, false, "/health"));
+        thread::sleep(std::time::Duration::from_millis(100));
+
+        let (status, body) = http_get(port, "/webhook/status");
+        assert_eq!(status, 200);
+        assert!(body.contains("reindexing"), "body: {}", body);
+    }
+
+    #[test]
+    fn test_reindexing_flag_cleared_after_spawn() {
+        let _guard = TEST_LOCK.lock().unwrap();
+        unsafe {
+            std::env::remove_var("WEBHOOK_SECRET");
+        }
+        REINDEXING.store(false, Ordering::SeqCst);
+        let port = free_port();
+        set_ready(true);
+        assert!(start_mcp_http_server(port, false, "/health"));
+        thread::sleep(std::time::Duration::from_millis(100));
+
+        let body = push_event("nonexistent-repo", "refs/heads/main", "main");
+        let (status, _) = http_post(port, "/webhook/reindex", &body, &[]);
+        assert_eq!(status, 200);
+
+        // Background thread should fail fast (no binary/repo) and clear flag
+        thread::sleep(std::time::Duration::from_millis(500));
+        assert!(
+            !REINDEXING.load(Ordering::SeqCst),
+            "REINDEXING flag should be cleared even after failure"
         );
     }
 }

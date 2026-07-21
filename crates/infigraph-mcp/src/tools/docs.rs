@@ -55,7 +55,16 @@ pub fn auto_start_doc_watch_opportunistic(path: &str) -> Option<String> {
     auto_start_doc_watch_inner(path, true)
 }
 
+fn is_remote_mode() -> bool {
+    std::env::var("INFIGRAPH_BACKEND")
+        .map(|v| v == "neo4j")
+        .unwrap_or(false)
+}
+
 fn auto_start_doc_watch_inner(path: &str, skip_disabled_check: bool) -> Option<String> {
+    if is_remote_mode() {
+        return None;
+    }
     if !skip_disabled_check && super::watch::watchers_disabled() {
         return None;
     }
@@ -101,8 +110,8 @@ pub fn tool_review(args: &Value) -> Result<String> {
     let context = args.get("context").and_then(|v| v.as_str());
     let group = args.get("group").and_then(|v| v.as_str());
 
-    let store = prism
-        .store()
+    let backend = prism
+        .backend()
         .context("not initialized -- run 'infigraph index' first")?;
     let registry = infigraph_languages::bundled_registry()?;
     let root = prism.root().to_path_buf();
@@ -114,13 +123,13 @@ pub fn tool_review(args: &Value) -> Result<String> {
             base_ref,
             limit,
             &registry,
-            store,
+            backend,
             group_name,
             &multi_reg,
             infigraph_languages::bundled_registry,
         )?
     } else {
-        infigraph_core::review::review(&root, base_ref, limit, &registry, store)?
+        infigraph_core::review::review(&root, base_ref, limit, &registry, backend)?
     };
 
     if !llm && !dry_run {
@@ -128,7 +137,7 @@ pub fn tool_review(args: &Value) -> Result<String> {
     }
 
     let (prompt, result) =
-        infigraph_core::review::llm::review_with_llm(&root, &report, store, dry_run, context)?;
+        infigraph_core::review::llm::review_with_llm(&root, &report, backend, dry_run, context)?;
 
     if dry_run {
         return Ok(prompt);
@@ -218,7 +227,11 @@ pub fn tool_search_docs(args: &Value) -> Result<String> {
     let mut file_contents: HashMap<String, String> = HashMap::new();
     for r in &results {
         if !file_contents.contains_key(&r.doc_file) {
-            let full_path = root.join(&r.doc_file);
+            let full_path = if std::path::Path::new(&r.doc_file).is_absolute() {
+                PathBuf::from(&r.doc_file)
+            } else {
+                root.join(&r.doc_file)
+            };
             if let Ok(content) = std::fs::read_to_string(&full_path) {
                 file_contents.insert(r.doc_file.clone(), content);
             }
@@ -493,7 +506,7 @@ pub fn tool_index_confluence_pages(args: &Value) -> Result<String> {
     if !docs.is_empty() {
         let doc_refs: Vec<&infigraph_docs::extract::ExtractedDoc> = docs.iter().collect();
         let chunk_refs: Vec<&infigraph_docs::chunk::Chunk> = all_chunks.iter().collect();
-        store.upsert_all_parquet(&doc_refs, &chunk_refs)?;
+        store.upsert_docs(&doc_refs, &chunk_refs)?;
 
         for doc in &docs {
             store.link_doc_to_source(&doc.file, &source_id)?;
@@ -524,6 +537,13 @@ pub fn tool_index_confluence_pages(args: &Value) -> Result<String> {
 }
 
 pub fn tool_watch_docs(args: &Value) -> Result<String> {
+    if is_remote_mode() {
+        return Ok(
+            "Doc watching is not supported in remote mode (Neo4j backend). \
+             Reindexing is triggered via webhooks instead."
+                .to_string(),
+        );
+    }
     init_doc_watchers();
 
     let path = args
@@ -598,8 +618,8 @@ pub fn tool_stop_watch_docs(args: &Value) -> Result<String> {
 
 pub fn tool_index_manifests(args: &Value) -> Result<String> {
     let prism = open_prism(args)?;
-    let store = prism.store().context("not initialized")?;
-    let results = infigraph_core::manifest::index_manifests(prism.root(), store)?;
+    let backend = prism.backend().context("not initialized")?;
+    let results = infigraph_core::manifest::index_manifests(prism.root(), backend)?;
     if results.is_empty() {
         return Ok(
             "No manifests found (package.json, Cargo.toml, go.mod, pom.xml, etc.)".to_string(),

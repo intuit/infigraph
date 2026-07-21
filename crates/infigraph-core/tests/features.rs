@@ -1,4 +1,4 @@
-use infigraph_core::graph::{GraphQuery, GraphStore};
+use infigraph_core::graph::{GraphStore, KuzuBackend};
 use infigraph_core::model::{FileExtraction, Relation, RelationKind, Span, Symbol, SymbolKind};
 
 fn span(file: &str, start: u32, end: u32) -> Span {
@@ -40,7 +40,7 @@ fn rel(src: &str, tgt: &str, kind: RelationKind) -> Relation {
 
 struct TestGraph {
     _dir: tempfile::TempDir,
-    store: GraphStore,
+    backend: KuzuBackend,
 }
 
 fn setup_graph() -> TestGraph {
@@ -153,7 +153,10 @@ fn setup_graph() -> TestGraph {
         let conn = store.connection().unwrap();
         store.upsert_all_bulk(&conn, &extractions).unwrap();
     }
-    TestGraph { _dir: dir, store }
+    TestGraph {
+        _dir: dir,
+        backend: KuzuBackend::from_store(store),
+    }
 }
 
 // ============================================================
@@ -163,11 +166,8 @@ fn setup_graph() -> TestGraph {
 #[test]
 fn test_export_cypher() {
     let tg = setup_graph();
-    let conn = tg.store.connection().unwrap();
-    let q = GraphQuery::new(&conn);
-
     let mut buf = Vec::new();
-    infigraph_core::export::export_cypher(&q, &mut buf).unwrap();
+    infigraph_core::export::export_cypher(&tg.backend, &mut buf).unwrap();
     let output = String::from_utf8(buf).unwrap();
 
     assert!(output.contains("CREATE"), "should have CREATE statements");
@@ -181,11 +181,8 @@ fn test_export_cypher() {
 #[test]
 fn test_export_graphml() {
     let tg = setup_graph();
-    let conn = tg.store.connection().unwrap();
-    let q = GraphQuery::new(&conn);
-
     let mut buf = Vec::new();
-    infigraph_core::export::export_graphml(&q, &mut buf).unwrap();
+    infigraph_core::export::export_graphml(&tg.backend, &mut buf).unwrap();
     let output = String::from_utf8(buf).unwrap();
 
     assert!(output.contains("<graphml"), "should be valid GraphML");
@@ -196,11 +193,8 @@ fn test_export_graphml() {
 #[test]
 fn test_export_json() {
     let tg = setup_graph();
-    let conn = tg.store.connection().unwrap();
-    let q = GraphQuery::new(&conn);
-
     let mut buf = Vec::new();
-    infigraph_core::export::export_json(&q, &mut buf).unwrap();
+    infigraph_core::export::export_json(&tg.backend, &mut buf).unwrap();
     let output = String::from_utf8(buf).unwrap();
 
     let parsed: serde_json::Value = serde_json::from_str(&output).unwrap();
@@ -212,11 +206,10 @@ fn test_export_json() {
 fn test_export_empty_graph() {
     let dir = tempfile::TempDir::new().unwrap();
     let store = GraphStore::open(&dir.path().join("graph")).unwrap();
-    let conn = store.connection().unwrap();
-    let q = GraphQuery::new(&conn);
+    let backend = KuzuBackend::from_store(store);
 
     let mut buf = Vec::new();
-    infigraph_core::export::export_json(&q, &mut buf).unwrap();
+    infigraph_core::export::export_json(&backend, &mut buf).unwrap();
     let output = String::from_utf8(buf).unwrap();
     let parsed: serde_json::Value = serde_json::from_str(&output).unwrap();
     assert!(parsed["nodes"].as_array().unwrap().is_empty());
@@ -229,11 +222,9 @@ fn test_export_empty_graph() {
 #[test]
 fn test_sequence_diagram_basic() {
     let tg = setup_graph();
-    let conn = tg.store.connection().unwrap();
-    let q = GraphQuery::new(&conn);
 
     let mermaid = infigraph_core::sequence::generate_sequence_mermaid(
-        &q,
+        &tg.backend,
         "src/api/handler.py::handle_request",
         3,
     )
@@ -252,11 +243,9 @@ fn test_sequence_diagram_basic() {
 #[test]
 fn test_sequence_diagram_no_calls() {
     let tg = setup_graph();
-    let conn = tg.store.connection().unwrap();
-    let q = GraphQuery::new(&conn);
 
     let mermaid = infigraph_core::sequence::generate_sequence_mermaid(
-        &q,
+        &tg.backend,
         "src/api/handler.py::validate_input",
         3,
     )
@@ -272,18 +261,16 @@ fn test_sequence_diagram_no_calls() {
 #[test]
 fn test_sequence_diagram_depth_limit() {
     let tg = setup_graph();
-    let conn = tg.store.connection().unwrap();
-    let q = GraphQuery::new(&conn);
 
     let shallow = infigraph_core::sequence::generate_sequence_mermaid(
-        &q,
+        &tg.backend,
         "src/api/handler.py::handle_request",
         1,
     )
     .unwrap();
 
     let deep = infigraph_core::sequence::generate_sequence_mermaid(
-        &q,
+        &tg.backend,
         "src/api/handler.py::handle_request",
         5,
     )
@@ -462,11 +449,9 @@ fn test_diff_format() {
 #[test]
 fn test_viz_generate_html() {
     let tg = setup_graph();
-    let conn = tg.store.connection().unwrap();
-    let q = GraphQuery::new(&conn);
 
     let output_path = tg._dir.path().join("graph.html");
-    let result_path = infigraph_core::viz::generate_html(&q, &output_path).unwrap();
+    let result_path = infigraph_core::viz::generate_html(&tg.backend, &output_path).unwrap();
     assert!(!result_path.is_empty());
     let html = std::fs::read_to_string(&output_path).unwrap();
     assert!(
@@ -482,12 +467,10 @@ fn test_viz_generate_html() {
 #[test]
 fn test_viz_generate_symbol_html() {
     let tg = setup_graph();
-    let conn = tg.store.connection().unwrap();
-    let q = GraphQuery::new(&conn);
 
     let output_path = tg._dir.path().join("symbol.html");
     let result_path = infigraph_core::viz::generate_symbol_html(
-        &q,
+        &tg.backend,
         "src/api/handler.py::handle_request",
         2,
         &output_path,

@@ -2,14 +2,14 @@ use std::collections::{HashMap, HashSet, VecDeque};
 
 use anyhow::Result;
 
-use crate::graph::GraphQuery;
+use crate::graph::GraphBackend;
 
 /// Generate a Mermaid sequenceDiagram from the call graph starting at `entry_symbol_id`.
 ///
 /// Participants = unique files. Messages = CALLS edges. BFS bounded by `depth`.
 /// Skips self-calls (same file calling same file) unless they cross functions.
 pub fn generate_sequence_mermaid(
-    gq: &GraphQuery,
+    backend: &dyn GraphBackend,
     entry_symbol_id: &str,
     depth: u32,
 ) -> Result<String> {
@@ -28,7 +28,7 @@ pub fn generate_sequence_mermaid(
         }
         let esc = id.replace('\'', "\\'");
         let q = format!("MATCH (a:Symbol)-[:CALLS]->(b:Symbol) WHERE a.id = '{esc}' RETURN b.id");
-        if let Ok(rows) = gq.raw_query(&q) {
+        if let Ok(rows) = backend.raw_query(&q) {
             for row in &rows {
                 if let Some(callee_id) = row.first() {
                     edges.push((id.clone(), callee_id.clone()));
@@ -52,7 +52,7 @@ pub fn generate_sequence_mermaid(
     for id in &visited {
         let esc = id.replace('\'', "\\'");
         let q = format!("MATCH (s:Symbol) WHERE s.id = '{esc}' RETURN s.name, s.file");
-        if let Ok(rows) = gq.raw_query(&q) {
+        if let Ok(rows) = backend.raw_query(&q) {
             if let Some(row) = rows.first() {
                 if row.len() >= 2 {
                     sym_info.insert(id.clone(), (row[0].clone(), row[1].clone()));

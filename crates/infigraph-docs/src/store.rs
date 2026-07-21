@@ -10,6 +10,7 @@ use kuzu::{Connection, Database, SystemConfig};
 use parquet::arrow::ArrowWriter;
 use parquet::file::properties::WriterProperties;
 
+use crate::backend::DocBackend;
 use crate::chunk::Chunk;
 use crate::extract::ExtractedDoc;
 
@@ -803,6 +804,127 @@ pub struct ImpactResult {
     pub impact_type: String,
     pub depth: u32,
     pub path: String,
+}
+
+impl DocBackend for DocStore {
+    fn get_doc_hashes(&self) -> Result<HashMap<String, String>> {
+        self.get_doc_hashes()
+    }
+
+    fn upsert_docs(&self, docs: &[&ExtractedDoc], chunks: &[&Chunk]) -> Result<()> {
+        self.upsert_all_parquet(docs, chunks)
+    }
+
+    fn delete_docs_by_ids(&self, doc_ids: &[&str]) -> Result<()> {
+        self.delete_docs_by_ids(doc_ids)
+    }
+
+    fn ensure_document_node(&self, doc_id: &str) -> Result<()> {
+        self.ensure_document_node(doc_id)
+    }
+
+    fn upsert_source(
+        &self,
+        id: &str,
+        source_type: &str,
+        base_url: &str,
+        space_key: &str,
+    ) -> Result<()> {
+        self.upsert_source(id, source_type, base_url, space_key)
+    }
+
+    fn link_doc_to_source(&self, doc_id: &str, source_id: &str) -> Result<()> {
+        self.link_doc_to_source(doc_id, source_id)
+    }
+
+    fn get_docs_by_source(&self, source_id: &str) -> Result<Vec<String>> {
+        self.get_docs_by_source(source_id)
+    }
+
+    fn create_link(
+        &self,
+        from_doc_id: &str,
+        to_doc_id: &str,
+        url: &str,
+        link_type: &str,
+    ) -> Result<()> {
+        self.create_link(from_doc_id, to_doc_id, url, link_type)
+    }
+
+    fn delete_links_from(&self, doc_id: &str) -> Result<()> {
+        self.delete_links_from(doc_id)
+    }
+
+    fn get_all_chunks(&self) -> Result<Vec<(String, String)>> {
+        self.get_all_chunks()
+    }
+
+    fn get_chunk_ids(&self) -> Result<std::collections::HashSet<String>> {
+        self.get_chunk_ids()
+    }
+
+    fn get_chunk_details(&self, chunk_ids: &[&str]) -> Result<Vec<ChunkDetail>> {
+        self.get_chunk_details(chunk_ids)
+    }
+
+    fn stats(&self) -> Result<DocStoreStats> {
+        self.stats()
+    }
+
+    fn ensure_plugin_table(&self, plugin_id: &str, columns: &[(String, String)]) -> Result<()> {
+        self.ensure_plugin_table(plugin_id, columns)
+    }
+
+    fn upsert_pipeline_core(&self, record: &PipelineCoreRecord) -> Result<()> {
+        self.upsert_pipeline_core(record)
+    }
+
+    fn upsert_plugin_properties(
+        &self,
+        pipeline_id: &str,
+        plugin_id: &str,
+        properties: &serde_json::Map<String, serde_json::Value>,
+        schema: &[(String, String)],
+    ) -> Result<()> {
+        self.upsert_plugin_properties(pipeline_id, plugin_id, properties, schema)
+    }
+
+    fn link_pipeline_core_to_doc(&self, pipeline_id: &str, doc_id: &str) -> Result<()> {
+        self.link_pipeline_core_to_doc(pipeline_id, doc_id)
+    }
+
+    fn link_pipeline_dependencies(&self) -> Result<usize> {
+        self.link_pipeline_dependencies()
+    }
+
+    fn get_all_pipeline_cores(&self, plugin_id: Option<&str>) -> Result<Vec<PipelineCoreRecord>> {
+        self.get_all_pipeline_cores(plugin_id)
+    }
+
+    fn get_pipeline_core(&self, pipeline_id: &str) -> Result<Option<PipelineCoreRecord>> {
+        self.get_pipeline_core(pipeline_id)
+    }
+
+    fn impact_analysis(&self, table_name: &str, max_depth: u32) -> Result<Vec<ImpactResult>> {
+        self.impact_analysis(table_name, max_depth)
+    }
+
+    fn get_pipeline_deps(&self) -> Result<Vec<(String, String, String)>> {
+        self.get_pipeline_deps()
+    }
+
+    fn query_plugin_table(
+        &self,
+        plugin_id: &str,
+        field: &str,
+        value: &str,
+    ) -> Result<Vec<serde_json::Value>> {
+        self.query_plugin_table(plugin_id, field, value)
+    }
+
+    fn pipeline_core_count(&self) -> Result<usize> {
+        self.pipeline_core_count()
+    }
 }
 
 fn count_query(conn: &Connection<'_>, query: &str) -> usize {

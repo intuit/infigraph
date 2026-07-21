@@ -90,6 +90,13 @@ where
     MR: Fn() -> Result<crate::lang::LanguageRegistry> + Send + 'static,
     F: Fn(&crate::IndexResult) + Send + 'static,
 {
+    // Some watch backends (e.g. FSEvents on macOS) deliver absolute,
+    // symlink-resolved event paths regardless of how `root` was specified.
+    // If `root` is relative, or traverses a symlink (macOS temp dirs live
+    // under /var, itself a symlink to /private/var), `path.strip_prefix(root)`
+    // below silently fails for every event and all changes are dropped.
+    let root = &root.canonicalize().unwrap_or_else(|_| root.to_path_buf());
+
     let ignore_dirs: &[&str] = &[
         ".infigraph",
         ".git",
@@ -174,12 +181,12 @@ where
                     Ok(result) => {
                         changes_since_periodic += result.indexed_files;
 
-                        if let Some(store) = prism.store() {
+                        if let Some(backend) = prism.backend() {
                             let changed: Vec<&str> =
                                 result.extractions.iter().map(|e| e.file.as_str()).collect();
                             if !changed.is_empty() {
                                 if let Err(e) =
-                                    crate::embed::update_embeddings(store, root, &changed)
+                                    crate::embed::update_embeddings(backend, root, &changed)
                                 {
                                     eprintln!("[watch] batch embedding update failed: {e}");
                                 }
@@ -342,8 +349,8 @@ where
                                 .unwrap_or_else(|_| evt.path.to_string_lossy().replace('\\', "/"));
                             let mut affected_files = vec![evt.path.clone()];
 
-                            if let Some(store) = p.store() {
-                                let deps = get_cross_file_dependents(store, &changed_rel);
+                            if let Some(backend) = p.backend() {
+                                let deps = get_cross_file_dependents(backend, &changed_rel);
                                 for dep_rel in deps {
                                     let dep_abs = root_owned.join(&dep_rel);
                                     if dep_abs.exists() {
@@ -359,11 +366,10 @@ where
                                         r.indexed_files, r.total_files
                                     );
 
-                                    if let Some(store) = p.store() {
+                                    if let Some(backend) = p.backend() {
                                         let file_strs: Vec<String> =
                                             r.extractions.iter().map(|e| e.file.clone()).collect();
-                                        match crate::resolve::re_resolve_for_files(
-                                            store,
+                                        match backend.re_resolve_for_files(
                                             &file_strs,
                                             &r.extractions,
                                             None,
@@ -378,17 +384,21 @@ where
 
                                         let changed: Vec<&str> =
                                             r.extractions.iter().map(|e| e.file.as_str()).collect();
-                                        match crate::embed::update_embeddings(
-                                            store,
-                                            &root_owned,
-                                            &changed,
-                                        ) {
-                                            Ok(n) => {
-                                                eprintln!("[watch {prefix}] updated {n} embeddings")
+                                        if let Some(eb) = p.backend() {
+                                            match crate::embed::update_embeddings(
+                                                eb,
+                                                &root_owned,
+                                                &changed,
+                                            ) {
+                                                Ok(n) => {
+                                                    eprintln!(
+                                                        "[watch {prefix}] updated {n} embeddings"
+                                                    )
+                                                }
+                                                Err(e) => eprintln!(
+                                                    "[watch {prefix}] embedding update failed: {e}"
+                                                ),
                                             }
-                                            Err(e) => eprintln!(
-                                                "[watch {prefix}] embedding update failed: {e}"
-                                            ),
                                         }
                                     }
                                 }
@@ -419,18 +429,17 @@ where
 }
 
 /// Returns the relative paths of files that have cross-file CALLS edges to/from the given file.
-fn get_cross_file_dependents(store: &crate::graph::GraphStore, rel_path: &str) -> Vec<String> {
-    let conn = match store.connection() {
-        Ok(c) => c,
-        Err(_) => return Vec::new(),
-    };
+fn get_cross_file_dependents(
+    backend: &dyn crate::graph::GraphBackend,
+    rel_path: &str,
+) -> Vec<String> {
     let escaped = rel_path.replace('\'', "\\'");
     let mut dependents = std::collections::HashSet::new();
 
     let q1 = format!(
         "MATCH (a:Symbol)-[:CALLS]->(b:Symbol) WHERE a.file = '{escaped}' AND b.file <> '{escaped}' RETURN DISTINCT b.file"
     );
-    if let Ok(result) = conn.query(&q1) {
+    if let Ok(result) = backend.raw_query(&q1) {
         for row in result {
             if let Some(val) = row.first() {
                 dependents.insert(val.to_string());
@@ -441,7 +450,7 @@ fn get_cross_file_dependents(store: &crate::graph::GraphStore, rel_path: &str) -
     let q2 = format!(
         "MATCH (a:Symbol)-[:CALLS]->(b:Symbol) WHERE b.file = '{escaped}' AND a.file <> '{escaped}' RETURN DISTINCT a.file"
     );
-    if let Ok(result) = conn.query(&q2) {
+    if let Ok(result) = backend.raw_query(&q2) {
         for row in result {
             if let Some(val) = row.first() {
                 dependents.insert(val.to_string());
@@ -454,20 +463,16 @@ fn get_cross_file_dependents(store: &crate::graph::GraphStore, rel_path: &str) -
 
 /// Returns true if the file has any resolved CALLS edges to/from symbols in other files.
 fn has_cross_file_calls(prism: &Infigraph, rel_path: &str) -> bool {
-    let store = match prism.store() {
-        Some(s) => s,
+    let backend = match prism.backend() {
+        Some(b) => b,
         None => return false,
-    };
-    let conn = match store.connection() {
-        Ok(c) => c,
-        Err(_) => return false,
     };
     let escaped = rel_path.replace('\'', "\\'");
     let q = format!(
         "MATCH (a:Symbol)-[:CALLS]->(b:Symbol) WHERE a.file = '{escaped}' AND b.file <> '{escaped}' RETURN count(*) LIMIT 1"
     );
-    if let Ok(mut result) = conn.query(&q) {
-        if let Some(row) = result.next() {
+    if let Ok(result) = backend.raw_query(&q) {
+        if let Some(row) = result.first() {
             if let Some(val) = row.first() {
                 if val.to_string().parse::<u64>().unwrap_or(0) > 0 {
                     return true;
@@ -478,8 +483,8 @@ fn has_cross_file_calls(prism: &Infigraph, rel_path: &str) -> bool {
     let q2 = format!(
         "MATCH (a:Symbol)-[:CALLS]->(b:Symbol) WHERE b.file = '{escaped}' AND a.file <> '{escaped}' RETURN count(*) LIMIT 1"
     );
-    if let Ok(mut result) = conn.query(&q2) {
-        if let Some(row) = result.next() {
+    if let Ok(result) = backend.raw_query(&q2) {
+        if let Some(row) = result.first() {
             if let Some(val) = row.first() {
                 return val.to_string().parse::<u64>().unwrap_or(0) > 0;
             }
@@ -522,5 +527,85 @@ fn register_subdirs(watcher: &mut RecommendedWatcher, dir: &Path, ignore_dirs: &
         }
         let _ = watcher.watch(&path, RecursiveMode::NonRecursive);
         register_subdirs(watcher, &path, ignore_dirs);
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::sync::Mutex;
+
+    /// Regression test for a macOS-specific bug: `watch_project_with_periodic`
+    /// used to compare raw filesystem-watch event paths against the caller's
+    /// `root` exactly as given. FSEvents delivers absolute, symlink-resolved
+    /// event paths, so a non-canonical `root` (e.g. a relative path, or one
+    /// that traverses a symlink) made `path.strip_prefix(root)` fail for
+    /// every event, silently dropping all changes with no error. This is the
+    /// same class of bug that made the `infigraph watch` CLI command — which
+    /// watched the unresolved `.` — appear to receive no events at all,
+    /// prompting a workaround (the kqueue backend) that caused a much larger
+    /// file-descriptor leak.
+    ///
+    /// A custom-prefixed `tempfile::TempDir` reproduces a non-canonical root
+    /// deterministically on macOS: it lives under `/var/folders/...`, itself
+    /// a symlink to `/private/var/folders/...`. (The default `TempDir::new()`
+    /// prefix starts with a dot, which the watcher's own hidden-file filter
+    /// would ignore regardless of this bug, so a custom prefix is used to
+    /// keep the test isolated to the canonicalization behavior.)
+    #[test]
+    #[cfg(target_os = "macos")]
+    fn watch_project_detects_changes_through_symlinked_root() {
+        let tmp = tempfile::Builder::new()
+            .prefix("infigraph-watch-test-")
+            .tempdir()
+            .unwrap();
+        let raw_root = tmp.path().to_path_buf();
+        let canonical_root = raw_root.canonicalize().unwrap();
+        assert_ne!(
+            raw_root, canonical_root,
+            "test assumption broken: TempDir root is already canonical on this machine"
+        );
+
+        let file_path = raw_root.join("watched.txt");
+        std::fs::write(&file_path, "v1").unwrap();
+
+        let events: Arc<Mutex<Vec<WatchEvent>>> = Arc::new(Mutex::new(Vec::new()));
+        let events_clone = Arc::clone(&events);
+        let (stop_tx, stop_rx) = mpsc::channel();
+
+        let handle = std::thread::spawn(move || {
+            watch_project(
+                &raw_root,
+                || Ok(crate::lang::LanguageRegistry::new()),
+                50,
+                stop_rx,
+                move |evt| events_clone.lock().unwrap().push(evt),
+            )
+        });
+
+        // Give the watcher time to register before triggering a change.
+        std::thread::sleep(Duration::from_millis(300));
+        std::fs::remove_file(&file_path).unwrap();
+
+        // Poll rather than a single fixed sleep: fast on a quiet machine,
+        // robust on a loaded one.
+        let mut seen = false;
+        for _ in 0..40 {
+            std::thread::sleep(Duration::from_millis(100));
+            if !events.lock().unwrap().is_empty() {
+                seen = true;
+                break;
+            }
+        }
+
+        let _ = stop_tx.send(());
+        let _ = handle.join();
+
+        assert!(
+            seen,
+            "watch_project delivered no events for a change under a non-canonical \
+             (symlinked) root — the root.canonicalize() call in \
+             watch_project_with_periodic may have regressed"
+        );
     }
 }

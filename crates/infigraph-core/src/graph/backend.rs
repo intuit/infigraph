@@ -2,13 +2,18 @@ use std::collections::HashMap;
 
 use anyhow::Result;
 
+use std::path::Path;
+
 use crate::learned::LearnedStore;
 use crate::model::FileExtraction;
 use crate::resolve::ResolveStats;
+use crate::scip::ImportStats;
+use crate::structured::{IngestResult, SchemaMeta};
 
 use super::{
-    ApiSymbol, BranchInfo, FileDeps, GraphStats, ImpactRow, ReferenceRow, SymbolDetail, SymbolRow,
-    TestContext, TestCoverage, TypeHierarchy,
+    ApiSymbol, ArchitectureStats, BranchInfo, ComplexityRow, DeadCodeRow, FileDeps, GraphStats,
+    ImpactRow, ReferenceRow, SymbolDetail, SymbolMeta, SymbolRow, SymbolWithDocstring, TestContext,
+    TestCoverage, TypeHierarchy,
 };
 
 /// Backend-agnostic graph storage interface.
@@ -66,6 +71,19 @@ pub trait GraphBackend: Send + Sync {
         )
     }
 
+    // ── Phase-2: backend-agnostic query methods ──────────────────────
+
+    fn symbol_metadata(&self, id: &str) -> Result<Option<SymbolMeta>>;
+    fn get_complexity_ranking(&self, file_filter: Option<&str>) -> Result<Vec<ComplexityRow>>;
+    fn list_indexed_files(&self) -> Result<Vec<String>>;
+    fn find_uncalled_symbols(&self) -> Result<Vec<DeadCodeRow>>;
+    fn get_architecture_stats(&self) -> Result<ArchitectureStats>;
+    fn symbols_with_docstring(
+        &self,
+        kind_filter: Option<&[&str]>,
+    ) -> Result<Vec<SymbolWithDocstring>>;
+    fn upsert_similar_edge(&self, id_a: &str, id_b: &str, score: f32) -> Result<()>;
+
     // ── Write ────────────────────────────────────────────────────────
 
     /// Insert a single file extraction (delete existing + insert).
@@ -85,7 +103,23 @@ pub trait GraphBackend: Send + Sync {
     fn remove_file(&self, file: &str) -> Result<()>;
 
     /// Derive TESTED_BY edges from naming conventions.
-    fn derive_tested_by_edges(&self) -> Result<usize>;
+    /// When `changed_files` is provided, only derives edges where at least one
+    /// endpoint (test or target) is in the changed set — needed because
+    /// DETACH DELETE on target files destroys existing TESTED_BY edges.
+    fn derive_tested_by_edges(&self, changed_files: Option<&[&str]>) -> Result<usize>;
+
+    /// Delete all data from the graph (used by `--full` reindex in remote mode).
+    /// Default: no-op (local backends wipe `~/.infigraph/` on disk instead).
+    fn clear_all_data(&self) -> Result<()> {
+        Ok(())
+    }
+
+    /// Create a Repo node and link all File nodes to it via BELONGS_TO.
+    /// Sets `repo` property on File nodes for scoped queries.
+    /// Default: no-op (only meaningful for Neo4j multi-repo graphs).
+    fn upsert_repo(&self, _repo_name: &str) -> Result<()> {
+        Ok(())
+    }
 
     // ── Resolve ──────────────────────────────────────────────────────
 
@@ -96,4 +130,34 @@ pub trait GraphBackend: Send + Sync {
         extractions: &[FileExtraction],
         learned: Option<&LearnedStore>,
     ) -> Result<ResolveStats>;
+
+    /// Re-resolve CALLS/INHERITS edges for specific files only.
+    /// Deletes existing edges for the given files, then re-resolves
+    /// using the full symbol map from the graph.
+    fn re_resolve_for_files(
+        &self,
+        files: &[String],
+        extractions: &[FileExtraction],
+        learned: Option<&LearnedStore>,
+    ) -> Result<ResolveStats>;
+
+    // ── SCIP import ──────────────────────────────────────────────────
+
+    fn import_scip_index(
+        &self,
+        index_path: &Path,
+        project_root: Option<&Path>,
+    ) -> Result<ImportStats>;
+
+    // ── Structured ingestion ────────────────────────────────────────
+
+    fn ingest_structured_data(
+        &self,
+        schema: &SchemaMeta,
+        data: &[serde_json::Value],
+    ) -> Result<IngestResult>;
+
+    fn ingest_structured_file(&self, schema: &SchemaMeta, path: &Path) -> Result<IngestResult>;
+
+    fn ingest_structured_directory(&self, schema: &SchemaMeta, dir: &Path) -> Result<IngestResult>;
 }

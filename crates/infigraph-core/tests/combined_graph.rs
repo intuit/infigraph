@@ -191,6 +191,7 @@ def health_check():
             languages: vec!["Python".to_string()],
             symbol_count: ig_a.stats().map(|s| s.symbols).unwrap_or(0),
             module_count: ig_a.stats().map(|s| s.modules).unwrap_or(0),
+            last_indexed_commit: None,
         },
     );
     registry.repos.insert(
@@ -201,6 +202,7 @@ def health_check():
             languages: vec!["Python".to_string()],
             symbol_count: ig_b.stats().map(|s| s.symbols).unwrap_or(0),
             module_count: ig_b.stats().map(|s| s.modules).unwrap_or(0),
+            last_indexed_commit: None,
         },
     );
 
@@ -208,6 +210,7 @@ def health_check():
         "test-platform".to_string(),
         Group {
             name: "test-platform".to_string(),
+            org: String::new(),
             repos: vec!["svc-a".to_string(), "svc-b".to_string()],
             contracts: vec![],
         },
@@ -468,6 +471,7 @@ def get_settings():
             languages: vec!["Python".to_string()],
             symbol_count: ig_a.stats().map(|s| s.symbols).unwrap_or(0),
             module_count: ig_a.stats().map(|s| s.modules).unwrap_or(0),
+            last_indexed_commit: None,
         },
     );
     registry.repos.insert(
@@ -478,12 +482,14 @@ def get_settings():
             languages: vec!["Python".to_string()],
             symbol_count: ig_b.stats().map(|s| s.symbols).unwrap_or(0),
             module_count: ig_b.stats().map(|s| s.modules).unwrap_or(0),
+            last_indexed_commit: None,
         },
     );
     registry.groups.insert(
         "test-false-match".to_string(),
         Group {
             name: "test-false-match".to_string(),
+            org: String::new(),
             repos: vec!["svc-a".to_string(), "svc-b".to_string()],
             contracts: vec![],
         },
@@ -584,6 +590,7 @@ class BaseHandler:
             languages: vec!["Python".to_string()],
             symbol_count: ig_a.stats().map(|s| s.symbols).unwrap_or(0),
             module_count: ig_a.stats().map(|s| s.modules).unwrap_or(0),
+            last_indexed_commit: None,
         },
     );
     registry.repos.insert(
@@ -594,12 +601,14 @@ class BaseHandler:
             languages: vec!["Python".to_string()],
             symbol_count: ig_b.stats().map(|s| s.symbols).unwrap_or(0),
             module_count: ig_b.stats().map(|s| s.modules).unwrap_or(0),
+            last_indexed_commit: None,
         },
     );
     registry.groups.insert(
         "test-real-inherit".to_string(),
         Group {
             name: "test-real-inherit".to_string(),
+            org: String::new(),
             repos: vec!["lib-a".to_string(), "lib-b".to_string()],
             contracts: vec![],
         },

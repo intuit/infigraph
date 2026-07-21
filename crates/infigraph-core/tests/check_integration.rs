@@ -1,10 +1,10 @@
 use infigraph_core::check::{load_config, run_checks, CheckConfig, CheckSelection, CheckStatus};
-use infigraph_core::graph::GraphStore;
+use infigraph_core::graph::{GraphStore, KuzuBackend};
 
-fn empty_store() -> (tempfile::TempDir, GraphStore) {
+fn empty_backend() -> (tempfile::TempDir, KuzuBackend) {
     let dir = tempfile::TempDir::new().unwrap();
     let store = GraphStore::open(&dir.path().join("graph")).unwrap();
-    (dir, store)
+    (dir, KuzuBackend::from_store(store))
 }
 
 #[test]
@@ -66,10 +66,10 @@ fn test_check_security_pass() {
     let dir = tempfile::TempDir::new().unwrap();
     std::fs::write(dir.path().join("safe.py"), "print('hello world')\n").unwrap();
 
-    let (_tmp, store) = empty_store();
+    let (_tmp, backend) = empty_backend();
     let cfg = CheckConfig::default();
     let sel = CheckSelection::all();
-    let results = run_checks(dir.path(), &cfg, &store, &sel);
+    let results = run_checks(dir.path(), &cfg, &backend, &sel);
 
     let sec = results.iter().find(|r| r.name == "security");
     if let Some(s) = sec {
@@ -91,7 +91,7 @@ fn test_check_security_fail() {
     )
     .unwrap();
 
-    let (_tmp, store) = empty_store();
+    let (_tmp, backend) = empty_backend();
     let mut cfg = CheckConfig::default();
     cfg.security.max_critical = 0;
     cfg.security.max_high = 0;
@@ -101,7 +101,7 @@ fn test_check_security_fail() {
         dead_code: false,
         vulnerabilities: false,
     };
-    let results = run_checks(dir.path(), &cfg, &store, &sel);
+    let results = run_checks(dir.path(), &cfg, &backend, &sel);
 
     let sec = results.iter().find(|r| r.name == "security").unwrap();
     assert_eq!(
@@ -114,7 +114,7 @@ fn test_check_security_fail() {
 
 #[test]
 fn test_check_complexity_pass() {
-    let (_tmp, store) = empty_store();
+    let (_tmp, backend) = empty_backend();
     let cfg = CheckConfig::default();
     let sel = CheckSelection {
         security: false,
@@ -122,7 +122,7 @@ fn test_check_complexity_pass() {
         dead_code: false,
         vulnerabilities: false,
     };
-    let results = run_checks(std::path::Path::new("."), &cfg, &store, &sel);
+    let results = run_checks(std::path::Path::new("."), &cfg, &backend, &sel);
 
     let cx = results.iter().find(|r| r.name == "complexity");
     if let Some(c) = cx {

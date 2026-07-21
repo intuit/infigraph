@@ -1,7 +1,10 @@
+pub mod backend;
 pub mod chunk;
 pub mod combined;
 pub mod embed;
 pub mod extract;
+#[cfg(feature = "remote")]
+pub mod neo4j_store;
 pub mod search;
 pub mod store;
 pub mod watch;
@@ -14,16 +17,23 @@ use anyhow::{Context, Result};
 use rayon::prelude::*;
 use sha2::{Digest, Sha256};
 
+use backend::DocBackend;
 use chunk::{Chunk, ChunkStrategy};
 use extract::ExtractedDoc;
 use store::DocStore;
 
 pub mod links;
 
+fn is_remote_mode() -> bool {
+    std::env::var("INFIGRAPH_BACKEND")
+        .map(|v| v == "neo4j")
+        .unwrap_or(false)
+}
+
 pub struct DocIndex {
     root: PathBuf,
     db_path: PathBuf,
-    store: Option<DocStore>,
+    store: Option<Box<dyn DocBackend>>,
     skip_file_embeddings: bool,
 }
 
@@ -39,7 +49,9 @@ pub struct DocIndexResult {
 impl DocIndex {
     pub fn open(root: &Path) -> Result<Self> {
         let tg_dir = root.join(".infigraph");
-        std::fs::create_dir_all(&tg_dir)?;
+        if !is_remote_mode() {
+            std::fs::create_dir_all(&tg_dir)?;
+        }
         let db_path = tg_dir.join("docs.kuzu");
         Ok(Self {
             root: root.to_path_buf(),
@@ -50,13 +62,20 @@ impl DocIndex {
     }
 
     pub fn init(&mut self) -> Result<()> {
+        #[cfg(feature = "remote")]
+        if is_remote_mode() {
+            let neo = neo4j_store::Neo4jDocStore::connect_from_env()?;
+            neo.init_schema()?;
+            self.store = Some(Box::new(neo));
+            return Ok(());
+        }
+
         match DocStore::open(&self.db_path) {
             Ok(store) => {
-                self.store = Some(store);
+                self.store = Some(Box::new(store));
                 Ok(())
             }
             Err(first_err) => {
-                // Corrupt / unreadable docs.kuzu — wipe and rebuild like code graph crash recovery.
                 eprintln!(
                     "[docs] open failed ({first_err}), wiping corrupt doc index and rebuilding..."
                 );
@@ -64,15 +83,15 @@ impl DocIndex {
                 let store = DocStore::open(&self.db_path).with_context(|| {
                     format!("docs kuzu still unreadable after wipe (was: {first_err})")
                 })?;
-                self.store = Some(store);
+                self.store = Some(Box::new(store));
                 self.index()?;
                 Ok(())
             }
         }
     }
 
-    pub fn store(&self) -> Option<&DocStore> {
-        self.store.as_ref()
+    pub fn store(&self) -> Option<&dyn DocBackend> {
+        self.store.as_deref()
     }
 
     pub fn root(&self) -> &Path {
@@ -108,7 +127,7 @@ impl DocIndex {
     }
 
     pub fn index(&self) -> Result<DocIndexResult> {
-        let store = self.store.as_ref().context("call init() first")?;
+        let store = self.store.as_deref().context("call init() first")?;
 
         let files = self.collect_doc_files()?;
         let total = files.len();
@@ -127,12 +146,13 @@ impl DocIndex {
         let existing_hashes = store.get_doc_hashes().unwrap_or_default();
 
         let done = AtomicUsize::new(0);
+        let root = &self.root;
 
         let results: Vec<(ExtractedDoc, Vec<Chunk>)> = files
             .par_iter()
             .filter_map(|path| {
                 let rel = path
-                    .strip_prefix(&self.root)
+                    .strip_prefix(root)
                     .ok()?
                     .to_string_lossy()
                     .replace('\\', "/");
@@ -175,7 +195,7 @@ impl DocIndex {
         if !results.is_empty() {
             let docs: Vec<&ExtractedDoc> = results.iter().map(|(d, _)| d).collect();
             let chunks: Vec<&Chunk> = results.iter().flat_map(|(_, c)| c.iter()).collect();
-            store.upsert_all_parquet(&docs, &chunks)?;
+            store.upsert_docs(&docs, &chunks)?;
         }
 
         let result_chunks: Vec<Chunk> = results.iter().flat_map(|(_, c)| c.clone()).collect();
@@ -184,6 +204,19 @@ impl DocIndex {
         if total_chunks > 0 && !self.skip_file_embeddings {
             let all_chunks: Vec<&Chunk> = results.iter().flat_map(|(_, c)| c.iter()).collect();
             let changed_files: Vec<&str> = results.iter().map(|(d, _)| d.file.as_str()).collect();
+            #[cfg(feature = "remote")]
+            if is_remote_mode() {
+                if let Ok(pg) = infigraph_core::meta::PostgresMetaStore::connect_from_env_cached() {
+                    embed::update_doc_embeddings_remote(store, &pg, &all_chunks, &changed_files)?;
+                } else {
+                    eprintln!(
+                        "Warning: remote mode but Postgres unavailable, skipping doc embeddings"
+                    );
+                }
+            } else {
+                embed::update_doc_embeddings(store, &self.root, &all_chunks, &changed_files)?;
+            }
+            #[cfg(not(feature = "remote"))]
             embed::update_doc_embeddings(store, &self.root, &all_chunks, &changed_files)?;
         }
 
@@ -280,7 +313,7 @@ impl DocIndex {
 
     fn bfs_follow_links(
         &self,
-        store: &DocStore,
+        store: &dyn DocBackend,
         indexed_docs: &mut HashSet<String>,
         repo_root: &Path,
         max_depth: usize,
@@ -407,7 +440,7 @@ impl DocIndex {
 
                     let docs_ref = vec![&doc];
                     let chunks_ref: Vec<&Chunk> = chunks.iter().collect();
-                    if store.upsert_all_parquet(&docs_ref, &chunks_ref).is_ok() {
+                    if store.upsert_docs(&docs_ref, &chunks_ref).is_ok() {
                         indexed_docs.insert(rel_id.clone());
                         changed_files.push(rel_id);
                         new_chunks.extend(chunks);

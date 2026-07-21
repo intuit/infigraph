@@ -15,6 +15,7 @@ Cargo.lock
 *.a
 
 # IDE / Editor
+.claude/
 .vscode/
 .idea/
 *.swp
@@ -67,3 +68,5 @@ docs/assets/branding/
 docs/architecture.md
 docs/contributing.md
 docs/getting-started.md
+/.terragraph
+.devassist-plugins.lock.json

@@ -665,7 +665,12 @@ enum Commands {
 #[derive(Subcommand)]
 pub(crate) enum GroupAction {
     /// Create a new repository group
-    Create { name: String },
+    Create {
+        name: String,
+        /// Organization scope (prevents group name collisions). Defaults to INFIGRAPH_ORG env var.
+        #[arg(long)]
+        org: Option<String>,
+    },
     /// Add a repository to a group
     Add {
         group: String,
@@ -1008,11 +1013,11 @@ fn run(command: Commands, root: &Path) -> Result<()> {
             let registry = bundled_registry()?;
             let mut prism = infigraph_core::Infigraph::open(root, registry)?;
             prism.init()?;
-            let store = prism
-                .store()
+            let backend = prism
+                .backend()
                 .context("graph not initialized -- run 'infigraph index' first")?;
 
-            let current = infigraph_core::bench::QualityMetrics::capture(root, store)?;
+            let current = infigraph_core::bench::QualityMetrics::capture(root, backend)?;
 
             if save {
                 infigraph_core::bench::save_baseline(root, &current)?;

@@ -22,26 +22,14 @@ pub fn tool_detect_clones(args: &Value) -> Result<String> {
         .unwrap_or("Function,Method");
     let kinds: Vec<&str> = kinds_str.split(',').map(str::trim).collect();
 
-    let store = prism.store().context("not initialized")?;
-    let conn = store.connection()?;
-    let gq = infigraph_core::graph::GraphQuery::new(&conn);
+    let backend = prism.backend().context("not initialized")?;
 
-    // Fetch symbols to check
-    let kind_filter = kinds
-        .iter()
-        .map(|k| format!("s.kind = '{}'", k))
-        .collect::<Vec<_>>()
-        .join(" OR ");
-    let query = format!(
-        "MATCH (s:Symbol) WHERE ({kind_filter}) RETURN s.id, s.name, s.kind, s.file, s.docstring"
-    );
-    let rows = gq.raw_query(&query)?;
+    let syms = backend.symbols_with_docstring(Some(&kinds))?;
 
-    if rows.len() < 2 {
+    if syms.len() < 2 {
         return Ok("Not enough symbols to compare. Run index_project first.".to_string());
     }
 
-    // Build embeddings
     let embedder = embed::best_embedder();
     let path = args.get("path").and_then(|p| p.as_str()).unwrap_or(".");
     let emb_path = std::path::PathBuf::from(path)
@@ -56,31 +44,28 @@ pub fn tool_detect_clones(args: &Value) -> Result<String> {
         std::collections::HashMap::new()
     };
 
-    let symbol_vecs: Vec<(String, String, String, Vec<f32>)> = rows
+    let symbol_vecs: Vec<(String, String, String, Vec<f32>)> = syms
         .iter()
-        .map(|row| {
-            let id = row[0].clone();
-            let text = if row.get(4).is_some_and(|s| !s.is_empty()) {
-                format!("{} {}: {}", row[2], row[1], row[4])
+        .map(|s| {
+            let text = if !s.docstring.is_empty() {
+                format!("{} {}: {}", s.kind, s.name, s.docstring)
             } else {
-                format!("{} {}", row[2], row[1])
+                format!("{} {}", s.kind, s.name)
             };
             let emb = cached
-                .get(&id)
+                .get(&s.id)
                 .cloned()
                 .unwrap_or_else(|| embedder.embed(&text).unwrap_or_default());
-            (id, row[1].clone(), row[3].clone(), emb)
+            (s.id.clone(), s.name.clone(), s.file.clone(), emb)
         })
         .filter(|(_, _, _, emb)| !emb.is_empty())
         .collect();
 
-    // Pairwise comparison
     let n = symbol_vecs.len();
     let mut pairs: Vec<(f32, usize, usize)> = Vec::new();
 
     for i in 0..n {
         for j in (i + 1)..n {
-            // Skip same file (often fine to have similar helpers in same file)
             if symbol_vecs[i].2 == symbol_vecs[j].2 {
                 continue;
             }
@@ -102,20 +87,9 @@ pub fn tool_detect_clones(args: &Value) -> Result<String> {
         ));
     }
 
-    // Optionally write SIMILAR_TO edges
     if store_edges && !pairs.is_empty() {
-        let write_conn = store.connection()?;
         for (score, i, j) in &pairs {
-            let id_a = &symbol_vecs[*i].0;
-            let id_b = &symbol_vecs[*j].0;
-            let escape = |s: &str| s.replace('\'', "\\'");
-            let _ = write_conn.query(&format!(
-                "MATCH (a:Symbol), (b:Symbol) WHERE a.id = '{}' AND b.id = '{}' \
-                 MERGE (a)-[r:SIMILAR_TO]->(b) SET r.score = {}",
-                escape(id_a),
-                escape(id_b),
-                score
-            ));
+            let _ = backend.upsert_similar_edge(&symbol_vecs[*i].0, &symbol_vecs[*j].0, *score);
         }
     }
 
@@ -141,8 +115,7 @@ pub fn tool_detect_clones(args: &Value) -> Result<String> {
 
 pub fn tool_refactor(args: &Value) -> Result<String> {
     let prism = open_prism(args)?;
-    let store = prism.store().context("not initialized")?;
-    let conn = store.connection()?;
+    let backend = prism.backend().context("not initialized")?;
 
     let target = args.get("target").and_then(|v| v.as_str());
     let focus_str = args.get("focus").and_then(|v| v.as_str()).unwrap_or("all");
@@ -159,7 +132,7 @@ pub fn tool_refactor(args: &Value) -> Result<String> {
         None
     };
 
-    let recs = infigraph_core::refactor::analyze(&conn, emb_ref, target, focus, limit)?;
+    let recs = infigraph_core::refactor::analyze(backend, emb_ref, target, focus, limit)?;
     Ok(infigraph_core::refactor::format_recommendations(
         &recs, target,
     ))

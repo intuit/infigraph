@@ -2,6 +2,10 @@
 
 Thank you for your interest in contributing!
 
+## AI-assisted contributions
+
+If you're using Claude Code, see [`CLAUDE.md`](CLAUDE.md) — architecture, build/test commands, and cross-cutting invariants, plus deeper guides under `.claude/skills/` (`code-indexing-pipeline`, `analysis-subsystems`, `review-pr-against-issue`). Cursor users get the same content via `.cursor/rules/*.mdc`, auto-loaded per file.
+
 ## Prerequisites
 
 - Rust stable (via [rustup](https://rustup.rs/))

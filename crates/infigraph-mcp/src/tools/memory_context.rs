@@ -5,7 +5,7 @@ use anyhow::{Context, Result};
 use serde_json::Value;
 
 use infigraph_core::embed;
-use infigraph_core::graph::SessionStore;
+use infigraph_core::graph::{GraphBackend, SessionStore};
 
 use super::helpers::open_prism_read_only;
 
@@ -202,11 +202,9 @@ fn gather_code(
 ) -> Result<Vec<ScoredItem>> {
     let prism = open_prism_read_only(args)?;
     let path = args.get("path").and_then(|p| p.as_str()).unwrap_or(".");
-    let store = prism
-        .store()
+    let backend = prism
+        .backend()
         .context("not indexed — run index_project first")?;
-    let conn = store.connection()?;
-    let gq = infigraph_core::graph::GraphQuery::new(&conn);
 
     // L1 requires anchor file; escalate to L2 if missing
     if depth == Depth::L1 && anchor_file.is_none() {
@@ -216,7 +214,7 @@ fn gather_code(
     // --- L1: anchor file symbols + recent edits + active session ---
     if depth == Depth::L1 {
         let anchor = anchor_file.unwrap();
-        let mut items = gather_file_symbols(&gq, &prism, anchor, 0.8)?;
+        let mut items = gather_file_symbols(backend, &prism, anchor, 0.8)?;
         let seen_ids: HashSet<String> = items.iter().map(|i| i.id.clone()).collect();
 
         // Recent edits: git diff --name-only for modified files in same dir
@@ -232,7 +230,7 @@ fn gather_code(
                     if diff_file == anchor || diff_file.is_empty() {
                         continue;
                     }
-                    for sym in gq.symbols_in_file(diff_file).unwrap_or_default() {
+                    for sym in backend.symbols_in_file(diff_file).unwrap_or_default() {
                         if !seen_ids.contains(&sym.id) {
                             items.push(ScoredItem {
                                 id: sym.id,
@@ -263,7 +261,7 @@ fn gather_code(
         let mut seen_ids: HashSet<String> = HashSet::new();
 
         if let Some(anchor) = anchor_file {
-            let anchor_items = gather_file_symbols(&gq, &prism, anchor, 0.8)?;
+            let anchor_items = gather_file_symbols(backend, &prism, anchor, 0.8)?;
             for item in &anchor_items {
                 seen_ids.insert(item.id.clone());
             }
@@ -271,12 +269,12 @@ fn gather_code(
             // Collect related symbol IDs via callers/callees
             let mut related_ids: HashSet<String> = HashSet::new();
             for item in &anchor_items {
-                for caller in gq.callers_of(&item.id).unwrap_or_default() {
+                for caller in backend.callers_of(&item.id).unwrap_or_default() {
                     if !seen_ids.contains(&caller) {
                         related_ids.insert(caller);
                     }
                 }
-                for callee in gq.callees_of(&item.id).unwrap_or_default() {
+                for callee in backend.callees_of(&item.id).unwrap_or_default() {
                     if !seen_ids.contains(&callee) {
                         related_ids.insert(callee);
                     }
@@ -284,9 +282,9 @@ fn gather_code(
             }
 
             // Collect related files via file deps
-            if let Ok(deps) = gq.get_file_deps(anchor) {
+            if let Ok(deps) = backend.get_file_deps(anchor) {
                 for imp_file in deps.imports.iter().chain(deps.imported_by.iter()) {
-                    let file_syms = gq.symbols_in_file(imp_file).unwrap_or_default();
+                    let file_syms = backend.symbols_in_file(imp_file).unwrap_or_default();
                     for sym in &file_syms {
                         if !seen_ids.contains(&sym.id) {
                             related_ids.insert(sym.id.clone());
@@ -298,16 +296,16 @@ fn gather_code(
             items.extend(anchor_items);
 
             // Render related symbols
-            let related_rendered = render_symbol_ids(&gq, &prism, &related_ids, 0.5)?;
+            let related_rendered = render_symbol_ids(backend, &prism, &related_ids, 0.5)?;
             items.extend(related_rendered);
         } else {
             // No anchor: use BM25-only quick search for L2
-            items = gather_l3_hybrid(query, &gq, &prism, path, limit)?;
+            items = gather_l3_hybrid(query, backend, &prism, path, limit)?;
         }
 
         // Auto-escalate: L2 < 5 results → L3
         if items.len() < 5 && anchor_file.is_some() {
-            let l3_items = gather_l3_hybrid(query, &gq, &prism, path, limit)?;
+            let l3_items = gather_l3_hybrid(query, backend, &prism, path, limit)?;
             let existing_ids: HashSet<String> = items.iter().map(|i| i.id.clone()).collect();
             for item in l3_items {
                 if !existing_ids.contains(&item.id) {
@@ -321,16 +319,16 @@ fn gather_code(
     }
 
     // --- L3: full hybrid search (current behavior) ---
-    gather_l3_hybrid(query, &gq, &prism, path, limit)
+    gather_l3_hybrid(query, backend, &prism, path, limit)
 }
 
 fn gather_file_symbols(
-    gq: &infigraph_core::graph::GraphQuery,
+    backend: &dyn GraphBackend,
     prism: &infigraph_core::Infigraph,
     file: &str,
     base_score: f32,
 ) -> Result<Vec<ScoredItem>> {
-    let file_symbols = gq.symbols_in_file(file).unwrap_or_default();
+    let file_symbols = backend.symbols_in_file(file).unwrap_or_default();
     let mut items = Vec::new();
 
     for sym in file_symbols {
@@ -341,7 +339,11 @@ fn gather_file_symbols(
             file, sym.name, sym.kind, start_line, end_line
         );
 
-        let file_path = prism.root().join(file);
+        let file_path = if std::path::Path::new(file).is_absolute() {
+            std::path::PathBuf::from(file)
+        } else {
+            prism.root().join(file)
+        };
         if let Ok(source) = std::fs::read_to_string(&file_path) {
             let lines: Vec<&str> = source.lines().collect();
             let start = (start_line as usize).saturating_sub(1);
@@ -368,7 +370,7 @@ fn gather_file_symbols(
 }
 
 fn render_symbol_ids(
-    gq: &infigraph_core::graph::GraphQuery,
+    backend: &dyn GraphBackend,
     prism: &infigraph_core::Infigraph,
     ids: &HashSet<String>,
     base_score: f32,
@@ -381,7 +383,7 @@ fn render_symbol_ids(
     let mut items = Vec::new();
 
     for id in &id_list {
-        let detail = match gq.find_symbol_by_id(id) {
+        let detail = match backend.find_symbol_by_id(id) {
             Ok(Some(d)) => d,
             _ => continue,
         };
@@ -391,7 +393,11 @@ fn render_symbol_ids(
             detail.file, detail.name, base_score, detail.kind, detail.start_line, detail.end_line
         );
 
-        let file_path = prism.root().join(&detail.file);
+        let file_path = if std::path::Path::new(&detail.file).is_absolute() {
+            std::path::PathBuf::from(&detail.file)
+        } else {
+            prism.root().join(&detail.file)
+        };
         if let Ok(source) = std::fs::read_to_string(&file_path) {
             let lines: Vec<&str> = source.lines().collect();
             let start = (detail.start_line as usize).saturating_sub(1);
@@ -419,12 +425,12 @@ fn render_symbol_ids(
 
 fn gather_l3_hybrid(
     query: &str,
-    gq: &infigraph_core::graph::GraphQuery,
+    backend: &dyn GraphBackend,
     prism: &infigraph_core::Infigraph,
     path: &str,
     limit: usize,
 ) -> Result<Vec<ScoredItem>> {
-    let rows = gq.raw_query(
+    let rows = backend.raw_query(
         "MATCH (s:Symbol) RETURN s.id, s.name, s.kind, s.file, s.docstring, s.start_line, s.end_line",
     )?;
 
@@ -530,7 +536,11 @@ fn gather_l3_hybrid(
             text.push_str(&format!("Doc: {}\n", doc));
         }
 
-        let file_path = prism.root().join(file);
+        let file_path = if std::path::Path::new(file).is_absolute() {
+            std::path::PathBuf::from(file)
+        } else {
+            prism.root().join(file)
+        };
         if let Ok(source) = std::fs::read_to_string(&file_path) {
             let lines: Vec<&str> = source.lines().collect();
             let start = start_line.saturating_sub(1);
@@ -544,8 +554,8 @@ fn gather_l3_hybrid(
             }
         }
 
-        let callers = gq.callers_of(&r.symbol_id).unwrap_or_default();
-        let callees = gq.callees_of(&r.symbol_id).unwrap_or_default();
+        let callers = backend.callers_of(&r.symbol_id).unwrap_or_default();
+        let callees = backend.callees_of(&r.symbol_id).unwrap_or_default();
         if !callers.is_empty() {
             text.push_str(&format!(
                 "Callers: {}\n",
@@ -695,11 +705,9 @@ fn gather_sessions(path: &str, query: &str) -> Result<(Vec<ScoredItem>, Vec<Scor
 
 fn gather_skeleton(args: &Value, file: &str) -> Result<Option<ScoredItem>> {
     let prism = open_prism_read_only(args)?;
-    let store = prism.store().context("not indexed")?;
-    let conn = store.connection()?;
-    let gq = infigraph_core::graph::GraphQuery::new(&conn);
+    let backend = prism.backend().context("not indexed")?;
 
-    match gq.skeleton(file) {
+    match backend.skeleton(file) {
         Ok(skeleton_text) if !skeleton_text.is_empty() => {
             let text = format!("#### Skeleton: {}\n{}\n", file, skeleton_text);
             Ok(Some(ScoredItem {
@@ -715,23 +723,21 @@ fn gather_skeleton(args: &Value, file: &str) -> Result<Option<ScoredItem>> {
 
 fn apply_anchor_boost(items: &mut [ScoredItem], args: &Value, anchor_file: &str) -> Result<()> {
     let prism = open_prism_read_only(args)?;
-    let store = match prism.store() {
-        Some(s) => s,
+    let backend = match prism.backend() {
+        Some(b) => b,
         None => return Ok(()),
     };
-    let conn = store.connection()?;
-    let gq = infigraph_core::graph::GraphQuery::new(&conn);
 
-    let file_symbols = gq.symbols_in_file(anchor_file).unwrap_or_default();
+    let file_symbols = backend.symbols_in_file(anchor_file).unwrap_or_default();
     let anchor_ids: std::collections::HashSet<String> =
         file_symbols.iter().map(|s| s.id.clone()).collect();
 
     let mut related_ids: std::collections::HashSet<String> = anchor_ids.clone();
     for sym in &file_symbols {
-        for caller in gq.callers_of(&sym.id).unwrap_or_default() {
+        for caller in backend.callers_of(&sym.id).unwrap_or_default() {
             related_ids.insert(caller);
         }
-        for callee in gq.callees_of(&sym.id).unwrap_or_default() {
+        for callee in backend.callees_of(&sym.id).unwrap_or_default() {
             related_ids.insert(callee);
         }
     }

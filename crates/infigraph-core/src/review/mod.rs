@@ -19,8 +19,7 @@ use anyhow::{Context, Result};
 use serde::Serialize;
 
 use crate::diff;
-use crate::graph::store::GraphStore;
-use crate::graph::GraphQuery;
+use crate::graph::GraphBackend;
 use crate::lang::LanguageRegistry;
 use crate::security;
 
@@ -169,7 +168,7 @@ pub fn review(
     base_ref: &str,
     limit: usize,
     registry: &LanguageRegistry,
-    store: &GraphStore,
+    backend: &dyn GraphBackend,
 ) -> Result<ReviewReport> {
     let canonical = root.canonicalize().context("invalid project root")?;
 
@@ -215,12 +214,8 @@ pub fn review(
     // 2b. Auto-detect PR context from changes
     let context = detect_pr_context(&canonical, base_ref, &changed_files, &changed_symbols);
 
-    // 3. Query the graph for blast radius, API surface, and complexity
-    let conn = store.connection()?;
-    let gq = GraphQuery::new(&conn);
-
     // 3a. Resolve changed symbol IDs in the graph
-    let symbol_ids = resolve_symbol_ids(&gq, &changed_symbols);
+    let symbol_ids = resolve_symbol_ids(backend, &changed_symbols);
 
     // 3b. Blast radius: unbounded CALLS* traversal for each changed symbol
     let mut blast_set: HashSet<String> = HashSet::new();
@@ -234,7 +229,7 @@ pub fn review(
              RETURN DISTINCT a.name, a.kind, a.file \
              LIMIT {limit}",
         );
-        if let Ok(rows) = gq.raw_query(&query) {
+        if let Ok(rows) = backend.raw_query(&query) {
             for row in rows {
                 if row.len() >= 3 {
                     let key = format!("{}::{}", row[2], row[0]);
@@ -261,22 +256,22 @@ pub fn review(
         .collect();
 
     // 3d. API surface changes: filter changed symbols that are public
-    let api_surface_changes = find_api_surface_changes(&gq, &changed_symbols);
+    let api_surface_changes = find_api_surface_changes(backend, &changed_symbols);
 
     // 4. Security scan scoped to changed files
     let security_findings = scan_changed_files(&canonical, &changed_files);
 
     // 5. Complexity hotspots in changed files
-    let complexity_hotspots = find_complexity_hotspots(&gq, &changed_files);
+    let complexity_hotspots = find_complexity_hotspots(backend, &changed_files);
 
     // 6. Dead code in changed files (symbols with zero callers)
-    let dead_code = find_dead_code_in_changed_files(&gq, &changed_files);
+    let dead_code = find_dead_code_in_changed_files(backend, &changed_files);
 
     // 7. Code clones: near-duplicate symbols in changed files (via SIMILAR_TO edges)
-    let code_clones = find_clones_in_changed_files(&gq, &changed_files);
+    let code_clones = find_clones_in_changed_files(backend, &changed_files);
 
     // 8. Consistency: symbols sharing a name pattern that diverge in structure
-    let consistency_issues = find_consistency_issues(&gq, &changed_symbols);
+    let consistency_issues = find_consistency_issues(backend, &changed_symbols);
 
     Ok(ReviewReport {
         base_ref: base_ref.to_string(),
@@ -301,13 +296,13 @@ pub fn review_with_group(
     base_ref: &str,
     limit: usize,
     registry: &LanguageRegistry,
-    store: &GraphStore,
+    backend: &dyn GraphBackend,
     group_name: &str,
     group_registry: &crate::multi::Registry,
     build_registry: impl Fn() -> Result<LanguageRegistry>,
 ) -> Result<ReviewReport> {
     // 1. Run standard single-repo review
-    let mut report = review(root, base_ref, limit, registry, store)?;
+    let mut report = review(root, base_ref, limit, registry, backend)?;
 
     // 2. Force scope to CrossRepo
     report.context.scope = PrScope::CrossRepo;
@@ -474,7 +469,7 @@ fn git_changed_files(root: &Path, base_ref: &str) -> Result<Vec<String>> {
 }
 
 /// Resolve graph symbol IDs for changed symbols by querying the graph.
-fn resolve_symbol_ids(gq: &GraphQuery, symbols: &[ChangedSymbol]) -> Vec<String> {
+fn resolve_symbol_ids(backend: &dyn GraphBackend, symbols: &[ChangedSymbol]) -> Vec<String> {
     let mut ids = Vec::new();
     for sym in symbols {
         let escaped_name = sym.name.replace('\'', "\\'");
@@ -484,7 +479,7 @@ fn resolve_symbol_ids(gq: &GraphQuery, symbols: &[ChangedSymbol]) -> Vec<String>
              WHERE s.name = '{escaped_name}' AND s.file ENDS WITH '{escaped_file}' \
              RETURN s.id",
         );
-        if let Ok(rows) = gq.raw_query(&query) {
+        if let Ok(rows) = backend.raw_query(&query) {
             for row in rows {
                 if let Some(id) = row.first() {
                     ids.push(id.clone());
@@ -507,7 +502,10 @@ fn is_test_symbol(sym: &AffectedSymbol) -> bool {
 }
 
 /// Find changed symbols that are public (API surface).
-fn find_api_surface_changes(gq: &GraphQuery, symbols: &[ChangedSymbol]) -> Vec<ChangedSymbol> {
+fn find_api_surface_changes(
+    backend: &dyn GraphBackend,
+    symbols: &[ChangedSymbol],
+) -> Vec<ChangedSymbol> {
     let mut api_changes = Vec::new();
     for sym in symbols {
         let escaped_name = sym.name.replace('\'', "\\'");
@@ -518,7 +516,7 @@ fn find_api_surface_changes(gq: &GraphQuery, symbols: &[ChangedSymbol]) -> Vec<C
              AND s.visibility = 'public' \
              RETURN s.name",
         );
-        if let Ok(rows) = gq.raw_query(&query) {
+        if let Ok(rows) = backend.raw_query(&query) {
             if !rows.is_empty() {
                 api_changes.push(sym.clone());
             }
@@ -548,7 +546,10 @@ fn scan_changed_files(root: &Path, changed_files: &[String]) -> Vec<SecurityFind
 }
 
 /// Find high-complexity symbols in changed files.
-fn find_complexity_hotspots(gq: &GraphQuery, changed_files: &[String]) -> Vec<ComplexityHotspot> {
+fn find_complexity_hotspots(
+    backend: &dyn GraphBackend,
+    changed_files: &[String],
+) -> Vec<ComplexityHotspot> {
     if changed_files.is_empty() {
         return vec![];
     }
@@ -566,7 +567,7 @@ fn find_complexity_hotspots(gq: &GraphQuery, changed_files: &[String]) -> Vec<Co
          ORDER BY s.complexity DESC",
     );
 
-    match gq.raw_query(&query) {
+    match backend.raw_query(&query) {
         Ok(rows) => rows
             .iter()
             .filter_map(|row| {
@@ -854,7 +855,7 @@ fn build_intent_string(
 
 /// Find functions/methods in changed files that have zero callers.
 fn find_dead_code_in_changed_files(
-    gq: &GraphQuery,
+    backend: &dyn GraphBackend,
     changed_files: &[String],
 ) -> Vec<DeadCodeSymbol> {
     if changed_files.is_empty() {
@@ -880,7 +881,7 @@ fn find_dead_code_in_changed_files(
          ORDER BY s.file, s.name"
     );
 
-    match gq.raw_query(&query) {
+    match backend.raw_query(&query) {
         Ok(rows) => rows
             .iter()
             .filter_map(|row| {
@@ -896,7 +897,10 @@ fn find_dead_code_in_changed_files(
 }
 
 /// Find near-duplicate symbols in changed files using SIMILAR_TO edges.
-fn find_clones_in_changed_files(gq: &GraphQuery, changed_files: &[String]) -> Vec<ClonePair> {
+fn find_clones_in_changed_files(
+    backend: &dyn GraphBackend,
+    changed_files: &[String],
+) -> Vec<ClonePair> {
     if changed_files.is_empty() {
         return vec![];
     }
@@ -916,7 +920,7 @@ fn find_clones_in_changed_files(gq: &GraphQuery, changed_files: &[String]) -> Ve
          LIMIT 30"
     );
 
-    match gq.raw_query(&query) {
+    match backend.raw_query(&query) {
         Ok(rows) => rows
             .iter()
             .filter_map(|row| {
@@ -936,7 +940,7 @@ fn find_clones_in_changed_files(gq: &GraphQuery, changed_files: &[String]) -> Ve
 /// Find consistency issues: groups of changed symbols with similar names
 /// that should follow the same pattern but have different structures.
 fn find_consistency_issues(
-    gq: &GraphQuery,
+    backend: &dyn GraphBackend,
     changed_symbols: &[ChangedSymbol],
 ) -> Vec<ConsistencyIssue> {
     let mut issues = Vec::new();
@@ -986,7 +990,7 @@ fn find_consistency_issues(
                  WHERE s.name = '{escaped_name}' AND s.file ENDS WITH '{escaped_file}' \
                  RETURN count(c)"
             );
-            let count: usize = gq
+            let count: usize = backend
                 .raw_query(&query)
                 .ok()
                 .and_then(|rows| rows.first()?.first()?.parse().ok())

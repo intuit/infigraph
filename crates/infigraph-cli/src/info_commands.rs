@@ -37,11 +37,8 @@ pub(crate) fn cmd_symbols(root: &Path, file: &str) -> Result<()> {
     let mut prism = Infigraph::open(root, registry)?;
     prism.init()?;
 
-    let store = prism.store().context("graph not initialized")?;
-    let conn = store.connection()?;
-    let gq = infigraph_core::graph::GraphQuery::new(&conn);
-
-    let symbols = gq.symbols_in_file(file)?;
+    let backend = prism.backend().context("graph not initialized")?;
+    let symbols = backend.symbols_in_file(file)?;
     if symbols.is_empty() {
         println!(
             "No symbols found for '{}'. Run 'infigraph index' first.",
@@ -65,11 +62,8 @@ pub(crate) fn cmd_skeleton(root: &Path, file: &str) -> Result<()> {
     let mut prism = Infigraph::open(root, registry)?;
     prism.init()?;
 
-    let store = prism.store().context("graph not initialized")?;
-    let conn = store.connection()?;
-    let gq = infigraph_core::graph::GraphQuery::new(&conn);
-
-    let result = gq.skeleton(file)?;
+    let backend = prism.backend().context("graph not initialized")?;
+    let result = backend.skeleton(file)?;
     print!("{}", result);
     Ok(())
 }
@@ -116,16 +110,11 @@ pub(crate) fn cmd_ingest(
         .find(|(_, s)| s.schema.schema_id == sid)
         .context(format!("schema '{}' not found", sid))?;
 
-    let store = prism.store().context("graph not initialized")?;
-    let _lock = store.write_lock()?;
-    let conn = store.connection()?;
+    let backend = prism.backend().context("graph not initialized")?;
 
     if let Some(dir) = source_dir {
-        let result = infigraph_core::structured::ingest_directory(
-            &conn,
-            &schema.schema,
-            std::path::Path::new(dir),
-        )?;
+        let result =
+            backend.ingest_structured_directory(&schema.schema, std::path::Path::new(dir))?;
         println!(
             "Ingested directory '{}' using schema '{}': {} nodes, {} edges",
             dir, sid, result.nodes_created, result.edges_created
@@ -133,11 +122,7 @@ pub(crate) fn cmd_ingest(
     } else {
         let file =
             data_file.context("--data-file or --source required when --schema is specified")?;
-        let result = infigraph_core::structured::ingest_file(
-            &conn,
-            &schema.schema,
-            std::path::Path::new(file),
-        )?;
+        let result = backend.ingest_structured_file(&schema.schema, std::path::Path::new(file))?;
         println!(
             "Ingested '{}' using schema '{}': {} nodes, {} edges",
             file, sid, result.nodes_created, result.edges_created
@@ -150,8 +135,8 @@ pub(crate) fn cmd_index_manifests(root: &Path) -> Result<()> {
     let registry = bundled_registry()?;
     let mut prism = Infigraph::open(root, registry)?;
     prism.init()?;
-    let store = prism.store().context("graph not initialized")?;
-    let results = infigraph_core::manifest::index_manifests(root, store)?;
+    let backend = prism.backend().context("graph not initialized")?;
+    let results = infigraph_core::manifest::index_manifests(root, backend)?;
     if results.is_empty() {
         println!("No manifests found.");
         return Ok(());
@@ -202,8 +187,8 @@ pub(crate) fn cmd_dependencies(root: &Path, ecosystem: Option<&str>) -> Result<(
     let registry = bundled_registry()?;
     let mut prism = Infigraph::open(root, registry)?;
     prism.init()?;
-    let store = prism.store().context("graph not initialized")?;
-    let mut deps = infigraph_core::manifest::query_deps(store)?;
+    let backend = prism.backend().context("graph not initialized")?;
+    let mut deps = infigraph_core::manifest::query_deps(backend)?;
     if let Some(eco) = ecosystem {
         deps.retain(|d| d.ecosystem == eco);
     }
@@ -228,11 +213,8 @@ pub(crate) fn cmd_api_surface(root: &Path, file_filter: Option<&str>) -> Result<
     let registry = bundled_registry()?;
     let mut prism = Infigraph::open(root, registry)?;
     prism.init()?;
-    let store = prism.store().context("graph not initialized")?;
-    let conn = store.connection()?;
-    let gq = infigraph_core::graph::GraphQuery::new(&conn);
-
-    let mut syms = gq.get_api_surface()?;
+    let backend = prism.backend().context("graph not initialized")?;
+    let mut syms = backend.get_api_surface()?;
     if let Some(f) = file_filter {
         syms.retain(|s| s.file.contains(f));
     }
@@ -253,11 +235,8 @@ pub(crate) fn cmd_file_deps(root: &Path, file: &str) -> Result<()> {
     let registry = bundled_registry()?;
     let mut prism = Infigraph::open(root, registry)?;
     prism.init()?;
-    let store = prism.store().context("graph not initialized")?;
-    let conn = store.connection()?;
-    let gq = infigraph_core::graph::GraphQuery::new(&conn);
-
-    let deps = gq.get_file_deps(file)?;
+    let backend = prism.backend().context("graph not initialized")?;
+    let deps = backend.get_file_deps(file)?;
     println!("File dependencies for '{}':\n", file);
     println!("  Imports ({}):", deps.imports.len());
     for f in &deps.imports {
@@ -280,11 +259,8 @@ pub(crate) fn cmd_type_hierarchy(root: &Path, symbol: &str, depth: u32) -> Resul
     let registry = bundled_registry()?;
     let mut prism = Infigraph::open(root, registry)?;
     prism.init()?;
-    let store = prism.store().context("graph not initialized")?;
-    let conn = store.connection()?;
-    let gq = infigraph_core::graph::GraphQuery::new(&conn);
-
-    let hier = gq.get_type_hierarchy(symbol, depth)?;
+    let backend = prism.backend().context("graph not initialized")?;
+    let hier = backend.get_type_hierarchy(symbol, depth)?;
     println!("Type hierarchy for '{}':\n", hier.root_name);
     println!("  Ancestors ({}):", hier.ancestors.len());
     for a in &hier.ancestors {
@@ -307,11 +283,8 @@ pub(crate) fn cmd_test_coverage(root: &Path, file_filter: Option<&str>) -> Resul
     let registry = bundled_registry()?;
     let mut prism = Infigraph::open(root, registry)?;
     prism.init()?;
-    let store = prism.store().context("graph not initialized")?;
-    let conn = store.connection()?;
-    let gq = infigraph_core::graph::GraphQuery::new(&conn);
-
-    let mut cov = gq.get_test_coverage()?;
+    let backend = prism.backend().context("graph not initialized")?;
+    let mut cov = backend.get_test_coverage()?;
     if let Some(f) = file_filter {
         cov.covered.retain(|s| s.file.contains(f));
         cov.uncovered.retain(|s| s.file.contains(f));
@@ -429,7 +402,7 @@ pub(crate) fn cmd_scip_import(root: &Path, index_path: &Path) -> Result<()> {
     let mut prism = Infigraph::open(root, registry)?;
     prism.init()?;
 
-    let store = prism.store().context("graph not initialized")?;
+    let backend = prism.backend().context("graph not initialized")?;
     let abs_index = if index_path.is_absolute() {
         index_path.to_path_buf()
     } else {
@@ -437,7 +410,7 @@ pub(crate) fn cmd_scip_import(root: &Path, index_path: &Path) -> Result<()> {
     };
 
     println!("Importing SCIP index from {}", abs_index.display());
-    let stats = infigraph_core::scip::import_scip_index(&abs_index, store, Some(root))?;
+    let stats = backend.import_scip_index(&abs_index, Some(root))?;
     println!(
         "SCIP import complete:\n  files processed: {}\n  symbols added: {}\n  symbols enriched: {}\n  relations added: {}\n  references added: {}\n  corrections learned: {}",
         stats.files_processed,
@@ -482,7 +455,7 @@ pub(crate) fn cmd_index_docs(root: &Path) -> Result<()> {
 
     #[cfg(feature = "remote")]
     if is_remote {
-        let pg = infigraph_core::meta::PostgresMetaStore::connect_from_env()?;
+        let pg = infigraph_core::meta::PostgresMetaStore::connect_from_env_cached()?;
         pg.init_schema()?;
         let store = idx.store().context("doc store not initialized")?;
         let chunk_refs: Vec<&infigraph_docs::chunk::Chunk> = result.new_chunks.iter().collect();
@@ -586,11 +559,8 @@ pub(crate) fn cmd_list_files(root: &Path, glob: Option<&str>) -> Result<()> {
     let mut prism = Infigraph::open(root, registry)?;
     prism.init()?;
 
-    let store = prism.store().context("graph not initialized")?;
-    let conn = store.connection()?;
-    let gq = infigraph_core::graph::GraphQuery::new(&conn);
-
-    let rows = gq.raw_query("MATCH (s:Symbol) RETURN DISTINCT s.file ORDER BY s.file")?;
+    let backend = prism.backend().context("graph not initialized")?;
+    let rows = backend.raw_query("MATCH (s:Symbol) RETURN DISTINCT s.file ORDER BY s.file")?;
 
     if rows.is_empty() {
         println!("No files indexed. Run 'infigraph index' first.");
@@ -621,11 +591,8 @@ pub(crate) fn cmd_generate_test_context(
     let mut prism = Infigraph::open(root, registry)?;
     prism.init()?;
 
-    let store = prism.store().context("graph not initialized")?;
-    let conn = store.connection()?;
-    let gq = infigraph_core::graph::GraphQuery::new(&conn);
-
-    let ctx = gq.generate_test_context(file, limit, None)?;
+    let backend = prism.backend().context("graph not initialized")?;
+    let ctx = backend.generate_test_context(file, limit, None)?;
 
     println!("Test Generation Context\n");
     println!("Framework: {}", ctx.framework);

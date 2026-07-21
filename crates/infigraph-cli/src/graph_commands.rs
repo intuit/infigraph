@@ -9,11 +9,8 @@ pub(crate) fn cmd_query(root: &Path, cypher: &str) -> Result<()> {
     let mut prism = Infigraph::open(root, registry)?;
     prism.init()?;
 
-    let store = prism.store().context("graph not initialized")?;
-    let conn = store.connection()?;
-    let gq = infigraph_core::graph::GraphQuery::new(&conn);
-
-    let rows = gq.raw_query(cypher)?;
+    let backend = prism.backend().context("graph not initialized")?;
+    let rows = backend.raw_query(cypher)?;
     for row in &rows {
         println!("{}", row.join(" | "));
     }
@@ -32,22 +29,20 @@ pub(crate) fn cmd_export(
     let mut prism = Infigraph::open(root, registry)?;
     prism.init()?;
 
-    let store = prism.store().context("graph not initialized")?;
-    let conn = store.connection()?;
-    let gq = infigraph_core::graph::GraphQuery::new(&conn);
+    let backend = prism.backend().context("graph not initialized")?;
 
     match output {
         Some(path) => {
             let file = std::fs::File::create(&path)
                 .with_context(|| format!("failed to create output file: {}", path.display()))?;
             let mut writer = std::io::BufWriter::new(file);
-            export_to_writer(&gq, format, &mut writer)?;
+            export_to_writer(backend, format, &mut writer)?;
             println!("Exported {} to {}", format, path.display());
         }
         None => {
             let stdout = std::io::stdout();
             let mut writer = std::io::BufWriter::new(stdout.lock());
-            export_to_writer(&gq, format, &mut writer)?;
+            export_to_writer(backend, format, &mut writer)?;
         }
     }
 
@@ -59,11 +54,8 @@ pub(crate) fn cmd_callers(root: &Path, symbol: &str) -> Result<()> {
     let mut prism = Infigraph::open(root, registry)?;
     prism.init()?;
 
-    let store = prism.store().context("graph not initialized")?;
-    let conn = store.connection()?;
-    let gq = infigraph_core::graph::GraphQuery::new(&conn);
-
-    let callers = gq.callers_of(symbol)?;
+    let backend = prism.backend().context("graph not initialized")?;
+    let callers = backend.callers_of(symbol)?;
     if callers.is_empty() {
         println!("No callers found for '{}'", symbol);
         return Ok(());
@@ -81,11 +73,8 @@ pub(crate) fn cmd_callees(root: &Path, symbol: &str) -> Result<()> {
     let mut prism = Infigraph::open(root, registry)?;
     prism.init()?;
 
-    let store = prism.store().context("graph not initialized")?;
-    let conn = store.connection()?;
-    let gq = infigraph_core::graph::GraphQuery::new(&conn);
-
-    let callees = gq.callees_of(symbol)?;
+    let backend = prism.backend().context("graph not initialized")?;
+    let callees = backend.callees_of(symbol)?;
     if callees.is_empty() {
         println!("No callees found for '{}'", symbol);
         return Ok(());
@@ -103,13 +92,8 @@ pub(crate) fn cmd_dead_code(root: &Path) -> Result<()> {
     let mut prism = Infigraph::open(root, registry)?;
     prism.init()?;
 
-    let store = prism.store().context("graph not initialized")?;
-    let conn = store.connection()?;
-    let gq = infigraph_core::graph::GraphQuery::new(&conn);
-
-    let rows = gq.raw_query(
-        "MATCH (s:Symbol) WHERE s.kind IN ['Function', 'Method'] AND NOT EXISTS { MATCH ()-[:CALLS]->(s) } RETURN s.name, s.kind, s.file ORDER BY s.file, s.name",
-    )?;
+    let backend = prism.backend().context("graph not initialized")?;
+    let rows = backend.find_uncalled_symbols()?;
 
     if rows.is_empty() {
         println!("No dead code found (all functions/methods have callers).");
@@ -117,9 +101,9 @@ pub(crate) fn cmd_dead_code(root: &Path) -> Result<()> {
     }
 
     let entry_points = ["main", "__init__", "setUp", "tearDown"];
-    let dead: Vec<&Vec<String>> = rows
+    let dead: Vec<_> = rows
         .iter()
-        .filter(|row| !entry_points.contains(&row[0].as_str()))
+        .filter(|r| !entry_points.contains(&r.name.as_str()))
         .collect();
 
     if dead.is_empty() {
@@ -129,12 +113,12 @@ pub(crate) fn cmd_dead_code(root: &Path) -> Result<()> {
 
     println!("Potentially dead code ({} symbols):", dead.len());
     let mut current_file = "";
-    for row in &dead {
-        if row[2] != current_file {
-            current_file = &row[2];
+    for r in &dead {
+        if r.file != current_file {
+            current_file = &r.file;
             println!("\n  {}:", current_file);
         }
-        println!("    {:>8} {}", row[1], row[0]);
+        println!("    {:>8} {}", r.kind, r.name);
     }
 
     Ok(())
@@ -145,11 +129,8 @@ pub(crate) fn cmd_impact(root: &Path, symbol: &str, depth: u32) -> Result<()> {
     let mut prism = Infigraph::open(root, registry)?;
     prism.init()?;
 
-    let store = prism.store().context("graph not initialized")?;
-    let conn = store.connection()?;
-    let gq = infigraph_core::graph::GraphQuery::new(&conn);
-
-    let impacted = gq.transitive_impact(symbol, depth)?;
+    let backend = prism.backend().context("graph not initialized")?;
+    let impacted = backend.transitive_impact(symbol, depth)?;
 
     if impacted.is_empty() {
         println!("No symbols affected by changes to '{}'", symbol);
@@ -168,14 +149,14 @@ pub(crate) fn cmd_impact(root: &Path, symbol: &str, depth: u32) -> Result<()> {
 }
 
 fn export_to_writer<W: std::io::Write>(
-    gq: &infigraph_core::graph::GraphQuery,
+    backend: &dyn infigraph_core::graph::GraphBackend,
     format: &str,
     writer: &mut W,
 ) -> anyhow::Result<()> {
     match format {
-        "cypher" => infigraph_core::export::export_cypher(gq, writer),
-        "graphml" => infigraph_core::export::export_graphml(gq, writer),
-        "json" => infigraph_core::export::export_json(gq, writer),
+        "cypher" => infigraph_core::export::export_cypher(backend, writer),
+        "graphml" => infigraph_core::export::export_graphml(backend, writer),
+        "json" => infigraph_core::export::export_json(backend, writer),
         _ => anyhow::bail!(
             "unknown export format '{}'. Supported formats: cypher, graphml, json",
             format

@@ -1,20 +1,13 @@
 use anyhow::{Context, Result};
 use serde_json::Value;
 
-use infigraph_core::graph::GraphStore;
+use super::super::helpers::open_prism;
 
 pub fn tool_detect_cross_cutting(args: &Value) -> Result<String> {
-    let path = args
-        .get("path")
-        .and_then(|p| p.as_str())
-        .context("missing 'path'")?;
-    let root = std::path::PathBuf::from(path)
-        .canonicalize()
-        .context("invalid path")?;
-    let db_path = root.join(".infigraph").join("graph");
-    let store = GraphStore::open(&db_path)?;
+    let prism = open_prism(args)?;
+    let backend = prism.backend().context("not initialized")?;
 
-    let matches = infigraph_core::concerns::detect_cross_cutting(&store)?;
+    let matches = infigraph_core::concerns::detect_cross_cutting(backend)?;
 
     let kind_filter = args
         .get("kind")

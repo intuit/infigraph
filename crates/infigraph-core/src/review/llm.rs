@@ -4,8 +4,7 @@ use std::path::Path;
 use anyhow::{Context, Result};
 use serde::{Deserialize, Serialize};
 
-use crate::graph::store::GraphStore;
-use crate::graph::{GraphQuery, SymbolDetail};
+use crate::graph::{GraphBackend, SymbolDetail};
 
 use super::ReviewReport;
 
@@ -93,10 +92,8 @@ pub struct TokenUsage {
 pub fn enrich_review(
     root: &Path,
     report: &ReviewReport,
-    store: &GraphStore,
+    backend: &dyn GraphBackend,
 ) -> Result<EnrichedReport> {
-    let conn = store.connection()?;
-    let gq = GraphQuery::new(&conn);
     let canonical = root.canonicalize().unwrap_or_else(|_| root.to_path_buf());
 
     let mut enriched_symbols = Vec::new();
@@ -111,7 +108,7 @@ pub fn enrich_review(
              WHERE s.name = '{escaped_name}' AND s.file ENDS WITH '{escaped_file}' \
              RETURN s.id, s.start_line, s.end_line, s.complexity"
         );
-        let rows = gq.raw_query(&id_query).unwrap_or_default();
+        let rows = backend.raw_query(&id_query).unwrap_or_default();
         let (symbol_id, complexity) = if let Some(row) = rows.first() {
             let id = row.first().cloned().unwrap_or_default();
             let cx: Option<u32> = row.get(3).and_then(|v| v.parse().ok());
@@ -122,21 +119,22 @@ pub fn enrich_review(
 
         // Callers
         let callers = if !symbol_id.is_empty() {
-            gq.callers_of(&symbol_id).unwrap_or_default()
+            backend.callers_of(&symbol_id).unwrap_or_default()
         } else {
             vec![]
         };
 
         // Callees
         let callees = if !symbol_id.is_empty() {
-            gq.callees_of(&symbol_id).unwrap_or_default()
+            backend.callees_of(&symbol_id).unwrap_or_default()
         } else {
             vec![]
         };
 
         // Source snippet from graph
         let source = if !symbol_id.is_empty() {
-            gq.find_symbol_by_id(&symbol_id)
+            backend
+                .find_symbol_by_id(&symbol_id)
                 .ok()
                 .flatten()
                 .and_then(|detail| read_symbol_source(&canonical, &detail))
@@ -144,7 +142,7 @@ pub fn enrich_review(
             None
         };
 
-        let similar_symbols = find_similar_symbols(&gq, &sym.name, &sym.file);
+        let similar_symbols = find_similar_symbols(backend, &sym.name, &sym.file);
 
         enriched_symbols.push(EnrichedSymbol {
             name: sym.name.clone(),
@@ -181,7 +179,11 @@ fn read_symbol_source(root: &Path, detail: &SymbolDetail) -> Option<String> {
     Some(lines[start..end].join("\n"))
 }
 
-fn find_similar_symbols(gq: &GraphQuery, name: &str, exclude_file: &str) -> Vec<SimilarSymbol> {
+fn find_similar_symbols(
+    backend: &dyn GraphBackend,
+    name: &str,
+    exclude_file: &str,
+) -> Vec<SimilarSymbol> {
     let escaped = name.replace('\'', "\\'");
     let query = format!(
         "MATCH (s:Symbol) \
@@ -189,7 +191,7 @@ fn find_similar_symbols(gq: &GraphQuery, name: &str, exclude_file: &str) -> Vec<
          RETURN s.name, s.file \
          LIMIT 5"
     );
-    match gq.raw_query(&query) {
+    match backend.raw_query(&query) {
         Ok(rows) => rows
             .into_iter()
             .filter_map(|row| {
@@ -783,11 +785,11 @@ fn extract_json(text: &str) -> &str {
 pub fn review_with_llm(
     root: &Path,
     report: &ReviewReport,
-    store: &GraphStore,
+    backend: &dyn GraphBackend,
     dry_run: bool,
     context: Option<&str>,
 ) -> Result<(String, Option<LlmReviewResult>)> {
-    let enriched = enrich_review(root, report, store)?;
+    let enriched = enrich_review(root, report, backend)?;
     let prompt = build_review_prompt(&enriched, context);
 
     if dry_run {

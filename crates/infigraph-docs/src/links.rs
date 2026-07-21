@@ -3,8 +3,8 @@ use std::path::{Path, PathBuf};
 
 use regex::Regex;
 
+use crate::backend::DocBackend;
 use crate::extract::ExtractedDoc;
-use crate::store::DocStore;
 
 #[derive(Debug)]
 pub struct DocLink {
@@ -13,7 +13,11 @@ pub struct DocLink {
     pub target_doc_id: Option<String>,
 }
 
-pub fn extract_and_link_doc(store: &DocStore, doc: &ExtractedDoc, all_doc_ids: &HashSet<String>) {
+pub fn extract_and_link_doc(
+    store: &dyn DocBackend,
+    doc: &ExtractedDoc,
+    all_doc_ids: &HashSet<String>,
+) {
     let links = extract_links(&doc.text, &doc.file);
     if links.is_empty() {
         return;
@@ -291,7 +295,7 @@ pub fn resolve_doc_id(doc_path: &str, doc_ids: &HashSet<String>) -> Option<Strin
 /// Create LINKS_TO edges from manifest files to indexed docs based on doc_urls.
 /// Creates a Document node for the manifest file if one doesn't already exist.
 pub fn link_manifest_doc_urls(
-    store: &DocStore,
+    store: &dyn DocBackend,
     manifest_file: &str,
     doc_urls: &[String],
     all_doc_ids: &HashSet<String>,

@@ -16,9 +16,7 @@ pub(crate) fn cmd_git_summary(
     let mut prism = Infigraph::open(root, registry)?;
     prism.init()?;
 
-    let store = prism.store().context("graph not initialized")?;
-    let conn = store.connection()?;
-    let gq = infigraph_core::graph::GraphQuery::new(&conn);
+    let backend = prism.backend().context("graph not initialized")?;
 
     // Get recent commit hashes + metadata
     let n_commits_arg = format!("-{}", n_commits);
@@ -99,7 +97,7 @@ pub(crate) fn cmd_git_summary(
         // Collect touched symbols
         let mut touched: HashSet<String> = HashSet::new();
         for (file, start, end) in &hunks {
-            if let Ok(syms) = gq.symbols_in_range(file, *start, *end) {
+            if let Ok(syms) = backend.symbols_in_range(file, *start, *end) {
                 for s in syms {
                     touched.insert(format!(
                         "{} {} ({}:{})",

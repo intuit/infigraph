@@ -6,8 +6,7 @@
 use anyhow::Result;
 use serde::Serialize;
 
-use crate::graph::store::GraphStore;
-use crate::graph::GraphQuery;
+use crate::graph::GraphBackend;
 
 // ---------------------------------------------------------------------------
 // Data types
@@ -48,23 +47,20 @@ pub struct PatternReport {
 // ---------------------------------------------------------------------------
 
 /// Run all pattern detectors and return a combined report.
-pub fn detect_all(store: &GraphStore) -> Result<PatternReport> {
-    let conn = store.connection()?;
-    let gq = GraphQuery::new(&conn);
-
+pub fn detect_all(backend: &dyn GraphBackend) -> Result<PatternReport> {
     let mut patterns = Vec::new();
-    patterns.extend(detect_factory(&gq));
-    patterns.extend(detect_singleton(&gq));
-    patterns.extend(detect_observer(&gq));
-    patterns.extend(detect_strategy(&gq));
-    patterns.extend(detect_decorator(&gq));
+    patterns.extend(detect_factory(backend));
+    patterns.extend(detect_singleton(backend));
+    patterns.extend(detect_observer(backend));
+    patterns.extend(detect_strategy(backend));
+    patterns.extend(detect_decorator(backend));
 
     Ok(PatternReport { patterns })
 }
 
 /// Run detectors and optionally keep only the given pattern type.
-pub fn detect_filtered(store: &GraphStore, filter: Option<&str>) -> Result<PatternReport> {
-    let mut report = detect_all(store)?;
+pub fn detect_filtered(backend: &dyn GraphBackend, filter: Option<&str>) -> Result<PatternReport> {
+    let mut report = detect_all(backend)?;
     if let Some(name) = filter {
         let lower = name.to_lowercase();
         report
@@ -147,7 +143,7 @@ fn strip_quotes(s: &str) -> String {
 // A class/struct with methods that create or return instances of subtypes.
 // High confidence when the method name contains create/build/make/factory.
 
-fn detect_factory(gq: &GraphQuery) -> Vec<PatternMatch> {
+fn detect_factory(backend: &dyn GraphBackend) -> Vec<PatternMatch> {
     // Find methods that call constructors/classes that have INHERITS edges
     let query = "\
         MATCH (creator:Symbol)-[:CALLS]->(product:Symbol) \
@@ -156,7 +152,7 @@ fn detect_factory(gq: &GraphQuery) -> Vec<PatternMatch> {
         AND EXISTS { MATCH (product)-[:INHERITS]->(:Symbol) } \
         RETURN DISTINCT creator.parent, creator.name, creator.file, product.name, product.file";
 
-    let rows = match gq.raw_query(query) {
+    let rows = match backend.raw_query(query) {
         Ok(r) => r,
         Err(_) => return Vec::new(),
     };
@@ -218,7 +214,7 @@ fn detect_factory(gq: &GraphQuery) -> Vec<PatternMatch> {
 // Classes with a static instance-access method (getInstance, instance, shared,
 // get_instance, etc.).
 
-fn detect_singleton(gq: &GraphQuery) -> Vec<PatternMatch> {
+fn detect_singleton(backend: &dyn GraphBackend) -> Vec<PatternMatch> {
     let singleton_names = [
         "getInstance",
         "instance",
@@ -242,7 +238,7 @@ fn detect_singleton(gq: &GraphQuery) -> Vec<PatternMatch> {
             accessor
         );
 
-        let rows = match gq.raw_query(&query) {
+        let rows = match backend.raw_query(&query) {
             Ok(r) => r,
             Err(_) => continue,
         };
@@ -286,7 +282,7 @@ fn detect_singleton(gq: &GraphQuery) -> Vec<PatternMatch> {
 // ---------------------------------------------------------------------------
 // Subject with subscribe/register + notify/emit methods.
 
-fn detect_observer(gq: &GraphQuery) -> Vec<PatternMatch> {
+fn detect_observer(backend: &dyn GraphBackend) -> Vec<PatternMatch> {
     // Step 1: find methods whose names suggest registration of listeners
     let register_query = "\
         MATCH (reg:Symbol) \
@@ -299,7 +295,7 @@ fn detect_observer(gq: &GraphQuery) -> Vec<PatternMatch> {
              OR reg.name CONTAINS 'on_') \
         RETURN DISTINCT reg.parent, reg.name, reg.file";
 
-    let reg_rows = match gq.raw_query(register_query) {
+    let reg_rows = match backend.raw_query(register_query) {
         Ok(r) => r,
         Err(_) => return Vec::new(),
     };
@@ -333,7 +329,7 @@ fn detect_observer(gq: &GraphQuery) -> Vec<PatternMatch> {
              OR n.name CONTAINS 'fire') \
         RETURN DISTINCT n.parent, n.name, n.file";
 
-    let notify_rows = match gq.raw_query(notify_query) {
+    let notify_rows = match backend.raw_query(notify_query) {
         Ok(r) => r,
         Err(_) => return Vec::new(),
     };
@@ -385,7 +381,7 @@ fn detect_observer(gq: &GraphQuery) -> Vec<PatternMatch> {
 // ---------------------------------------------------------------------------
 // An interface/trait with 3+ classes inheriting from it.
 
-fn detect_strategy(gq: &GraphQuery) -> Vec<PatternMatch> {
+fn detect_strategy(backend: &dyn GraphBackend) -> Vec<PatternMatch> {
     // Kuzu/lbug may not support WITH + aggregation well, so fetch all
     // INHERITS edges and aggregate in Rust.
     let query = "\
@@ -393,7 +389,7 @@ fn detect_strategy(gq: &GraphQuery) -> Vec<PatternMatch> {
         WHERE iface.kind IN ['Class', 'Interface', 'Trait'] \
         RETURN iface.name, iface.file, impl.name, impl.file";
 
-    let rows = match gq.raw_query(query) {
+    let rows = match backend.raw_query(query) {
         Ok(r) => r,
         Err(_) => return Vec::new(),
     };
@@ -456,7 +452,7 @@ fn detect_strategy(gq: &GraphQuery) -> Vec<PatternMatch> {
 // ---------------------------------------------------------------------------
 // A class that inherits from X AND calls methods on the base type.
 
-fn detect_decorator(gq: &GraphQuery) -> Vec<PatternMatch> {
+fn detect_decorator(backend: &dyn GraphBackend) -> Vec<PatternMatch> {
     let query = "\
         MATCH (decorator:Symbol)-[:INHERITS]->(base:Symbol) \
         WHERE decorator.kind = 'Class' \
@@ -467,7 +463,7 @@ fn detect_decorator(gq: &GraphQuery) -> Vec<PatternMatch> {
         } \
         RETURN DISTINCT decorator.name, decorator.file, base.name, base.file";
 
-    let rows = match gq.raw_query(query) {
+    let rows = match backend.raw_query(query) {
         Ok(r) => r,
         Err(_) => return Vec::new(),
     };

@@ -12,24 +12,39 @@ pub(crate) fn cmd_group(root: &Path, action: GroupAction) -> Result<()> {
     let mut registry = Registry::load().unwrap_or_default();
 
     match action {
-        GroupAction::Create { name } => {
-            registry.create_group(&name)?;
+        GroupAction::Create { name, org } => {
+            let org = org.unwrap_or_else(infigraph_core::multi::default_org);
+            let key = infigraph_core::multi::qualified_group_name(&org, &name);
+            registry.create_group_with_org(&name, &org)?;
             registry.save()?;
-            println!("Created group '{}'", name);
+            println!("Created group '{}'", key);
         }
         GroupAction::Add { group, repo } => {
+            let repo_path = std::path::Path::new(&repo);
+            let (repo_name, actual_path) = if repo_path.is_dir() {
+                let name = repo_path
+                    .file_name()
+                    .map(|n| n.to_string_lossy().to_string())
+                    .unwrap_or_else(|| repo.clone());
+                (name, repo_path.to_path_buf())
+            } else {
+                (repo.clone(), root.to_path_buf())
+            };
             let reg = bundled_registry()?;
-            let mut prism = Infigraph::open(root, reg)?;
+            let mut prism = Infigraph::open(&actual_path, reg)?;
             prism.init()?;
-            registry.register_repo(&repo, root, &prism)?;
-            registry.group_add(&group, &repo)?;
+            registry.register_repo(&repo_name, &actual_path, &prism)?;
+            registry.group_add(&group, &repo_name)?;
             registry.save()?;
             let resolved = registry
                 .repos
-                .get(&repo)
+                .get(&repo_name)
                 .map(|e| e.path.display().to_string())
-                .unwrap_or_else(|| root.display().to_string());
-            println!("Added repo '{}' ({}) to group '{}'", repo, resolved, group);
+                .unwrap_or_else(|| actual_path.display().to_string());
+            println!(
+                "Added repo '{}' ({}) to group '{}'",
+                repo_name, resolved, group
+            );
         }
         GroupAction::Remove { group, repo } => {
             registry.group_remove(&group, &repo)?;
@@ -74,6 +89,7 @@ pub(crate) fn cmd_group(root: &Path, action: GroupAction) -> Result<()> {
                 }
             }
 
+            let mut skipped = 0usize;
             println!("Indexing {} repos in group '{}'...", g.repos.len(), group);
             for repo_name in &g.repos {
                 let entry = registry
@@ -82,6 +98,20 @@ pub(crate) fn cmd_group(root: &Path, action: GroupAction) -> Result<()> {
                     .context(format!("repo '{}' not in registry", repo_name))?
                     .clone();
                 println!("\n--- {} ({}) ---", repo_name, entry.path.display());
+
+                if !full {
+                    let current_commit = infigraph_core::multi::git_head_commit(&entry.path);
+                    let unchanged = match (&entry.last_indexed_commit, &current_commit) {
+                        (Some(prev), Some(curr)) => prev == curr,
+                        _ => false,
+                    };
+                    if unchanged {
+                        println!("  Skipped (unchanged at {})", current_commit.unwrap());
+                        skipped += 1;
+                        continue;
+                    }
+                }
+
                 if full {
                     let tg_dir = entry.path.join(".infigraph");
                     if tg_dir.exists() {
@@ -103,8 +133,8 @@ pub(crate) fn cmd_group(root: &Path, action: GroupAction) -> Result<()> {
                 let mut prism = Infigraph::open(&entry.path, reg)?;
                 prism.init()?;
                 let result = prism.index()?;
-                if let Some(store) = prism.store() {
-                    let _ = infigraph_core::manifest::index_manifests(&entry.path, store);
+                if let Some(backend) = prism.backend() {
+                    let _ = infigraph_core::manifest::index_manifests(&entry.path, backend);
                 }
                 println!(
                     "  Indexed {}/{} files",
@@ -118,6 +148,12 @@ pub(crate) fn cmd_group(root: &Path, action: GroupAction) -> Result<()> {
                     );
                 }
                 registry.register_repo(repo_name, &entry.path, &prism)?;
+            }
+            if skipped > 0 {
+                println!(
+                    "\n  ({} repos skipped — unchanged since last index)",
+                    skipped
+                );
             }
             // Auto-start watcher for each repo in group
             for repo_name in &g.repos {
@@ -252,49 +288,12 @@ pub(crate) fn cmd_group(root: &Path, action: GroupAction) -> Result<()> {
             }
         }
         GroupAction::Build { group, full } => {
-            let g = registry
-                .groups
-                .get(&group)
-                .context(format!("group '{}' not found", group))?
-                .clone();
-
-            // Step 1: Index
-            println!("=== Step 1/5: Indexing {} repos ===", g.repos.len());
-            for repo_name in &g.repos {
-                let entry = registry
-                    .repos
-                    .get(repo_name)
-                    .context(format!("repo '{}' not in registry", repo_name))?
-                    .clone();
-                println!("  {} ({})", repo_name, entry.path.display());
-                if full {
-                    let tg_dir = entry.path.join(".infigraph");
-                    if tg_dir.exists() {
-                        let sess_dir = tg_dir.join("sessions");
-                        let sess_bak = entry.path.join(".infigraph-sessions-backup");
-                        let had = sess_dir.exists();
-                        if had {
-                            let _ = std::fs::rename(&sess_dir, &sess_bak);
-                        }
-                        std::fs::remove_dir_all(&tg_dir)?;
-                        if had {
-                            std::fs::create_dir_all(&tg_dir)?;
-                            let _ = std::fs::rename(&sess_bak, &sess_dir);
-                        }
-                    }
-                }
-                let reg = bundled_registry()?;
-                let mut prism = Infigraph::open(&entry.path, reg)?;
-                prism.init()?;
-                let result = prism.index()?;
-                if let Some(store) = prism.store() {
-                    let _ = infigraph_core::manifest::index_manifests(&entry.path, store);
-                }
-                println!(
-                    "    Indexed {}/{} files",
-                    result.indexed_files, result.total_files
-                );
-                registry.register_repo(repo_name, &entry.path, &prism)?;
+            // Step 1: Index (uses index_group for namespace isolation + parallel on Neo4j)
+            let results =
+                infigraph_core::multi::index_group(&mut registry, &group, full, bundled_registry)?;
+            println!("=== Step 1/5: Indexed {} repos ===", results.len());
+            for (repo, indexed, total) in &results {
+                println!("  {}: {}/{} files", repo, indexed, total);
             }
 
             // Step 2: Sync contracts
@@ -316,37 +315,94 @@ pub(crate) fn cmd_group(root: &Path, action: GroupAction) -> Result<()> {
             )?;
             println!("  {} CALLS_SERVICE edges", edge_count);
 
-            // Step 4: Build combined graph
-            println!("=== Step 4/5: Building combined graph ===");
-            let (symbols, edges) =
-                infigraph_core::multi::combined::build_combined_graph(&registry, &group)?;
+            // Step 4: Build combined graph (skip on Neo4j — shared instance already namespaced)
+            let is_remote = {
+                #[cfg(feature = "remote")]
+                {
+                    std::env::var("INFIGRAPH_BACKEND")
+                        .map(|v| v == "neo4j")
+                        .unwrap_or(false)
+                }
+                #[cfg(not(feature = "remote"))]
+                {
+                    false
+                }
+            };
 
-            // Step 5: Index docs sequentially, then build their physical combined store.
-            println!("=== Step 5/5: Building combined document store ===");
+            if is_remote {
+                println!(
+                    "=== Step 4/5: Skipped combined graph (shared Neo4j already namespaced) ==="
+                );
+            } else {
+                println!("=== Step 4/5: Building combined graph ===");
+                let (symbols, edges) =
+                    infigraph_core::multi::combined::build_combined_graph(&registry, &group)?;
+                println!("  {} symbols, {} edges", symbols, edges);
+            }
+
+            // Step 5: Index docs + embeddings
+            let g = registry
+                .groups
+                .get(&group)
+                .context(format!("group '{}' not found", group))?
+                .clone();
             let mut bfs_discovered = 0;
             for repo_name in &g.repos {
                 let entry = registry
                     .repos
                     .get(repo_name)
                     .context(format!("repo '{}' not in registry", repo_name))?;
-                let mut index = infigraph_docs::DocIndex::open(&entry.path)?;
-                index.init()?;
-                bfs_discovered += index.index()?.bfs_discovered;
+                let mut idx = infigraph_docs::DocIndex::open(&entry.path)?;
+                if is_remote {
+                    idx.set_skip_file_embeddings(true);
+                }
+                idx.init()?;
+                let result = idx.index()?;
+                bfs_discovered += result.bfs_discovered;
+
+                #[cfg(feature = "remote")]
+                if is_remote {
+                    if let Some(store) = idx.store() {
+                        let pg =
+                            infigraph_core::meta::PostgresMetaStore::connect_from_env_cached()?;
+                        pg.init_schema()?;
+                        let chunk_refs: Vec<&infigraph_docs::chunk::Chunk> =
+                            result.new_chunks.iter().collect();
+                        let changed_refs: Vec<&str> =
+                            result.changed_files.iter().map(|s| s.as_str()).collect();
+                        let _ = infigraph_docs::embed::update_doc_embeddings_remote(
+                            store,
+                            &pg,
+                            &chunk_refs,
+                            &changed_refs,
+                        )?;
+                    }
+                }
             }
-            let doc_stats = infigraph_docs::combined::build_combined_docs(&registry, &group)?;
-            println!(
-                "Done. {} symbols, {} code edges, {} documents, {} chunks, {} doc links ({} intra-repo, {} cross-repo), {} sources, {} BFS discoveries, {} doc embeddings.",
-                symbols,
-                edges,
-                doc_stats.documents,
-                doc_stats.chunks,
-                doc_stats.links,
-                doc_stats.intra_repo_links,
-                doc_stats.cross_repo_links,
-                doc_stats.sources,
-                bfs_discovered,
-                doc_stats.embeddings
-            );
+
+            if is_remote {
+                println!(
+                    "=== Step 5/5: Indexed docs for {} repos, {} BFS discoveries, embeddings in pgvector ===",
+                    g.repos.len(),
+                    bfs_discovered
+                );
+            } else {
+                println!("=== Step 5/5: Building combined document store ===");
+                let doc_stats = infigraph_docs::combined::build_combined_docs(&registry, &group)?;
+                println!(
+                    "  {} documents, {} chunks, {} doc links ({} intra-repo, {} cross-repo), {} sources, {} BFS discoveries, {} embeddings",
+                    doc_stats.documents,
+                    doc_stats.chunks,
+                    doc_stats.links,
+                    doc_stats.intra_repo_links,
+                    doc_stats.cross_repo_links,
+                    doc_stats.sources,
+                    bfs_discovered,
+                    doc_stats.embeddings
+                );
+            }
+
+            println!("Done.");
         }
         GroupAction::Search {
             group,

@@ -3,7 +3,7 @@ use std::path::Path;
 use anyhow::Result;
 use serde::Serialize;
 
-use crate::graph::GraphStore;
+use crate::graph::GraphBackend;
 
 use super::interprocedural::detect_interprocedural_taint;
 
@@ -35,14 +35,13 @@ static PATH_TRAVERSAL_SANITIZERS: &[&str] = &[
 ];
 
 pub fn detect_path_traversal(
-    store: &GraphStore,
+    backend: &dyn GraphBackend,
     root: &Path,
     max_depth: u32,
 ) -> Result<Vec<PathTraversalFlow>> {
     let mut results = Vec::new();
 
-    // Intra-procedural: check existing taint flows
-    let intra_flows = super::detect_taint_flows(store, root)?;
+    let intra_flows = super::detect_taint_flows(backend, root)?;
     for flow in &intra_flows {
         if flow.sink_category == "PathTraversal"
             && PATH_TRAVERSAL_SOURCE_KINDS.contains(&flow.source_kind.as_str())
@@ -60,12 +59,12 @@ pub fn detect_path_traversal(
     }
 
     // Inter-procedural: trace across function boundaries
-    let inter_flows = detect_interprocedural_taint(store, root, max_depth)?;
+    let inter_flows = detect_interprocedural_taint(backend, root, max_depth)?;
     for flow in &inter_flows {
         if PATH_TRAVERSAL_SINK_CATEGORIES.contains(&flow.sink_category.as_str())
             && PATH_TRAVERSAL_SOURCE_KINDS.contains(&flow.source_kind.as_str())
         {
-            let sanitized = check_chain_sanitized(store, root, &flow.call_chain);
+            let sanitized = check_chain_sanitized(backend, root, &flow.call_chain);
             results.push(PathTraversalFlow {
                 kind: "inter-procedural",
                 source_symbol: flow.source_symbol.clone(),
@@ -81,14 +80,9 @@ pub fn detect_path_traversal(
     Ok(results)
 }
 
-fn check_chain_sanitized(store: &GraphStore, root: &Path, chain: &[String]) -> bool {
-    let conn = match store.connection() {
-        Ok(c) => c,
-        Err(_) => return false,
-    };
-
+fn check_chain_sanitized(backend: &dyn GraphBackend, root: &Path, chain: &[String]) -> bool {
     for symbol_id in chain {
-        let result = conn.query(&format!(
+        let result = backend.raw_query(&format!(
             "MATCH (s:Symbol) WHERE s.id = '{}' RETURN s.file, s.start_line, s.end_line",
             crate::escape_str(symbol_id)
         ));

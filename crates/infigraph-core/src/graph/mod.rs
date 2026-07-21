@@ -21,9 +21,10 @@ pub use kuzu_backend::KuzuBackend;
 #[cfg(feature = "neo4j")]
 pub use neo4j_backend::Neo4jBackend;
 pub use queries::{
-    format_skeleton, ApiSymbol, BranchInfo, CoverageRow, ExampleTest, FileDeps, GraphQuery,
-    HierarchyNode, ImpactRow, ReferenceRow, SkeletonSymbol, SymbolDetail, SymbolRow, TestContext,
-    TestCoverage, TestTarget, TypeHierarchy,
+    format_skeleton, ApiSymbol, ArchitectureStats, BranchInfo, ComplexityRow, CoverageRow,
+    DeadCodeRow, ExampleTest, FileDeps, FileHotspot, GraphQuery, HierarchyNode, HubFunction,
+    ImpactRow, KindCount, LanguageCount, ReferenceRow, SkeletonSymbol, SymbolDetail, SymbolMeta,
+    SymbolRow, SymbolWithDocstring, TestContext, TestCoverage, TestTarget, TypeHierarchy,
 };
 pub use session_store::{SessionData, SessionStore};
 pub use store::{GraphStats, GraphStore};

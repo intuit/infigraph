@@ -5,8 +5,7 @@ use anyhow::Result;
 use serde::Serialize;
 
 use super::{FuncInfo, SourceCache};
-use crate::graph::GraphQuery;
-use crate::graph::GraphStore;
+use crate::graph::GraphBackend;
 use crate::routes::Route;
 
 #[derive(Debug, Clone, Serialize)]
@@ -92,17 +91,17 @@ static HTTP_CLIENT_PATTERNS: &[(&str, &[&str])] = &[
     ),
 ];
 
-pub fn detect_dynamic_urls(store: &GraphStore, root: &Path) -> Result<Vec<DynamicUrl>> {
-    let _lock = store.write_lock()?;
-    let conn = store.connection()?;
-    let gq = GraphQuery::new(&conn);
+pub fn detect_dynamic_urls(backend: &dyn GraphBackend, root: &Path) -> Result<Vec<DynamicUrl>> {
+    let route_rows = backend
+        .raw_query(
+            "MATCH (s:Symbol) WHERE s.kind IN ['Function', 'Method'] \
+         RETURN s.id, s.name, s.kind, s.file, s.docstring",
+        )
+        .unwrap_or_default();
+    let routes = crate::routes::detect_routes_from_rows(&route_rows);
 
-    // Get known routes for matching
-    let routes = crate::routes::detect_routes(&gq).unwrap_or_default();
-
-    let result = conn
-        .query("MATCH (s:Symbol) WHERE s.kind IN ['Function', 'Method'] AND s.file IS NOT NULL RETURN s.id, s.file, s.start_line, s.end_line")
-        .map_err(|e| anyhow::anyhow!("query: {e}"))?;
+    let result = backend
+        .raw_query("MATCH (s:Symbol) WHERE s.kind IN ['Function', 'Method'] AND s.file IS NOT NULL RETURN s.id, s.file, s.start_line, s.end_line")?;
 
     let mut functions: Vec<(String, String, u32, u32)> = Vec::new();
     for row in result {
@@ -142,21 +141,24 @@ pub fn detect_dynamic_urls(store: &GraphStore, root: &Path) -> Result<Vec<Dynami
     }
 
     if !urls.is_empty() {
-        write_calls_service_edges(store, &urls)?;
+        write_calls_service_edges(backend, &urls)?;
     }
 
     Ok(urls)
 }
 
 pub fn detect_dynamic_urls_with_cache(
-    store: &GraphStore,
+    backend: &dyn GraphBackend,
     functions: &[FuncInfo],
     cache: &SourceCache,
 ) -> Result<Vec<DynamicUrl>> {
-    let _lock = store.write_lock()?;
-    let conn = store.connection()?;
-    let gq = GraphQuery::new(&conn);
-    let routes = crate::routes::detect_routes(&gq).unwrap_or_default();
+    let route_rows = backend
+        .raw_query(
+            "MATCH (s:Symbol) WHERE s.kind IN ['Function', 'Method'] \
+         RETURN s.id, s.name, s.kind, s.file, s.docstring",
+        )
+        .unwrap_or_default();
+    let routes = crate::routes::detect_routes_from_rows(&route_rows);
 
     let mut urls = Vec::new();
     for func in functions {
@@ -177,7 +179,7 @@ pub fn detect_dynamic_urls_with_cache(
     }
 
     if !urls.is_empty() {
-        write_calls_service_edges(store, &urls)?;
+        write_calls_service_edges(backend, &urls)?;
     }
 
     Ok(urls)
@@ -397,11 +399,8 @@ fn match_route(template: &str, routes: &[Route]) -> Option<MatchedRoute> {
     None
 }
 
-fn write_calls_service_edges(store: &GraphStore, urls: &[DynamicUrl]) -> Result<()> {
-    let conn = store.connection()?;
-
-    conn.query("BEGIN TRANSACTION")
-        .map_err(|e| anyhow::anyhow!("begin txn: {e}"))?;
+fn write_calls_service_edges(backend: &dyn GraphBackend, urls: &[DynamicUrl]) -> Result<()> {
+    backend.raw_query("BEGIN TRANSACTION")?;
 
     for url in urls {
         if let Some(ref matched) = url.matched_route {
@@ -410,15 +409,14 @@ fn write_calls_service_edges(store: &GraphStore, urls: &[DynamicUrl]) -> Result<
             let method_esc = crate::escape_str(&matched.method);
             let path_esc = crate::escape_str(&url.url_template);
 
-            let _ = conn.query(&format!(
+            let _ = backend.raw_query(&format!(
                 "MATCH (s:Symbol), (t:Symbol) WHERE s.id = '{src_esc}' AND t.id = '{tgt_esc}' \
                  CREATE (s)-[:CALLS_SERVICE {{method: '{method_esc}', path: '{path_esc}', target_service: ''}}]->(t)"
             ));
         }
     }
 
-    conn.query("COMMIT")
-        .map_err(|e| anyhow::anyhow!("commit txn: {e}"))?;
+    backend.raw_query("COMMIT")?;
 
     Ok(())
 }

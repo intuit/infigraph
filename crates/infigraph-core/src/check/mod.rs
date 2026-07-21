@@ -9,8 +9,7 @@ use std::path::Path;
 use anyhow::Result;
 use serde::{Deserialize, Serialize};
 
-use crate::graph::store::GraphStore;
-use crate::graph::GraphQuery;
+use crate::graph::GraphBackend;
 use crate::security;
 
 // ---------------------------------------------------------------------------
@@ -196,7 +195,7 @@ impl CheckSelection {
 pub fn run_checks(
     root: &Path,
     config: &CheckConfig,
-    store: &GraphStore,
+    backend: &dyn GraphBackend,
     selection: &CheckSelection,
 ) -> Vec<CheckResult> {
     let mut results = Vec::new();
@@ -205,44 +204,14 @@ pub fn run_checks(
         results.push(run_security_check(root, &config.security));
     }
 
-    // Graph-based checks need a connection.
-    let conn_result = store.connection();
-    let conn = match conn_result {
-        Ok(ref c) => Some(c),
-        Err(ref e) => {
-            if selection.complexity && config.complexity.enabled {
-                results.push(CheckResult {
-                    name: "complexity".into(),
-                    status: CheckStatus::Fail,
-                    summary: format!("Graph connection failed: {e}"),
-                    details: vec![],
-                });
-            }
-            if selection.dead_code && config.dead_code.enabled {
-                results.push(CheckResult {
-                    name: "dead-code".into(),
-                    status: CheckStatus::Fail,
-                    summary: format!("Graph connection failed: {e}"),
-                    details: vec![],
-                });
-            }
-            None
-        }
-    };
-
-    if let Some(conn) = conn {
-        let gq = GraphQuery::new(conn);
-
-        if selection.complexity && config.complexity.enabled {
-            results.push(run_complexity_check(&gq, &config.complexity));
-        }
-        if selection.dead_code && config.dead_code.enabled {
-            results.push(run_dead_code_check(&gq, &config.dead_code));
-        }
-
-        if selection.vulnerabilities && config.vulnerabilities.enabled {
-            results.push(run_vuln_check(store, &config.vulnerabilities));
-        }
+    if selection.complexity && config.complexity.enabled {
+        results.push(run_complexity_check(backend, &config.complexity));
+    }
+    if selection.dead_code && config.dead_code.enabled {
+        results.push(run_dead_code_check(backend, &config.dead_code));
+    }
+    if selection.vulnerabilities && config.vulnerabilities.enabled {
+        results.push(run_vuln_check(backend, &config.vulnerabilities));
     }
 
     results
@@ -312,7 +281,7 @@ fn run_security_check(root: &Path, cfg: &SecurityConfig) -> CheckResult {
     }
 }
 
-fn run_complexity_check(gq: &GraphQuery, cfg: &ComplexityConfig) -> CheckResult {
+fn run_complexity_check(backend: &dyn GraphBackend, cfg: &ComplexityConfig) -> CheckResult {
     let query = format!(
         "MATCH (s:Symbol) WHERE s.complexity >= {} \
          AND (s.kind = 'Function' OR s.kind = 'Method') \
@@ -320,7 +289,7 @@ fn run_complexity_check(gq: &GraphQuery, cfg: &ComplexityConfig) -> CheckResult 
         cfg.threshold,
     );
 
-    let rows = match gq.raw_query(&query) {
+    let rows = match backend.raw_query(&query) {
         Ok(r) => r,
         Err(e) => {
             return CheckResult {
@@ -365,13 +334,13 @@ fn run_complexity_check(gq: &GraphQuery, cfg: &ComplexityConfig) -> CheckResult 
     }
 }
 
-fn run_dead_code_check(gq: &GraphQuery, cfg: &DeadCodeConfig) -> CheckResult {
+fn run_dead_code_check(backend: &dyn GraphBackend, cfg: &DeadCodeConfig) -> CheckResult {
     let query = "MATCH (s:Symbol) WHERE s.kind IN ['Function', 'Method'] \
                  AND NOT EXISTS { MATCH ()-[:CALLS]->(s) } \
                  AND NOT EXISTS { MATCH (p:Symbol)<-[:INHERITS]-() WHERE p.file = s.file AND p.kind IN ['Class', 'Interface', 'Trait'] } \
                  RETURN s.name, s.kind, s.file ORDER BY s.file, s.name";
 
-    let rows = match gq.raw_query(query) {
+    let rows = match backend.raw_query(query) {
         Ok(r) => r,
         Err(e) => {
             return CheckResult {
@@ -427,8 +396,8 @@ fn run_dead_code_check(gq: &GraphQuery, cfg: &DeadCodeConfig) -> CheckResult {
     }
 }
 
-fn run_vuln_check(store: &GraphStore, cfg: &VulnCheckConfig) -> CheckResult {
-    let deps = match crate::manifest::query_deps(store) {
+fn run_vuln_check(backend: &dyn GraphBackend, cfg: &VulnCheckConfig) -> CheckResult {
+    let deps = match crate::manifest::query_deps(backend) {
         Ok(d) => d,
         Err(e) => {
             return CheckResult {

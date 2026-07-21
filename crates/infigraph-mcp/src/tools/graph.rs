@@ -17,11 +17,9 @@ pub fn tool_query_graph(args: &Value) -> Result<String> {
         .and_then(|c| c.as_str())
         .context("missing 'cypher'")?;
 
-    let store = prism.store().context("not initialized")?;
-    let conn = store.connection()?;
-    let gq = infigraph_core::graph::GraphQuery::new(&conn);
+    let backend = prism.backend().context("not initialized")?;
 
-    let rows = gq.raw_query(cypher)?;
+    let rows = backend.raw_query(cypher)?;
     let mut out = String::new();
     for row in &rows {
         out.push_str(&row.join(" | "));
@@ -40,11 +38,9 @@ pub fn tool_get_symbols_in_file(args: &Value) -> Result<String> {
         .and_then(|f| f.as_str())
         .context("missing 'file'")?;
 
-    let store = prism.store().context("not initialized")?;
-    let conn = store.connection()?;
-    let gq = infigraph_core::graph::GraphQuery::new(&conn);
+    let backend = prism.backend().context("not initialized")?;
 
-    let symbols = gq.symbols_in_file(file)?;
+    let symbols = backend.symbols_in_file(file)?;
     let mut out = String::new();
     for s in &symbols {
         out.push_str(&format!(
@@ -71,15 +67,17 @@ pub fn tool_get_code_snippet(args: &Value) -> Result<String> {
         .and_then(|s| s.as_str())
         .context("missing 'symbol_id'")?;
 
-    let store = prism.store().context("not initialized")?;
-    let conn = store.connection()?;
-    let gq = infigraph_core::graph::GraphQuery::new(&conn);
+    let backend = prism.backend().context("not initialized")?;
 
-    let detail = gq
+    let detail = backend
         .find_symbol_by_id(symbol_id)?
         .context(format!("symbol '{}' not found in graph", symbol_id))?;
 
-    let file_path = prism.root().join(&detail.file);
+    let file_path = if std::path::Path::new(&detail.file).is_absolute() {
+        PathBuf::from(&detail.file)
+    } else {
+        prism.root().join(&detail.file)
+    };
     let snippet = infigraph_core::search::read_lines_from_file(
         &file_path,
         detail.start_line,
@@ -182,9 +180,7 @@ pub fn tool_list_languages(_args: &Value) -> Result<String> {
 pub fn tool_get_graph_schema(args: &Value) -> Result<String> {
     let prism = open_prism_read_only(args)?;
     let stats = prism.stats()?;
-    let store = prism.store().context("not initialized")?;
-    let conn = store.connection()?;
-    let gq = infigraph_core::graph::GraphQuery::new(&conn);
+    let backend = prism.backend().context("not initialized")?;
 
     let mut out = String::new();
 
@@ -213,12 +209,10 @@ pub fn tool_get_graph_schema(args: &Value) -> Result<String> {
     ));
     out.push_str("  HAS_STATEMENT         Symbol -> Statement\n");
 
-    // Show symbol kinds present in the graph
     out.push_str("\n=== Symbol Kinds ===\n");
-    let kind_rows =
-        gq.raw_query("MATCH (s:Symbol) RETURN s.kind, count(s) ORDER BY count(s) DESC")?;
-    for row in &kind_rows {
-        out.push_str(&format!("  {:>20}: {}\n", row[0], row[1]));
+    let arch = backend.get_architecture_stats()?;
+    for k in &arch.kind_counts {
+        out.push_str(&format!("  {:>20}: {}\n", k.kind, k.count));
     }
 
     Ok(out)
@@ -231,12 +225,9 @@ pub fn tool_symbol_context(args: &Value) -> Result<String> {
         .and_then(|s| s.as_str())
         .context("missing 'symbol_id'")?;
 
-    let store = prism.store().context("not initialized")?;
-    let conn = store.connection()?;
-    let gq = infigraph_core::graph::GraphQuery::new(&conn);
+    let backend = prism.backend().context("not initialized")?;
 
-    // Find the symbol
-    let detail = gq
+    let detail = backend
         .find_symbol_by_id(symbol_id)?
         .context(format!("symbol '{}' not found in graph", symbol_id))?;
 
@@ -250,28 +241,16 @@ pub fn tool_symbol_context(args: &Value) -> Result<String> {
         detail.start_line, detail.end_line
     ));
 
-    // Docstring
-    let doc_rows = gq.raw_query(&format!(
-        "MATCH (s:Symbol) WHERE s.id = '{}' RETURN s.docstring",
-        symbol_id.replace('\'', "\\'")
-    ))?;
-    if let Some(row) = doc_rows.first() {
-        if !row[0].is_empty() {
-            out.push_str(&format!("  Docstring:  {}\n", row[0]));
+    if let Ok(Some(meta)) = backend.symbol_metadata(symbol_id) {
+        if !meta.docstring.is_empty() {
+            out.push_str(&format!("  Docstring:  {}\n", meta.docstring));
+        }
+        if let (Some(pid), Some(pname)) = (&meta.parent_id, &meta.parent_name) {
+            out.push_str(&format!("  Parent:     {} ({})\n", pname, pid));
         }
     }
 
-    // Parent (containing scope)
-    let parent_rows = gq.raw_query(&format!(
-        "MATCH (parent)-[:CONTAINS]->(s:Symbol) WHERE s.id = '{}' RETURN parent.id, parent.name",
-        symbol_id.replace('\'', "\\'")
-    ))?;
-    if let Some(row) = parent_rows.first() {
-        out.push_str(&format!("  Parent:     {} ({})\n", row[1], row[0]));
-    }
-
-    // Callers
-    let callers = gq.callers_of(symbol_id)?;
+    let callers = backend.callers_of(symbol_id)?;
     out.push_str(&format!("\n  Callers ({}):\n", callers.len()));
     if callers.is_empty() {
         out.push_str("    (none)\n");
@@ -281,8 +260,7 @@ pub fn tool_symbol_context(args: &Value) -> Result<String> {
         }
     }
 
-    // Callees
-    let callees = gq.callees_of(symbol_id)?;
+    let callees = backend.callees_of(symbol_id)?;
     out.push_str(&format!("\n  Callees ({}):\n", callees.len()));
     if callees.is_empty() {
         out.push_str("    (none)\n");
@@ -292,7 +270,6 @@ pub fn tool_symbol_context(args: &Value) -> Result<String> {
         }
     }
 
-    // Auto-inject relevant session context (LM2 skip connection)
     let path = args.get("path").and_then(|p| p.as_str()).unwrap_or(".");
     auto_inject_session_context(path, &detail.name, &mut out);
 
@@ -301,26 +278,22 @@ pub fn tool_symbol_context(args: &Value) -> Result<String> {
 
 pub fn tool_detect_routes(args: &Value) -> Result<String> {
     let prism = open_prism_read_only(args)?;
-    let store = prism.store().context("not initialized")?;
-    let conn = store.connection()?;
-    let gq = infigraph_core::graph::GraphQuery::new(&conn);
+    let backend = prism.backend().context("not initialized")?;
 
-    let routes = infigraph_core::routes::detect_routes(&gq)?;
+    let routes = infigraph_core::routes::detect_routes(backend)?;
     Ok(infigraph_core::routes::format_routes(&routes))
 }
 
 pub fn tool_find_all_references(args: &Value) -> Result<String> {
     let prism = open_prism_read_only(args)?;
-    let store = prism.store().context("not initialized")?;
-    let conn = store.connection()?;
-    let gq = infigraph_core::graph::GraphQuery::new(&conn);
+    let backend = prism.backend().context("not initialized")?;
 
     let symbol_id = args
         .get("symbol_id")
         .and_then(|v| v.as_str())
         .context("missing 'symbol_id'")?;
 
-    let refs = gq.find_all_references(symbol_id)?;
+    let refs = backend.find_all_references(symbol_id)?;
     if refs.is_empty() {
         return Ok(format!("No references found for '{}'", symbol_id));
     }
@@ -334,12 +307,10 @@ pub fn tool_find_all_references(args: &Value) -> Result<String> {
 
 pub fn tool_get_api_surface(args: &Value) -> Result<String> {
     let prism = open_prism_read_only(args)?;
-    let store = prism.store().context("not initialized")?;
-    let conn = store.connection()?;
-    let gq = infigraph_core::graph::GraphQuery::new(&conn);
+    let backend = prism.backend().context("not initialized")?;
 
     let file_filter = args.get("file").and_then(|v| v.as_str());
-    let mut syms = gq.get_api_surface()?;
+    let mut syms = backend.get_api_surface()?;
     if let Some(f) = file_filter {
         syms.retain(|s| s.file.contains(f));
     }
@@ -380,16 +351,14 @@ pub fn tool_get_api_surface(args: &Value) -> Result<String> {
 
 pub fn tool_get_file_deps(args: &Value) -> Result<String> {
     let prism = open_prism_read_only(args)?;
-    let store = prism.store().context("not initialized")?;
-    let conn = store.connection()?;
-    let gq = infigraph_core::graph::GraphQuery::new(&conn);
+    let backend = prism.backend().context("not initialized")?;
 
     let file = args
         .get("file")
         .and_then(|v| v.as_str())
         .context("missing 'file'")?;
 
-    let deps = gq.get_file_deps(file)?;
+    let deps = backend.get_file_deps(file)?;
     let mut out = format!("File dependencies for '{}':\n\n", file);
 
     out.push_str(&format!("Imports ({}):\n", deps.imports.len()));
@@ -413,9 +382,7 @@ pub fn tool_get_file_deps(args: &Value) -> Result<String> {
 
 pub fn tool_get_type_hierarchy(args: &Value) -> Result<String> {
     let prism = open_prism_read_only(args)?;
-    let store = prism.store().context("not initialized")?;
-    let conn = store.connection()?;
-    let gq = infigraph_core::graph::GraphQuery::new(&conn);
+    let backend = prism.backend().context("not initialized")?;
 
     let symbol_id = args
         .get("symbol_id")
@@ -423,7 +390,7 @@ pub fn tool_get_type_hierarchy(args: &Value) -> Result<String> {
         .context("missing 'symbol_id'")?;
     let depth = args.get("depth").and_then(|v| v.as_u64()).unwrap_or(5) as u32;
 
-    let hier = gq.get_type_hierarchy(symbol_id, depth)?;
+    let hier = backend.get_type_hierarchy(symbol_id, depth)?;
     let mut out = format!("Type hierarchy for '{}':\n\n", hier.root_name);
 
     out.push_str(&format!("Ancestors ({}):\n", hier.ancestors.len()));
@@ -447,12 +414,10 @@ pub fn tool_get_type_hierarchy(args: &Value) -> Result<String> {
 
 pub fn tool_get_test_coverage(args: &Value) -> Result<String> {
     let prism = open_prism_read_only(args)?;
-    let store = prism.store().context("not initialized")?;
-    let conn = store.connection()?;
-    let gq = infigraph_core::graph::GraphQuery::new(&conn);
+    let backend = prism.backend().context("not initialized")?;
 
     let file_filter = args.get("file").and_then(|v| v.as_str());
-    let mut cov = gq.get_test_coverage()?;
+    let mut cov = backend.get_test_coverage()?;
 
     if let Some(f) = file_filter {
         cov.covered.retain(|s| s.file.contains(f));
@@ -496,32 +461,18 @@ pub fn tool_get_test_coverage(args: &Value) -> Result<String> {
 
 pub fn tool_get_complexity(args: &Value) -> Result<String> {
     let prism = open_prism_read_only(args)?;
-    let store = prism.store().context("not initialized")?;
-    let conn = store.connection()?;
-    let gq = infigraph_core::graph::GraphQuery::new(&conn);
+    let backend = prism.backend().context("not initialized")?;
 
     let threshold = args.get("threshold").and_then(|v| v.as_u64()).unwrap_or(10) as u32;
     let file_filter = args.get("file").and_then(|v| v.as_str());
 
-    let base_q = if let Some(f) = file_filter {
-        format!(
-            "MATCH (s:Symbol) WHERE (s.kind = 'Function' OR s.kind = 'Method' OR s.kind = 'Test') AND s.file CONTAINS '{}' RETURN s.name, s.file, s.start_line, s.complexity ORDER BY s.complexity DESC",
-            f.replace('\'', "\\'")
-        )
-    } else {
-        "MATCH (s:Symbol) WHERE (s.kind = 'Function' OR s.kind = 'Method' OR s.kind = 'Test') RETURN s.name, s.file, s.start_line, s.complexity ORDER BY s.complexity DESC".to_string()
-    };
-
-    let rows = gq.raw_query(&base_q)?;
+    let rows = backend.get_complexity_ranking(file_filter)?;
 
     if rows.is_empty() {
         return Ok("No function/method symbols found. Run index_project first.".to_string());
     }
 
-    let total: u32 = rows
-        .iter()
-        .filter_map(|r| r.get(3).and_then(|v| v.parse::<u32>().ok()))
-        .sum();
+    let total: u32 = rows.iter().map(|r| r.complexity).sum();
     let count = rows.len();
     let avg = if count > 0 {
         total as f64 / count as f64
@@ -529,10 +480,7 @@ pub fn tool_get_complexity(args: &Value) -> Result<String> {
         0.0
     };
 
-    let hotspots: Vec<_> = rows
-        .iter()
-        .filter(|r| r.get(3).and_then(|v| v.parse::<u32>().ok()).unwrap_or(0) >= threshold)
-        .collect();
+    let hotspots: Vec<_> = rows.iter().filter(|r| r.complexity >= threshold).collect();
 
     let mut out = format!(
         "Complexity Analysis: {} symbols, avg {:.1}, {} hotspots (>= {})\n\n",
@@ -544,28 +492,26 @@ pub fn tool_get_complexity(args: &Value) -> Result<String> {
 
     if !hotspots.is_empty() {
         out.push_str(&format!("Hotspots (complexity >= {}):\n", threshold));
-        for row in &hotspots {
-            let name = row.first().map(|s| s.as_str()).unwrap_or("?");
-            let file = row.get(1).map(|s| s.as_str()).unwrap_or("?");
-            let line = row.get(2).map(|s| s.as_str()).unwrap_or("?");
-            let cplx = row.get(3).map(|s| s.as_str()).unwrap_or("?");
-            out.push_str(&format!("  [{cplx:>3}] {name}  ({file}:{line})\n"));
+        for r in &hotspots {
+            out.push_str(&format!(
+                "  [{:>3}] {}  ({}:{})\n",
+                r.complexity, r.name, r.file, r.start_line
+            ));
         }
         out.push('\n');
     }
 
     out.push_str("Top 20 by complexity:\n");
-    for row in rows.iter().take(20) {
-        let name = row.first().map(|s| s.as_str()).unwrap_or("?");
-        let file = row.get(1).map(|s| s.as_str()).unwrap_or("?");
-        let line = row.get(2).map(|s| s.as_str()).unwrap_or("?");
-        let cplx = row.get(3).map(|s| s.as_str()).unwrap_or("?");
-        let flag = if cplx.parse::<u32>().unwrap_or(0) >= threshold {
+    for r in rows.iter().take(20) {
+        let flag = if r.complexity >= threshold {
             " ⚠"
         } else {
             ""
         };
-        out.push_str(&format!("  [{cplx:>3}] {name}  ({file}:{line}){flag}\n"));
+        out.push_str(&format!(
+            "  [{:>3}] {}  ({}:{}){flag}\n",
+            r.complexity, r.name, r.file, r.start_line
+        ));
     }
 
     Ok(out)
@@ -573,16 +519,14 @@ pub fn tool_get_complexity(args: &Value) -> Result<String> {
 
 pub fn tool_get_skeleton(args: &Value) -> Result<String> {
     let prism = open_prism_read_only(args)?;
-    let store = prism.store().context("not initialized")?;
-    let conn = store.connection()?;
-    let gq = infigraph_core::graph::GraphQuery::new(&conn);
+    let backend = prism.backend().context("not initialized")?;
 
     let file = args
         .get("file")
         .and_then(|v| v.as_str())
         .context("missing 'file'")?;
 
-    gq.skeleton(file)
+    backend.skeleton(file)
 }
 
 pub fn tool_get_doc_context(args: &Value) -> Result<String> {
@@ -592,11 +536,9 @@ pub fn tool_get_doc_context(args: &Value) -> Result<String> {
         .and_then(|s| s.as_str())
         .context("missing 'symbol_id'")?;
 
-    let store = prism.store().context("not initialized")?;
-    let conn = store.connection()?;
-    let gq = infigraph_core::graph::GraphQuery::new(&conn);
+    let backend = prism.backend().context("not initialized")?;
 
-    let detail = gq
+    let detail = backend
         .find_symbol_by_id(symbol_id)?
         .context(format!("symbol '{}' not found", symbol_id))?;
 
@@ -606,22 +548,20 @@ pub fn tool_get_doc_context(args: &Value) -> Result<String> {
         detail.file, detail.start_line, detail.end_line
     ));
 
-    // Docstring
-    let doc_rows = gq.raw_query(&format!(
-        "MATCH (s:Symbol) WHERE s.id = '{}' RETURN s.docstring, s.complexity",
-        symbol_id.replace('\'', "\\'")
-    ))?;
-    if let Some(row) = doc_rows.first() {
-        if !row[0].is_empty() {
-            out.push_str(&format!("Doc:   {}\n", row[0]));
+    if let Ok(Some(meta)) = backend.symbol_metadata(symbol_id) {
+        if !meta.docstring.is_empty() {
+            out.push_str(&format!("Doc:   {}\n", meta.docstring));
         }
-        if !row[1].is_empty() && row[1] != "1" {
-            out.push_str(&format!("Complexity: {}\n", row[1]));
+        if meta.complexity > 1 {
+            out.push_str(&format!("Complexity: {}\n", meta.complexity));
         }
     }
 
-    // Source snippet (read file directly)
-    let file_path = prism.root().join(&detail.file);
+    let file_path = if std::path::Path::new(&detail.file).is_absolute() {
+        PathBuf::from(&detail.file)
+    } else {
+        prism.root().join(&detail.file)
+    };
     if let Ok(source) = std::fs::read_to_string(&file_path) {
         let lines: Vec<&str> = source.lines().collect();
         let start = (detail.start_line as usize).saturating_sub(1);
@@ -635,8 +575,7 @@ pub fn tool_get_doc_context(args: &Value) -> Result<String> {
         }
     }
 
-    // Callers
-    let callers = gq.callers_of(symbol_id)?;
+    let callers = backend.callers_of(symbol_id)?;
     out.push_str(&format!("\nCallers ({}):\n", callers.len()));
     if callers.is_empty() {
         out.push_str("  (none — possible entry point or dead code)\n");
@@ -646,8 +585,7 @@ pub fn tool_get_doc_context(args: &Value) -> Result<String> {
         }
     }
 
-    // Callees
-    let callees = gq.callees_of(symbol_id)?;
+    let callees = backend.callees_of(symbol_id)?;
     out.push_str(&format!("\nCallees ({}):\n", callees.len()));
     if callees.is_empty() {
         out.push_str("  (none)\n");
@@ -657,7 +595,6 @@ pub fn tool_get_doc_context(args: &Value) -> Result<String> {
         }
     }
 
-    // Auto-inject relevant session context (LM2 skip connection)
     let path = args.get("path").and_then(|p| p.as_str()).unwrap_or(".");
     auto_inject_session_context(path, &detail.name, &mut out);
 
@@ -762,38 +699,33 @@ fn auto_inject_session_context(path: &str, symbol_name: &str, main_output: &mut 
 
 pub fn tool_list_files(args: &Value) -> Result<String> {
     let prism = open_prism_read_only(args)?;
-    let store = prism.store().context("not initialized")?;
-    let conn = store.connection()?;
-    let gq = infigraph_core::graph::GraphQuery::new(&conn);
+    let backend = prism.backend().context("not initialized")?;
 
-    let rows = gq.raw_query("MATCH (s:Symbol) RETURN DISTINCT s.file ORDER BY s.file")?;
-    if rows.is_empty() {
+    let all_files = backend.list_indexed_files()?;
+    if all_files.is_empty() {
         return Ok("No files indexed. Run index_project first.".to_string());
     }
 
     let glob = args.get("glob").and_then(|g| g.as_str()).unwrap_or("");
 
-    let mut files: Vec<&str> = rows
+    let files: Vec<&str> = all_files
         .iter()
-        .filter_map(|row| row.first().map(|s| s.as_str()))
+        .map(|s| s.as_str())
         .filter(|f| glob.is_empty() || glob_matches(glob, f))
         .collect();
-    files.dedup();
 
     Ok(files.join("\n"))
 }
 
 pub fn tool_generate_test_context(args: &Value) -> Result<String> {
     let prism = open_prism_read_only(args)?;
-    let store = prism.store().context("not initialized")?;
-    let conn = store.connection()?;
-    let gq = infigraph_core::graph::GraphQuery::new(&conn);
+    let backend = prism.backend().context("not initialized")?;
 
     let file_filter = args.get("file").and_then(|v| v.as_str());
     let limit = args.get("limit").and_then(|v| v.as_u64()).unwrap_or(10) as usize;
     let test_type = args.get("test_type").and_then(|v| v.as_str());
 
-    let ctx = gq.generate_test_context(file_filter, limit, test_type)?;
+    let ctx = backend.generate_test_context(file_filter, limit, test_type)?;
 
     let mut out = format!(
         "## Test Generation Context\n\nFramework: {}\n",
@@ -806,7 +738,11 @@ pub fn tool_generate_test_context(args: &Value) -> Result<String> {
             "  {} — {}:{}-{}\n",
             ex.name, ex.file, ex.start_line, ex.end_line
         ));
-        let file_path = prism.root().join(&ex.file);
+        let file_path = if std::path::Path::new(&ex.file).is_absolute() {
+            PathBuf::from(&ex.file)
+        } else {
+            prism.root().join(&ex.file)
+        };
         if let Ok(source) = std::fs::read_to_string(&file_path) {
             let lines: Vec<&str> = source.lines().collect();
             let start = (ex.start_line as usize).saturating_sub(1);
@@ -870,7 +806,11 @@ pub fn tool_generate_test_context(args: &Value) -> Result<String> {
             }
         }
 
-        let file_path = prism.root().join(&t.file);
+        let file_path = if std::path::Path::new(&t.file).is_absolute() {
+            PathBuf::from(&t.file)
+        } else {
+            prism.root().join(&t.file)
+        };
         if let Ok(source) = std::fs::read_to_string(&file_path) {
             let lines: Vec<&str> = source.lines().collect();
             let start = (t.start_line as usize).saturating_sub(1);
@@ -907,8 +847,6 @@ pub fn tool_generate_sequence_diagram(args: &Value) -> Result<String> {
         .and_then(|v| v.as_str())
         .context("missing 'symbol_id' argument")?;
     let depth = args.get("depth").and_then(|v| v.as_u64()).unwrap_or(3) as u32;
-    let store = prism.store().context("not initialized")?;
-    let conn = store.connection()?;
-    let gq = infigraph_core::graph::GraphQuery::new(&conn);
-    infigraph_core::sequence::generate_sequence_mermaid(&gq, symbol_id, depth)
+    let backend = prism.backend().context("not initialized")?;
+    infigraph_core::sequence::generate_sequence_mermaid(backend, symbol_id, depth)
 }

@@ -10,17 +10,14 @@ pub fn tool_detect_changes(args: &Value) -> Result<String> {
     let base = args.get("base").and_then(|b| b.as_str()).unwrap_or("HEAD");
     let depth = args.get("depth").and_then(|d| d.as_u64()).unwrap_or(3) as u32;
 
-    let store = prism.store().context("not initialized")?;
-    let conn = store.connection()?;
-    let gq = infigraph_core::graph::GraphQuery::new(&conn);
+    let backend = prism.backend().context("not initialized")?;
 
-    build_detect_changes_report(prism.root(), &gq, base, depth)
+    build_detect_changes_report(prism.root(), backend, base, depth)
 }
 
-/// Parse git diff output and map changed lines to symbols in the graph.
 pub fn build_detect_changes_report(
     project_root: &std::path::Path,
-    gq: &infigraph_core::graph::GraphQuery,
+    backend: &dyn infigraph_core::graph::GraphBackend,
     base: &str,
     depth: u32,
 ) -> Result<String> {
@@ -63,7 +60,7 @@ pub fn build_detect_changes_report(
     let mut seen_ids: HashSet<String> = HashSet::new();
 
     for (file, start, end) in &hunks {
-        let symbols = gq.symbols_in_range(file, *start, *end)?;
+        let symbols = backend.symbols_in_range(file, *start, *end)?;
         for s in symbols {
             if seen_ids.insert(s.id.clone()) {
                 directly_changed.push((s.id, s.name, s.file, s.start_line, s.end_line));
@@ -96,7 +93,7 @@ pub fn build_detect_changes_report(
         let mut indirect_ids: HashSet<String> = HashSet::new();
 
         for (id, _, _, _, _) in &directly_changed {
-            if let Ok(impacted) = gq.transitive_impact(id, depth) {
+            if let Ok(impacted) = backend.transitive_impact(id, depth) {
                 for row in impacted {
                     if !seen_ids.contains(&row.id) && indirect_ids.insert(row.id.clone()) {
                         indirectly_affected.push((row.id, row.name, row.file, row.kind));
@@ -183,9 +180,7 @@ pub fn tool_git_summary(args: &Value) -> Result<String> {
     let file_filter = args.get("file").and_then(|v| v.as_str());
 
     let root = prism.root().to_path_buf();
-    let store = prism.store().context("not initialized")?;
-    let conn = store.connection()?;
-    let gq = infigraph_core::graph::GraphQuery::new(&conn);
+    let backend = prism.backend().context("not initialized")?;
 
     // Get recent commit hashes + metadata
     let n_commits_arg = format!("-{}", n_commits);
@@ -265,7 +260,7 @@ pub fn tool_git_summary(args: &Value) -> Result<String> {
         // Collect touched symbols
         let mut touched: std::collections::HashSet<String> = std::collections::HashSet::new();
         for (file, start, end) in &hunks {
-            if let Ok(syms) = gq.symbols_in_range(file, *start, *end) {
+            if let Ok(syms) = backend.symbols_in_range(file, *start, *end) {
                 for s in syms {
                     touched.insert(format!(
                         "{} {} ({}:{})",

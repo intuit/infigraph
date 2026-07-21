@@ -1,23 +1,16 @@
 use std::collections::HashSet;
 
-use crate::graph::store::GraphStore;
-use crate::graph::GraphQuery;
+use crate::graph::GraphBackend;
 
 /// Extract gRPC service contracts from .proto files in the graph.
 ///
 /// Queries for proto Service symbols (kind='Class') in .proto files
 /// and their child Method symbols (RPC methods), producing one Contract
 /// per RPC endpoint with kind=GrpcService.
-pub fn extract_grpc_contracts(store: &GraphStore) -> Vec<super::Contract> {
-    let conn = match store.connection() {
-        Ok(c) => c,
-        Err(_) => return vec![],
-    };
-    let gq = GraphQuery::new(&conn);
-
+pub fn extract_grpc_contracts(backend: &dyn GraphBackend) -> Vec<super::Contract> {
     // Find services in .proto files
     let query = "MATCH (s:Symbol) WHERE s.kind = 'Class' AND s.file ENDS WITH '.proto' RETURN s.name, s.file, s.id";
-    let services = match gq.raw_query(query) {
+    let services = match backend.raw_query(query) {
         Ok(r) => r,
         Err(_) => return vec![],
     };
@@ -36,7 +29,7 @@ pub fn extract_grpc_contracts(store: &GraphStore) -> Vec<super::Contract> {
             svc_file.replace('\'', "\\'"),
             svc_name.replace('\'', "\\'"),
         );
-        if let Ok(rpcs) = gq.raw_query(&rpc_query) {
+        if let Ok(rpcs) = backend.raw_query(&rpc_query) {
             for rpc in &rpcs {
                 if rpc.is_empty() {
                     continue;
@@ -63,18 +56,12 @@ pub fn extract_grpc_contracts(store: &GraphStore) -> Vec<super::Contract> {
 ///   - `ServiceNameGrpc`
 ///   - `service_name_pb2_grpc` (Python pattern)
 pub fn detect_grpc_clients(
-    store: &GraphStore,
+    backend: &dyn GraphBackend,
     contracts: &[super::Contract],
 ) -> Vec<super::CrossServiceDep> {
     if contracts.is_empty() {
         return vec![];
     }
-
-    let conn = match store.connection() {
-        Ok(c) => c,
-        Err(_) => return vec![],
-    };
-    let gq = GraphQuery::new(&conn);
 
     // Build unique service names from gRPC contracts
     let svc_names: HashSet<&str> = contracts
@@ -99,7 +86,7 @@ pub fn detect_grpc_clients(
                 "MATCH (s:Symbol) WHERE s.name CONTAINS '{}' AND NOT s.file ENDS WITH '.proto' RETURN s.name, s.file, s.id",
                 pattern.replace('\'', "\\'"),
             );
-            if let Ok(rows) = gq.raw_query(&query) {
+            if let Ok(rows) = backend.raw_query(&query) {
                 for row in &rows {
                     if row.len() < 2 {
                         continue;

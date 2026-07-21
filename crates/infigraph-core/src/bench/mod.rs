@@ -3,8 +3,7 @@ use std::path::Path;
 use anyhow::Result;
 use serde::{Deserialize, Serialize};
 
-use crate::graph::store::GraphStore;
-use crate::graph::GraphQuery;
+use crate::graph::GraphBackend;
 
 /// Quality metrics snapshot captured from the code graph and security scan.
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -30,16 +29,13 @@ pub struct QualityBaseline {
 
 impl QualityMetrics {
     /// Capture current quality metrics from the graph store and security scanner.
-    pub fn capture(root: &Path, store: &GraphStore) -> Result<Self> {
-        let conn = store.connection()?;
-        let gq = GraphQuery::new(&conn);
+    pub fn capture(root: &Path, backend: &dyn GraphBackend) -> Result<Self> {
+        let symbols = count_query(backend, "MATCH (s:Symbol) RETURN count(s)");
+        let modules = count_query(backend, "MATCH (m:Module) RETURN count(m)");
+        let calls_edges = count_query(backend, "MATCH ()-[r:CALLS]->() RETURN count(r)");
+        let inherits_edges = count_query(backend, "MATCH ()-[r:INHERITS]->() RETURN count(r)");
 
-        let symbols = count_query(&gq, "MATCH (s:Symbol) RETURN count(s)");
-        let modules = count_query(&gq, "MATCH (m:Module) RETURN count(m)");
-        let calls_edges = count_query(&gq, "MATCH ()-[r:CALLS]->() RETURN count(r)");
-        let inherits_edges = count_query(&gq, "MATCH ()-[r:INHERITS]->() RETURN count(r)");
-
-        let dead_rows = gq
+        let dead_rows = backend
             .raw_query(
                 "MATCH (s:Symbol) WHERE s.kind IN ['Function', 'Method'] \
                  AND NOT EXISTS { MATCH ()-[:CALLS]->(s) } RETURN count(s)",
@@ -101,8 +97,9 @@ impl QualityMetrics {
     }
 }
 
-fn count_query(gq: &GraphQuery, cypher: &str) -> usize {
-    gq.raw_query(cypher)
+fn count_query(backend: &dyn GraphBackend, cypher: &str) -> usize {
+    backend
+        .raw_query(cypher)
         .ok()
         .and_then(|rows| rows.first().cloned())
         .and_then(|row| row.first().cloned())

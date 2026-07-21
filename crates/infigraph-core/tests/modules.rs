@@ -1,4 +1,4 @@
-use infigraph_core::graph::GraphStore;
+use infigraph_core::graph::{GraphStore, KuzuBackend};
 use infigraph_core::model::{FileExtraction, Relation, RelationKind, Span, Symbol, SymbolKind};
 
 fn span(file: &str, start: u32, end: u32) -> Span {
@@ -65,7 +65,7 @@ fn rel(src: &str, tgt: &str, kind: RelationKind) -> Relation {
 
 struct TestGraph {
     _dir: tempfile::TempDir,
-    store: GraphStore,
+    backend: KuzuBackend,
 }
 
 fn setup_graph() -> TestGraph {
@@ -196,7 +196,10 @@ fn setup_graph() -> TestGraph {
         let conn = store.connection().unwrap();
         store.upsert_all_bulk(&conn, &extractions).unwrap();
     }
-    TestGraph { _dir: dir, store }
+    TestGraph {
+        _dir: dir,
+        backend: KuzuBackend::from_store(store),
+    }
 }
 
 // ============================================================
@@ -207,9 +210,9 @@ fn setup_graph() -> TestGraph {
 fn test_cluster_empty_graph() {
     let dir = tempfile::TempDir::new().unwrap();
     let store = GraphStore::open(&dir.path().join("graph")).unwrap();
-    let conn = store.connection().unwrap();
+    let backend = KuzuBackend::from_store(store);
 
-    let stats = infigraph_core::cluster::detect_clusters(&conn).unwrap();
+    let stats = infigraph_core::cluster::detect_clusters(&backend).unwrap();
     assert_eq!(stats.num_clusters, 0);
     assert!(stats.cluster_sizes.is_empty());
     assert_eq!(stats.modularity, 0.0);
@@ -218,9 +221,8 @@ fn test_cluster_empty_graph() {
 #[test]
 fn test_cluster_with_connected_graph() {
     let tg = setup_graph();
-    let conn = tg.store.connection().unwrap();
 
-    let stats = infigraph_core::cluster::detect_clusters(&conn).unwrap();
+    let stats = infigraph_core::cluster::detect_clusters(&tg.backend).unwrap();
     assert!(stats.num_clusters >= 1, "should find at least 1 cluster");
     let total_members: usize = stats.cluster_sizes.iter().sum();
     assert!(total_members >= 3, "clusters should contain symbols");
@@ -229,9 +231,8 @@ fn test_cluster_with_connected_graph() {
 #[test]
 fn test_cluster_stats_display() {
     let tg = setup_graph();
-    let conn = tg.store.connection().unwrap();
 
-    let stats = infigraph_core::cluster::detect_clusters(&conn).unwrap();
+    let stats = infigraph_core::cluster::detect_clusters(&tg.backend).unwrap();
     let display = format!("{stats}");
     assert!(display.contains("Cluster Statistics:"));
     assert!(display.contains("Modularity:"));
@@ -257,8 +258,8 @@ fn test_cluster_isolated_symbols() {
         let conn = store.connection().unwrap();
         store.upsert_all_bulk(&conn, &extractions).unwrap();
     }
-    let conn = store.connection().unwrap();
-    let stats = infigraph_core::cluster::detect_clusters(&conn).unwrap();
+    let backend = KuzuBackend::from_store(store);
+    let stats = infigraph_core::cluster::detect_clusters(&backend).unwrap();
     assert!(
         stats.num_clusters >= 2,
         "isolated symbols should each be own cluster"
@@ -279,7 +280,8 @@ fn test_manifest_package_json() {
     .unwrap();
 
     let store = GraphStore::open(&dir.path().join("graph")).unwrap();
-    let results = infigraph_core::manifest::index_manifests(dir.path(), &store).unwrap();
+    let backend = KuzuBackend::from_store(store);
+    let results = infigraph_core::manifest::index_manifests(dir.path(), &backend).unwrap();
 
     assert_eq!(results.len(), 1);
     assert_eq!(results[0].ecosystem, "npm");
@@ -311,7 +313,8 @@ tempfile = "3.0"
     .unwrap();
 
     let store = GraphStore::open(&dir.path().join("graph")).unwrap();
-    let results = infigraph_core::manifest::index_manifests(dir.path(), &store).unwrap();
+    let backend = KuzuBackend::from_store(store);
+    let results = infigraph_core::manifest::index_manifests(dir.path(), &backend).unwrap();
 
     assert_eq!(results.len(), 1);
     assert_eq!(results[0].ecosystem, "cargo");
@@ -335,7 +338,8 @@ fn test_manifest_requirements_txt() {
     .unwrap();
 
     let store = GraphStore::open(&dir.path().join("graph")).unwrap();
-    let results = infigraph_core::manifest::index_manifests(dir.path(), &store).unwrap();
+    let backend = KuzuBackend::from_store(store);
+    let results = infigraph_core::manifest::index_manifests(dir.path(), &backend).unwrap();
 
     assert_eq!(results.len(), 1);
     assert_eq!(results[0].ecosystem, "pip");
@@ -354,7 +358,8 @@ fn test_manifest_go_mod() {
     ).unwrap();
 
     let store = GraphStore::open(&dir.path().join("graph")).unwrap();
-    let results = infigraph_core::manifest::index_manifests(dir.path(), &store).unwrap();
+    let backend = KuzuBackend::from_store(store);
+    let results = infigraph_core::manifest::index_manifests(dir.path(), &backend).unwrap();
 
     assert_eq!(results.len(), 1);
     assert_eq!(results[0].ecosystem, "go");
@@ -395,7 +400,8 @@ fn test_manifest_pom_xml() {
     .unwrap();
 
     let store = GraphStore::open(&dir.path().join("graph")).unwrap();
-    let results = infigraph_core::manifest::index_manifests(dir.path(), &store).unwrap();
+    let backend = KuzuBackend::from_store(store);
+    let results = infigraph_core::manifest::index_manifests(dir.path(), &backend).unwrap();
 
     assert_eq!(results.len(), 1);
     assert_eq!(results[0].ecosystem, "maven");
@@ -418,7 +424,8 @@ fn test_manifest_gemfile() {
     ).unwrap();
 
     let store = GraphStore::open(&dir.path().join("graph")).unwrap();
-    let results = infigraph_core::manifest::index_manifests(dir.path(), &store).unwrap();
+    let backend = KuzuBackend::from_store(store);
+    let results = infigraph_core::manifest::index_manifests(dir.path(), &backend).unwrap();
 
     assert_eq!(results.len(), 1);
     assert_eq!(results[0].ecosystem, "gem");
@@ -441,7 +448,8 @@ fn test_manifest_composer_json() {
     ).unwrap();
 
     let store = GraphStore::open(&dir.path().join("graph")).unwrap();
-    let results = infigraph_core::manifest::index_manifests(dir.path(), &store).unwrap();
+    let backend = KuzuBackend::from_store(store);
+    let results = infigraph_core::manifest::index_manifests(dir.path(), &backend).unwrap();
 
     assert_eq!(results.len(), 1);
     assert_eq!(results[0].ecosystem, "composer");
@@ -459,7 +467,8 @@ fn test_manifest_composer_json() {
 fn test_manifest_empty_dir() {
     let dir = tempfile::TempDir::new().unwrap();
     let store = GraphStore::open(&dir.path().join("graph")).unwrap();
-    let results = infigraph_core::manifest::index_manifests(dir.path(), &store).unwrap();
+    let backend = KuzuBackend::from_store(store);
+    let results = infigraph_core::manifest::index_manifests(dir.path(), &backend).unwrap();
     assert!(results.is_empty());
 }
 
@@ -473,9 +482,10 @@ fn test_manifest_query_deps() {
     .unwrap();
 
     let store = GraphStore::open(&dir.path().join("graph")).unwrap();
-    infigraph_core::manifest::index_manifests(dir.path(), &store).unwrap();
+    let backend = KuzuBackend::from_store(store);
+    infigraph_core::manifest::index_manifests(dir.path(), &backend).unwrap();
 
-    let deps = infigraph_core::manifest::query_deps(&store).unwrap();
+    let deps = infigraph_core::manifest::query_deps(&backend).unwrap();
     assert!(deps.iter().any(|d| d.name == "express"));
 }
 
@@ -488,7 +498,8 @@ fn test_manifest_gradle() {
     ).unwrap();
 
     let store = GraphStore::open(&dir.path().join("graph")).unwrap();
-    let results = infigraph_core::manifest::index_manifests(dir.path(), &store).unwrap();
+    let backend = KuzuBackend::from_store(store);
+    let results = infigraph_core::manifest::index_manifests(dir.path(), &backend).unwrap();
 
     assert_eq!(results.len(), 1);
     assert_eq!(results[0].ecosystem, "gradle");
@@ -504,7 +515,8 @@ fn test_manifest_pubspec_yaml() {
     ).unwrap();
 
     let store = GraphStore::open(&dir.path().join("graph")).unwrap();
-    let results = infigraph_core::manifest::index_manifests(dir.path(), &store).unwrap();
+    let backend = KuzuBackend::from_store(store);
+    let results = infigraph_core::manifest::index_manifests(dir.path(), &backend).unwrap();
 
     assert_eq!(results.len(), 1);
     assert_eq!(results[0].ecosystem, "pub");
@@ -532,7 +544,8 @@ fn test_manifest_packages_config() {
     .unwrap();
 
     let store = GraphStore::open(&dir.path().join("graph")).unwrap();
-    let results = infigraph_core::manifest::index_manifests(dir.path(), &store).unwrap();
+    let backend = KuzuBackend::from_store(store);
+    let results = infigraph_core::manifest::index_manifests(dir.path(), &backend).unwrap();
 
     assert_eq!(results.len(), 1);
     assert!(results[0]
@@ -772,7 +785,7 @@ fn test_check_run_complexity() {
         },
     };
     let sel = infigraph_core::check::CheckSelection::from_csv("complexity");
-    let results = infigraph_core::check::run_checks(tg._dir.path(), &cfg, &tg.store, &sel);
+    let results = infigraph_core::check::run_checks(tg._dir.path(), &cfg, &tg.backend, &sel);
     assert_eq!(results.len(), 1);
     assert_eq!(results[0].name, "complexity");
     assert_eq!(
@@ -805,7 +818,7 @@ fn test_check_run_dead_code() {
         },
     };
     let sel = infigraph_core::check::CheckSelection::from_csv("dead-code");
-    let results = infigraph_core::check::run_checks(tg._dir.path(), &cfg, &tg.store, &sel);
+    let results = infigraph_core::check::run_checks(tg._dir.path(), &cfg, &tg.backend, &sel);
     assert_eq!(results.len(), 1);
     assert_eq!(results[0].name, "dead-code");
 }
@@ -869,10 +882,10 @@ fn test_check_status_display() {
 fn test_refactor_analyze_empty_graph() {
     let dir = tempfile::TempDir::new().unwrap();
     let store = GraphStore::open(&dir.path().join("graph")).unwrap();
-    let conn = store.connection().unwrap();
+    let backend = KuzuBackend::from_store(store);
 
     let recs = infigraph_core::refactor::analyze(
-        &conn,
+        &backend,
         None,
         None,
         infigraph_core::refactor::Focus::All,
@@ -885,10 +898,9 @@ fn test_refactor_analyze_empty_graph() {
 #[test]
 fn test_refactor_analyze_detects_complexity() {
     let tg = setup_graph();
-    let conn = tg.store.connection().unwrap();
 
     let recs = infigraph_core::refactor::analyze(
-        &conn,
+        &tg.backend,
         None,
         None,
         infigraph_core::refactor::Focus::Complexity,
@@ -904,10 +916,9 @@ fn test_refactor_analyze_detects_complexity() {
 #[test]
 fn test_refactor_analyze_with_target_filter() {
     let tg = setup_graph();
-    let conn = tg.store.connection().unwrap();
 
     let recs = infigraph_core::refactor::analyze(
-        &conn,
+        &tg.backend,
         None,
         Some("src/utils.py"),
         infigraph_core::refactor::Focus::All,
@@ -925,10 +936,9 @@ fn test_refactor_analyze_with_target_filter() {
 #[test]
 fn test_refactor_analyze_limit() {
     let tg = setup_graph();
-    let conn = tg.store.connection().unwrap();
 
     let recs = infigraph_core::refactor::analyze(
-        &conn,
+        &tg.backend,
         None,
         None,
         infigraph_core::refactor::Focus::All,

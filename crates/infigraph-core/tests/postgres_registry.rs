@@ -33,6 +33,7 @@ fn sample_entry(name: &str) -> RepoEntry {
         languages: vec!["python".to_string(), "rust".to_string()],
         symbol_count: 42,
         module_count: 3,
+        last_indexed_commit: None,
     }
 }
 
@@ -51,6 +52,7 @@ fn test_postgres_registry_round_trip() {
         "org".into(),
         Group {
             name: "org".into(),
+            org: String::new(),
             repos: vec!["svc-a".into(), "svc-b".into()],
             contracts: vec![Contract {
                 kind: ContractKind::HttpRoute,
@@ -264,4 +266,116 @@ fn test_registry_load_save_postgres_mode() {
 
     assert!(registry.repos.contains_key("env-test-repo"));
     assert!(registry.groups.contains_key("env-test-group"));
+}
+
+// ── Org-level namespacing ───────────────────────────────────────────
+
+#[test]
+#[ignore]
+fn test_postgres_org_group_round_trip() {
+    let store = connect();
+    clean(&store);
+
+    store
+        .upsert_repo("svc-a", &sample_entry("svc-a"))
+        .expect("repo");
+
+    let group = Group {
+        name: "backend".into(),
+        org: "team-alpha".into(),
+        repos: vec!["svc-a".into()],
+        contracts: vec![],
+    };
+
+    let mut registry = Registry::default();
+    registry.repos.insert("svc-a".into(), sample_entry("svc-a"));
+    registry.groups.insert("team-alpha/backend".into(), group);
+    store.save_registry(&registry).expect("save");
+
+    let loaded = store.load_registry().expect("load");
+    assert!(
+        loaded.groups.contains_key("team-alpha/backend"),
+        "org-qualified key should exist, got: {:?}",
+        loaded.groups.keys().collect::<Vec<_>>()
+    );
+    let g = &loaded.groups["team-alpha/backend"];
+    assert_eq!(g.org, "team-alpha");
+    assert_eq!(g.name, "backend");
+    assert_eq!(g.repos, vec!["svc-a"]);
+}
+
+#[test]
+#[ignore]
+fn test_postgres_org_isolation_same_name() {
+    let store = connect();
+    clean(&store);
+
+    store
+        .upsert_repo("svc-a", &sample_entry("svc-a"))
+        .expect("repo");
+    store
+        .upsert_repo("svc-b", &sample_entry("svc-b"))
+        .expect("repo");
+
+    let mut registry = Registry::default();
+    registry.repos.insert("svc-a".into(), sample_entry("svc-a"));
+    registry.repos.insert("svc-b".into(), sample_entry("svc-b"));
+    registry.groups.insert(
+        "team-a/api".into(),
+        Group {
+            name: "api".into(),
+            org: "team-a".into(),
+            repos: vec!["svc-a".into()],
+            contracts: vec![],
+        },
+    );
+    registry.groups.insert(
+        "team-b/api".into(),
+        Group {
+            name: "api".into(),
+            org: "team-b".into(),
+            repos: vec!["svc-b".into()],
+            contracts: vec![],
+        },
+    );
+    store.save_registry(&registry).expect("save");
+
+    let loaded = store.load_registry().expect("load");
+    assert_eq!(
+        loaded.groups.len(),
+        2,
+        "two groups with same name, different orgs"
+    );
+    assert!(loaded.groups.contains_key("team-a/api"));
+    assert!(loaded.groups.contains_key("team-b/api"));
+    assert_eq!(loaded.groups["team-a/api"].repos, vec!["svc-a"]);
+    assert_eq!(loaded.groups["team-b/api"].repos, vec!["svc-b"]);
+}
+
+#[test]
+#[ignore]
+fn test_postgres_org_backwards_compat_empty_org() {
+    let store = connect();
+    clean(&store);
+
+    store
+        .upsert_repo("svc-a", &sample_entry("svc-a"))
+        .expect("repo");
+
+    let mut registry = Registry::default();
+    registry.repos.insert("svc-a".into(), sample_entry("svc-a"));
+    registry.groups.insert(
+        "legacy-group".into(),
+        Group {
+            name: "legacy-group".into(),
+            org: String::new(),
+            repos: vec!["svc-a".into()],
+            contracts: vec![],
+        },
+    );
+    store.save_registry(&registry).expect("save");
+
+    let loaded = store.load_registry().expect("load");
+    assert!(loaded.groups.contains_key("legacy-group"));
+    assert_eq!(loaded.groups["legacy-group"].org, "");
 }

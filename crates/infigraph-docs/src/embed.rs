@@ -9,11 +9,11 @@ use infigraph_core::embed::{
     load_embeddings, save_embeddings,
 };
 
+use crate::backend::DocBackend;
 use crate::chunk::Chunk;
-use crate::store::DocStore;
 
 pub fn update_doc_embeddings(
-    store: &DocStore,
+    store: &dyn DocBackend,
     root: &Path,
     new_chunks: &[&Chunk],
     changed_files: &[&str],
@@ -104,7 +104,7 @@ pub fn update_doc_embeddings(
 /// Embeds new/changed chunks plus any store chunks missing from pgvector.
 #[cfg(feature = "remote")]
 pub fn update_doc_embeddings_remote(
-    store: &DocStore,
+    store: &dyn DocBackend,
     pg: &infigraph_core::meta::PostgresMetaStore,
     _new_chunks: &[&Chunk],
     changed_files: &[&str],

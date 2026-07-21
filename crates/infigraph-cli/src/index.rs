@@ -1,26 +1,43 @@
 use std::path::Path;
 
 use anyhow::{Context, Result};
+#[cfg(feature = "remote")]
+use infigraph_core::graph::GraphBackend;
 use infigraph_core::Infigraph;
 use infigraph_languages::bundled_registry;
 
 pub(crate) fn cmd_index(root: &Path, full: bool, no_embed: bool) -> Result<()> {
+    #[cfg(feature = "remote")]
+    let remote = is_neo4j_backend();
+    #[cfg(not(feature = "remote"))]
+    let remote = false;
+
     if full {
-        let tg_dir = root.join(".infigraph");
-        if tg_dir.exists() {
-            // Sessions are in a separate DB at .infigraph/sessions/db/ — preserve them
-            let sessions_dir = tg_dir.join("sessions");
-            let sessions_backup = root.join(".infigraph-sessions-backup");
-            let had_sessions = sessions_dir.exists();
-            if had_sessions {
-                let _ = std::fs::rename(&sessions_dir, &sessions_backup);
+        if remote {
+            // Remote mode: clear the Neo4j graph (local .infigraph/ is irrelevant)
+            #[cfg(feature = "remote")]
+            {
+                let neo = infigraph_core::graph::Neo4jBackend::connect_from_env()?;
+                neo.init_schema()?;
+                neo.clear_all_data()?;
+                println!("Cleared Neo4j graph for full reindex");
             }
-            std::fs::remove_dir_all(&tg_dir)?;
-            if had_sessions {
-                std::fs::create_dir_all(&tg_dir)?;
-                let _ = std::fs::rename(&sessions_backup, &sessions_dir);
+        } else {
+            let tg_dir = root.join(".infigraph");
+            if tg_dir.exists() {
+                let sessions_dir = tg_dir.join("sessions");
+                let sessions_backup = root.join(".infigraph-sessions-backup");
+                let had_sessions = sessions_dir.exists();
+                if had_sessions {
+                    let _ = std::fs::rename(&sessions_dir, &sessions_backup);
+                }
+                std::fs::remove_dir_all(&tg_dir)?;
+                if had_sessions {
+                    std::fs::create_dir_all(&tg_dir)?;
+                    let _ = std::fs::rename(&sessions_backup, &sessions_dir);
+                }
+                println!("Cleaned .infigraph/ for full reindex (sessions preserved)");
             }
-            println!("Cleaned .infigraph/ for full reindex (sessions preserved)");
         }
     }
 
@@ -30,10 +47,19 @@ pub(crate) fn cmd_index(root: &Path, full: bool, no_embed: bool) -> Result<()> {
 
     println!("Indexing project...");
     let result = prism.index()?;
-    println!(
-        "Indexed {}/{} files",
-        result.indexed_files, result.total_files
-    );
+    if result.indexed_files == 0 {
+        println!(
+            "All {} files up-to-date, nothing to reindex",
+            result.total_files
+        );
+    } else {
+        println!(
+            "Indexed {} files ({} up-to-date, {} total)",
+            result.indexed_files,
+            result.total_files - result.indexed_files,
+            result.total_files
+        );
+    }
 
     let mut by_lang: std::collections::HashMap<&str, (usize, usize)> =
         std::collections::HashMap::new();
@@ -50,79 +76,93 @@ pub(crate) fn cmd_index(root: &Path, full: bool, no_embed: bool) -> Result<()> {
         println!("{}", result.resolve_stats);
     }
 
-    // Detect cross-cutting concerns, taint, etc. — skip when no files changed (incremental no-op)
-    if result.indexed_files > 0 {
-        if let Some(store) = prism.store() {
-            // Docstring-only analyzers (no file I/O)
-            match infigraph_core::concerns::detect_cross_cutting(store) {
-                Ok(matches) if !matches.is_empty() => {
-                    println!("Detected {} cross-cutting concerns", matches.len());
-                }
-                Ok(_) => {}
-                Err(e) => eprintln!("warning: concern detection failed: {e}"),
-            }
-            match infigraph_core::config::detect_config_bindings(store) {
-                Ok(bindings) if !bindings.is_empty() => {
-                    println!("Detected {} config bindings", bindings.len());
-                }
-                Ok(_) => {}
-                Err(e) => eprintln!("warning: config binding detection failed: {e}"),
-            }
-            match infigraph_core::reflection::detect_reflection_sites(store, root) {
-                Ok(sites) if !sites.is_empty() => {
-                    let resolved = sites.iter().filter(|s| s.resolved_to.is_some()).count();
-                    println!(
-                        "Detected {} reflection sites ({} resolved)",
-                        sites.len(),
-                        resolved
-                    );
-                }
-                Ok(_) => {}
-                Err(e) => eprintln!("warning: reflection detection failed: {e}"),
-            }
+    // Derive TESTED_BY edges — scoped to changed files for incremental
+    if result.indexed_files > 0 && prism.backend().is_some() {
+        let changed: Vec<&str> = result.extractions.iter().map(|e| e.file.as_str()).collect();
+        let scope = if full { None } else { Some(changed.as_slice()) };
+        match prism.backend().unwrap().derive_tested_by_edges(scope) {
+            Ok(count) if count > 0 => println!("Derived {} TESTED_BY edges", count),
+            Ok(_) => {}
+            Err(e) => eprintln!("warning: TESTED_BY derivation failed: {e}"),
+        }
+    }
 
-            // Source-reading analyzers — build shared cache once, pass to all three
-            match infigraph_core::taint::build_source_cache(store, root) {
-                Ok((functions, cache)) => {
-                    match infigraph_core::taint::detect_taint_flows_with_cache(
-                        store, &functions, &cache,
-                    ) {
-                        Ok(flows) if !flows.is_empty() => {
-                            let active = flows.iter().filter(|f| !f.sanitized).count();
-                            println!(
-                                "Detected {} taint flows ({} active, {} sanitized)",
-                                flows.len(),
-                                active,
-                                flows.len() - active
-                            );
-                        }
-                        Ok(_) => {}
-                        Err(e) => eprintln!("warning: taint analysis failed: {e}"),
+    // Detect cross-cutting concerns, taint, etc. — skip when no files changed (incremental no-op)
+    if result.indexed_files > 0 && prism.backend().is_some() {
+        // Docstring-only analyzers (no file I/O)
+        match infigraph_core::concerns::detect_cross_cutting(prism.backend().unwrap()) {
+            Ok(matches) if !matches.is_empty() => {
+                println!("Detected {} cross-cutting concerns", matches.len());
+            }
+            Ok(_) => {}
+            Err(e) => eprintln!("warning: concern detection failed: {e}"),
+        }
+        match infigraph_core::config::detect_config_bindings(prism.backend().unwrap()) {
+            Ok(bindings) if !bindings.is_empty() => {
+                println!("Detected {} config bindings", bindings.len());
+            }
+            Ok(_) => {}
+            Err(e) => eprintln!("warning: config binding detection failed: {e}"),
+        }
+        match infigraph_core::reflection::detect_reflection_sites(prism.backend().unwrap(), root) {
+            Ok(sites) if !sites.is_empty() => {
+                let resolved = sites.iter().filter(|s| s.resolved_to.is_some()).count();
+                println!(
+                    "Detected {} reflection sites ({} resolved)",
+                    sites.len(),
+                    resolved
+                );
+            }
+            Ok(_) => {}
+            Err(e) => eprintln!("warning: reflection detection failed: {e}"),
+        }
+
+        // Source-reading analyzers — build shared cache once, pass to all three
+        let taint_backend = prism.backend().unwrap();
+        match infigraph_core::taint::build_source_cache(taint_backend, root) {
+            Ok((functions, cache)) => {
+                match infigraph_core::taint::detect_taint_flows_with_cache(
+                    taint_backend,
+                    &functions,
+                    &cache,
+                ) {
+                    Ok(flows) if !flows.is_empty() => {
+                        let active = flows.iter().filter(|f| !f.sanitized).count();
+                        println!(
+                            "Detected {} taint flows ({} active, {} sanitized)",
+                            flows.len(),
+                            active,
+                            flows.len() - active
+                        );
                     }
-                    match infigraph_core::taint::interprocedural::detect_interprocedural_taint_with_cache(store, &functions, &cache, 5) {
+                    Ok(_) => {}
+                    Err(e) => eprintln!("warning: taint analysis failed: {e}"),
+                }
+                match infigraph_core::taint::interprocedural::detect_interprocedural_taint_with_cache(taint_backend, &functions, &cache, 5) {
                     Ok(flows) if !flows.is_empty() => {
                         println!("Detected {} inter-procedural taint flows", flows.len());
                     }
                     Ok(_) => {}
                     Err(e) => eprintln!("warning: inter-procedural taint failed: {e}"),
                 }
-                    match infigraph_core::taint::dynamic_urls::detect_dynamic_urls_with_cache(
-                        store, &functions, &cache,
-                    ) {
-                        Ok(urls) if !urls.is_empty() => {
-                            let matched = urls.iter().filter(|u| u.matched_route.is_some()).count();
-                            println!(
-                                "Detected {} dynamic URLs ({} matched to routes)",
-                                urls.len(),
-                                matched
-                            );
-                        }
-                        Ok(_) => {}
-                        Err(e) => eprintln!("warning: dynamic URL detection failed: {e}"),
+                match infigraph_core::taint::dynamic_urls::detect_dynamic_urls_with_cache(
+                    taint_backend,
+                    &functions,
+                    &cache,
+                ) {
+                    Ok(urls) if !urls.is_empty() => {
+                        let matched = urls.iter().filter(|u| u.matched_route.is_some()).count();
+                        println!(
+                            "Detected {} dynamic URLs ({} matched to routes)",
+                            urls.len(),
+                            matched
+                        );
                     }
+                    Ok(_) => {}
+                    Err(e) => eprintln!("warning: dynamic URL detection failed: {e}"),
                 }
-                Err(e) => eprintln!("warning: source cache build failed: {e}"),
             }
+            Err(e) => eprintln!("warning: source cache build failed: {e}"),
         }
     }
 
@@ -132,10 +172,7 @@ pub(crate) fn cmd_index(root: &Path, full: bool, no_embed: bool) -> Result<()> {
     // In remote mode, register this repo in Postgres so it appears in registry queries
     #[cfg(feature = "remote")]
     {
-        if std::env::var("INFIGRAPH_BACKEND")
-            .map(|v| v == "neo4j")
-            .unwrap_or(false)
-        {
+        if is_neo4j_backend() {
             let canonical = std::fs::canonicalize(root).unwrap_or_else(|_| root.to_path_buf());
             let repo_name = canonical
                 .file_name()
@@ -144,6 +181,12 @@ pub(crate) fn cmd_index(root: &Path, full: bool, no_embed: bool) -> Result<()> {
             let mut registry = infigraph_core::multi::Registry::load()?;
             registry.register_repo(&repo_name, root, &prism)?;
             println!("Registered '{}' in Postgres registry", repo_name);
+
+            // Create Repo node in Neo4j and link all files
+            if let Some(backend) = prism.backend() {
+                backend.upsert_repo(&repo_name)?;
+                println!("Created Repo node '{}' with BELONGS_TO edges", repo_name);
+            }
         }
     }
 
@@ -166,7 +209,7 @@ pub(crate) fn cmd_index(root: &Path, full: bool, no_embed: bool) -> Result<()> {
 
     // Compute and save embeddings — only for new/changed symbols
     if no_embed {
-        auto_scip(root, &result, prism.store())?;
+        auto_scip(root, &result, prism.backend())?;
         return Ok(());
     }
     {
@@ -175,8 +218,9 @@ pub(crate) fn cmd_index(root: &Path, full: bool, no_embed: bool) -> Result<()> {
         let mut done = false;
 
         #[cfg(feature = "remote")]
-        if let Some(backend) = prism.backend() {
-            let pg = infigraph_core::meta::PostgresMetaStore::connect_from_env()?;
+        if is_neo4j_backend() {
+            let backend = prism.backend().context("graph not initialized")?;
+            let pg = infigraph_core::meta::PostgresMetaStore::connect_from_env_cached()?;
             pg.init_schema()?;
             let count = infigraph_core::embed::update_embeddings_remote(backend, &pg, &changed)?;
             println!("Saved {} embeddings to Postgres pgvector", count);
@@ -184,8 +228,8 @@ pub(crate) fn cmd_index(root: &Path, full: bool, no_embed: bool) -> Result<()> {
         }
 
         if !done {
-            let store = prism.store().context("graph not initialized")?;
-            let count = infigraph_core::embed::update_embeddings(store, root, &changed)?;
+            let backend = prism.backend().context("graph not initialized")?;
+            let count = infigraph_core::embed::update_embeddings(backend, root, &changed)?;
             println!("Saved {} embeddings to .infigraph/embeddings.bin", count);
         }
     }
@@ -246,17 +290,79 @@ fn spawn_scip_child_process(root: &Path, detected_languages: &std::collections::
         Err(_) => std::process::Stdio::null(),
     };
 
-    let _ = std::process::Command::new(exe)
-        .arg("scip-enrich")
-        .arg("--languages")
-        .arg(&langs)
+    match std::process::Command::new(exe)
+        .args(scip_enrich_args(&langs))
         .current_dir(root)
         .stdin(std::process::Stdio::null())
         .stdout(std::process::Stdio::null())
         .stderr(stderr_target)
-        .spawn();
+        .spawn()
+    {
+        Ok(mut child) => {
+            // spawn() only reports failure to launch (missing binary, exec
+            // permission). It says nothing about the child crashing or
+            // exiting nonzero afterward — exactly the failure shape of the
+            // bug this function used to hit silently (the child launched
+            // fine and died instantly inside clap's parser). Wait on it from
+            // a detached thread so this function still returns immediately,
+            // but any future silent-death cause surfaces a warning instead
+            // of only leaving a trace in a log nobody's prompted to open.
+            let log_path = log_path.clone();
+            std::thread::spawn(move || {
+                if let Some(msg) = scip_enrich_exit_message(child.wait(), &log_path) {
+                    eprintln!("{msg}");
+                }
+            });
+        }
+        Err(e) => eprintln!("  Warning: failed to spawn scip-enrich: {e}"),
+    }
 
     eprintln!("  Log: {}", log_path.display());
+}
+
+/// Args for respawning this binary as the hidden `scip-enrich` subcommand.
+/// `languages` is a positional argument on `Commands::ScipEnrich`, not a
+/// flag — extracted so tests can assert these parse under that definition
+/// without spawning a process.
+fn scip_enrich_args(langs: &str) -> Vec<String> {
+    vec!["scip-enrich".to_string(), langs.to_string()]
+}
+
+/// Whether the active backend is remote Neo4j (vs. the default local Kùzu).
+///
+/// `Infigraph::backend()` used to return `None` for the default Kùzu
+/// backend, so `if let Some(backend) = prism.backend()` doubled as a de
+/// facto "are we in remote mode" check. Once `backend()` was made universal
+/// (returning `Some` for every backend kind, including local Kùzu), that
+/// check silently broke: the Postgres-embeddings branch below started
+/// firing on every `remote`-feature build regardless of backend, attempting
+/// a Postgres connection even for plain local indexing and failing the
+/// whole `index` command with a connection-refused error. Extracted so the
+/// exact condition can be unit-tested independently of a real backend.
+#[cfg(feature = "remote")]
+fn is_neo4j_backend() -> bool {
+    std::env::var("INFIGRAPH_BACKEND")
+        .map(|v| v == "neo4j")
+        .unwrap_or(false)
+}
+
+/// Decides what (if anything) to warn about after waiting on the detached
+/// scip-enrich child. Extracted from the wait thread so it's testable
+/// without spawning a real process — `current_exe()` in `spawn_scip_child_process`
+/// resolves to the test binary itself under `cargo test`, not `infigraph`,
+/// so the full spawn path can't be exercised end-to-end in a unit test.
+fn scip_enrich_exit_message(
+    status: std::io::Result<std::process::ExitStatus>,
+    log_path: &Path,
+) -> Option<String> {
+    match status {
+        Ok(status) if !status.success() => Some(format!(
+            "warning: scip-enrich exited with {status} — see {}",
+            log_path.display()
+        )),
+        Err(e) => Some(format!("warning: failed to wait on scip-enrich: {e}")),
+        _ => None,
+    }
 }
 
 pub(crate) const CI_ENV_VARS: &[&str] = &[
@@ -368,7 +474,7 @@ pub(crate) fn on_path(cmd: &str) -> bool {
 pub(crate) fn import_scip_and_cleanup(
     root: &Path,
     scip_path: Option<&std::path::Path>,
-    existing_store: Option<&infigraph_core::graph::GraphStore>,
+    existing_backend: Option<&dyn infigraph_core::graph::GraphBackend>,
 ) {
     let scip_out = scip_path
         .map(|p| p.to_path_buf())
@@ -377,8 +483,8 @@ pub(crate) fn import_scip_and_cleanup(
         return;
     }
 
-    if let Some(store) = existing_store {
-        match infigraph_core::scip::import_scip_index(&scip_out, store, Some(root)) {
+    if let Some(backend) = existing_backend {
+        match backend.import_scip_index(&scip_out, Some(root)) {
             Ok(stats) => println!(
                 "Auto-SCIP: enriched {} symbols, {} added, {} references, {} new symbols, {} corrections learned",
                 stats.symbols_enriched, stats.relations_added, stats.references_added, stats.symbols_added, stats.corrections_learned
@@ -406,11 +512,11 @@ pub(crate) fn import_scip_and_cleanup(
     if prism.init().is_err() {
         return;
     }
-    let store = match prism.store() {
-        Some(s) => s,
+    let backend = match prism.backend() {
+        Some(b) => b,
         None => return,
     };
-    match infigraph_core::scip::import_scip_index(&scip_out, store, Some(root)) {
+    match backend.import_scip_index(&scip_out, Some(root)) {
         Ok(stats) => println!(
             "Auto-SCIP: enriched {} symbols, {} added, {} references, {} new symbols, {} corrections learned",
             stats.symbols_enriched, stats.relations_added, stats.references_added, stats.symbols_added, stats.corrections_learned
@@ -424,7 +530,7 @@ pub(crate) fn import_scip_and_cleanup(
 pub(crate) fn auto_scip(
     root: &Path,
     result: &infigraph_core::IndexResult,
-    store: Option<&infigraph_core::graph::GraphStore>,
+    backend: Option<&dyn infigraph_core::graph::GraphBackend>,
 ) -> Result<()> {
     use crate::scip_download;
     use std::collections::HashSet;
@@ -502,7 +608,7 @@ pub(crate) fn auto_scip(
                     indexer.binary_name,
                     extra_path,
                 ) {
-                    import_scip_and_cleanup(root, None, store);
+                    import_scip_and_cleanup(root, None, backend);
                 } else {
                     println!("Auto-SCIP: {primary} failed, falling back to {fallback}");
                     let fallback_args = ["index", "--build-tool", fallback];
@@ -513,7 +619,7 @@ pub(crate) fn auto_scip(
                         indexer.binary_name,
                         extra_path,
                     ) {
-                        import_scip_and_cleanup(root, None, store);
+                        import_scip_and_cleanup(root, None, backend);
                     }
                 }
             } else if run_scip_indexer(
@@ -523,7 +629,7 @@ pub(crate) fn auto_scip(
                 indexer.binary_name,
                 extra_path,
             ) {
-                import_scip_and_cleanup(root, None, store);
+                import_scip_and_cleanup(root, None, backend);
             }
             continue;
         }
@@ -535,7 +641,7 @@ pub(crate) fn auto_scip(
             indexer.binary_name,
             extra_path,
         ) {
-            import_scip_and_cleanup(root, None, store);
+            import_scip_and_cleanup(root, None, backend);
         }
     }
 
@@ -663,14 +769,14 @@ fn auto_scip_background(root: &Path, detected_languages: &std::collections::Hash
     if prism.init().is_err() {
         return;
     }
-    let store = match prism.store() {
-        Some(s) => s,
+    let backend = match prism.backend() {
+        Some(b) => b,
         None => return,
     };
 
     for (label, scip_path, success) in &results {
         if *success && scip_path.exists() {
-            match infigraph_core::scip::import_scip_index(scip_path, store, Some(root)) {
+            match backend.import_scip_index(scip_path, Some(root)) {
                 Ok(stats) => eprintln!(
                     "Auto-SCIP: {label} enriched {} symbols, {} added, {} references, {} new symbols, {} corrections learned",
                     stats.symbols_enriched, stats.relations_added, stats.references_added, stats.symbols_added, stats.corrections_learned
@@ -686,14 +792,38 @@ fn auto_scip_background(root: &Path, detected_languages: &std::collections::Hash
     // Embed any new symbols SCIP added (skips existing embeddings)
     let root_buf = root.to_path_buf();
     let pre_count = infigraph_core::embed::embedding_count(&root_buf);
-    match infigraph_core::embed::update_embeddings(store, &root_buf, &[]) {
-        Ok(n) => {
-            let new = n.saturating_sub(pre_count);
-            if new > 0 {
-                eprintln!("Auto-SCIP: embedded {new} new symbols from SCIP enrichment");
+    let Some(backend) = prism.backend() else {
+        return;
+    };
+    #[allow(unused_mut)]
+    let mut done = false;
+    #[cfg(feature = "remote")]
+    if is_neo4j_backend() {
+        if let Ok(pg) = infigraph_core::meta::PostgresMetaStore::connect_from_env_cached() {
+            match infigraph_core::embed::update_embeddings_remote(backend, pg, &[]) {
+                Ok(n) => {
+                    let new = n.saturating_sub(pre_count);
+                    if new > 0 {
+                        eprintln!(
+                            "Auto-SCIP: embedded {new} new symbols to pgvector from SCIP enrichment"
+                        );
+                    }
+                }
+                Err(e) => eprintln!("Auto-SCIP: remote embedding update failed: {e}"),
             }
+            done = true;
         }
-        Err(e) => eprintln!("Auto-SCIP: embedding update failed: {e}"),
+    }
+    if !done {
+        match infigraph_core::embed::update_embeddings(backend, &root_buf, &[]) {
+            Ok(n) => {
+                let new = n.saturating_sub(pre_count);
+                if new > 0 {
+                    eprintln!("Auto-SCIP: embedded {new} new symbols from SCIP enrichment");
+                }
+            }
+            Err(e) => eprintln!("Auto-SCIP: embedding update failed: {e}"),
+        }
     }
 
     eprintln!("Auto-SCIP: background enrichment complete.");
@@ -874,6 +1004,114 @@ mod tests {
     use super::*;
     use std::fs;
     use tempfile::TempDir;
+
+    /// Regression test: `spawn_scip_child_process` respawns this binary with
+    /// `scip_enrich_args(&langs)` as the argv tail. This previously hardcoded
+    /// `--languages <langs>`, but `Commands::ScipEnrich` declares `languages`
+    /// as a positional argument (no `#[arg(long)]`), so every respawned
+    /// child died instantly with a clap parse error and no SCIP indexer
+    /// (scip-typescript, scip-python, etc.) ever actually ran. Parsing the
+    /// exact args through the real `Cli` definition — rather than spawning a
+    /// process — catches any future mismatch between the two immediately.
+    #[test]
+    fn scip_enrich_args_parse_as_positional_language() {
+        use clap::Parser;
+
+        let langs = "typescript,python";
+        let mut argv = vec!["infigraph".to_string()];
+        argv.extend(scip_enrich_args(langs));
+
+        let cli = crate::Cli::try_parse_from(&argv)
+            .expect("scip_enrich_args must parse under the ScipEnrich clap definition");
+
+        assert!(
+            matches!(&cli.command, crate::Commands::ScipEnrich { languages } if languages == langs),
+            "expected Commands::ScipEnrich {{ languages: {langs:?} }}"
+        );
+    }
+
+    /// Regression test for review feedback on the scip-enrich fix:
+    /// `spawn_scip_child_process` used to discard `spawn()`'s result
+    /// entirely. `spawn()` only reports failure to *launch* a process — it
+    /// says nothing about the child crashing or exiting nonzero afterward,
+    /// which is exactly the failure shape of the original bug (the child
+    /// launched fine and died instantly inside clap's parser). This asserts
+    /// the decision logic used by the wait thread: warn on a nonzero exit,
+    /// stay silent on success.
+    #[test]
+    #[cfg(unix)]
+    fn scip_enrich_exit_message_warns_on_nonzero_exit() {
+        use std::os::unix::process::ExitStatusExt;
+
+        let log_path = std::path::PathBuf::from("/tmp/some-project/.infigraph/scip-enrich.log");
+        let failed = std::process::ExitStatus::from_raw(1 << 8); // exit code 1
+        let msg = scip_enrich_exit_message(Ok(failed), &log_path);
+        assert!(
+            msg.as_deref()
+                .is_some_and(|m| m.contains("scip-enrich exited") && m.contains("scip-enrich.log")),
+            "expected a warning mentioning the exit status and log path, got {msg:?}"
+        );
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn scip_enrich_exit_message_silent_on_success() {
+        use std::os::unix::process::ExitStatusExt;
+
+        let log_path = std::path::PathBuf::from("/tmp/some-project/.infigraph/scip-enrich.log");
+        let ok = std::process::ExitStatus::from_raw(0);
+        let msg = scip_enrich_exit_message(Ok(ok), &log_path);
+        assert!(
+            msg.is_none(),
+            "a successful exit should not produce a warning, got {msg:?}"
+        );
+    }
+
+    #[test]
+    fn scip_enrich_exit_message_warns_on_wait_error() {
+        let log_path = std::path::PathBuf::from("/tmp/some-project/.infigraph/scip-enrich.log");
+        let err = std::io::Error::other("no such process");
+        let msg = scip_enrich_exit_message(Err(err), &log_path);
+        assert!(
+            msg.as_deref()
+                .is_some_and(|m| m.contains("failed to wait on scip-enrich")),
+            "expected a warning about the wait() failure, got {msg:?}"
+        );
+    }
+
+    /// Regression test for the Postgres-connect-on-plain-local-index bug:
+    /// `Infigraph::backend()` became universal (returning `Some` for the
+    /// default local Kùzu backend too, not just Neo4j), which silently
+    /// turned `if let Some(backend) = prism.backend()` into an always-true
+    /// check gating the Postgres-embeddings branch — so `infigraph index`
+    /// tried to connect to Postgres and failed even for plain local
+    /// indexing with no remote backend configured. `is_neo4j_backend()`
+    /// replaces that check with the same explicit `INFIGRAPH_BACKEND`
+    /// check already used a few lines above it (repo registration) —
+    /// asserts it's only true for an explicit `neo4j` value.
+    #[test]
+    #[cfg(feature = "remote")]
+    fn is_neo4j_backend_only_true_for_explicit_neo4j_env() {
+        std::env::remove_var("INFIGRAPH_BACKEND");
+        assert!(
+            !is_neo4j_backend(),
+            "unset INFIGRAPH_BACKEND must not select Postgres"
+        );
+
+        std::env::set_var("INFIGRAPH_BACKEND", "kuzu");
+        assert!(
+            !is_neo4j_backend(),
+            "explicit kuzu backend must not select Postgres"
+        );
+
+        std::env::set_var("INFIGRAPH_BACKEND", "neo4j");
+        assert!(
+            is_neo4j_backend(),
+            "explicit neo4j backend must select Postgres"
+        );
+
+        std::env::remove_var("INFIGRAPH_BACKEND");
+    }
 
     #[test]
     fn ci_env_vars_list_complete() {

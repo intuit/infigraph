@@ -614,6 +614,11 @@ pub fn reset_session() {
     *guard = None;
 }
 
+/// Cross-module serialisation lock for tests that mutate the global SESSION.
+/// Both session_context::tests and compress::tests share this to prevent races.
+#[cfg(test)]
+pub static SESSION_TEST_LOCK: Mutex<()> = Mutex::new(());
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -636,7 +641,7 @@ mod tests {
     }
 
     fn setup() -> TestEnv {
-        let lock = TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let lock = SESSION_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         let tmpdir = tempfile::tempdir().unwrap();
         let ig = tmpdir.path().join(".infigraph");
         std::fs::create_dir_all(&ig).unwrap();
@@ -734,7 +739,7 @@ mod tests {
 
     #[test]
     fn test_dedup_enabled_by_default() {
-        let _g = TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let _g = SESSION_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         reset_session();
         std::env::remove_var("INFIGRAPH_DEDUP");
         let output = big_output();
@@ -747,7 +752,7 @@ mod tests {
 
     #[test]
     fn test_dedup_disabled_with_env_zero() {
-        let _g = TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let _g = SESSION_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         reset_session();
         std::env::set_var("INFIGRAPH_DEDUP", "0");
         let output = big_output();

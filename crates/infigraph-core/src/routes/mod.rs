@@ -13,7 +13,7 @@ mod rust_lang;
 use anyhow::Result;
 use serde::{Deserialize, Serialize};
 
-use crate::graph::GraphQuery;
+use crate::graph::GraphBackend;
 
 use helpers::{detect_from_docstring, language_from_file, Lang};
 
@@ -48,15 +48,18 @@ pub struct Route {
 /// Queries symbols and applies language-aware pattern matching on names and
 /// docstrings to identify likely HTTP handlers. This is intentionally broad
 /// to catch routes across many web frameworks.
-pub fn detect_routes(gq: &GraphQuery) -> Result<Vec<Route>> {
-    let rows = gq.raw_query(
+pub fn detect_routes(backend: &dyn GraphBackend) -> Result<Vec<Route>> {
+    let rows = backend.raw_query(
         "MATCH (s:Symbol) WHERE s.kind IN ['Function', 'Method'] \
          RETURN s.id, s.name, s.kind, s.file, s.docstring",
     )?;
+    Ok(detect_routes_from_rows(&rows))
+}
 
+pub fn detect_routes_from_rows(rows: &[Vec<String>]) -> Vec<Route> {
     let mut routes = Vec::new();
 
-    for row in &rows {
+    for row in rows {
         let id = &row[0];
         let name = &row[1];
         let _kind = &row[2];
@@ -68,10 +71,9 @@ pub fn detect_routes(gq: &GraphQuery) -> Result<Vec<Route>> {
         }
     }
 
-    // Sort by file, then path for stable output
     routes.sort_by(|a, b| a.file.cmp(&b.file).then(a.path.cmp(&b.path)));
 
-    Ok(routes)
+    routes
 }
 
 /// Try to detect a route from a single symbol's name and docstring.

@@ -892,6 +892,74 @@ pub struct ExampleTest {
     pub end_line: u32,
 }
 
+// ── Phase-2 return types (backend-agnostic query results) ───────────
+
+#[derive(Debug, Serialize)]
+pub struct SymbolMeta {
+    pub docstring: String,
+    pub complexity: u32,
+    pub parent_id: Option<String>,
+    pub parent_name: Option<String>,
+}
+
+#[derive(Debug, Serialize)]
+pub struct ComplexityRow {
+    pub name: String,
+    pub file: String,
+    pub start_line: u32,
+    pub complexity: u32,
+}
+
+#[derive(Debug, Serialize)]
+pub struct DeadCodeRow {
+    pub name: String,
+    pub kind: String,
+    pub file: String,
+}
+
+#[derive(Debug, Serialize)]
+pub struct LanguageCount {
+    pub language: String,
+    pub count: u64,
+}
+
+#[derive(Debug, Serialize)]
+pub struct KindCount {
+    pub kind: String,
+    pub count: u64,
+}
+
+#[derive(Debug, Serialize)]
+pub struct FileHotspot {
+    pub file: String,
+    pub count: u64,
+}
+
+#[derive(Debug, Serialize)]
+pub struct HubFunction {
+    pub name: String,
+    pub file: String,
+    pub calls: u64,
+}
+
+#[derive(Debug, Serialize)]
+pub struct ArchitectureStats {
+    pub languages: Vec<LanguageCount>,
+    pub kind_counts: Vec<KindCount>,
+    pub hotspot_files: Vec<FileHotspot>,
+    pub hub_functions: Vec<HubFunction>,
+    pub entry_points: Vec<DeadCodeRow>,
+}
+
+#[derive(Debug, Serialize)]
+pub struct SymbolWithDocstring {
+    pub id: String,
+    pub name: String,
+    pub kind: String,
+    pub file: String,
+    pub docstring: String,
+}
+
 // ── Shared skeleton data + formatter (used by both Kuzu GraphQuery and CozoStore) ──
 
 pub struct SkeletonSymbol {

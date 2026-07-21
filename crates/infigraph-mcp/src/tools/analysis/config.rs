@@ -1,20 +1,14 @@
 use anyhow::{Context, Result};
 use serde_json::Value;
 
-use infigraph_core::graph::GraphStore;
+use super::super::helpers::open_prism;
 
 pub fn tool_detect_config_bindings(args: &Value) -> Result<String> {
-    let path = args
-        .get("path")
-        .and_then(|p| p.as_str())
-        .context("missing 'path'")?;
-    let root = std::path::PathBuf::from(path)
-        .canonicalize()
-        .context("invalid path")?;
-    let db_path = root.join(".infigraph").join("graph");
-    let store = GraphStore::open(&db_path)?;
+    let prism = open_prism(args)?;
+    let root = prism.root().to_path_buf();
+    let backend = prism.backend().context("not initialized")?;
 
-    let bindings = infigraph_core::config::detect_config_bindings(&store)?;
+    let bindings = infigraph_core::config::detect_config_bindings(backend)?;
     let config_files = infigraph_core::config::detect_config_files(&root);
 
     let kind_filter = args

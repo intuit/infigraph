@@ -1790,7 +1790,7 @@ mod tests {
 
     #[test]
     fn test_bypass_in_focus_symbol() {
-        let _guard = crate::session_context::TEST_LOCK
+        let _g = crate::session_context::SESSION_TEST_LOCK
             .lock()
             .unwrap_or_else(|e| e.into_inner());
         crate::session_context::reset_session();
@@ -1813,7 +1813,7 @@ mod tests {
 
     #[test]
     fn test_compress_pipeline_safe_recovers_from_panic() {
-        let _guard = crate::session_context::TEST_LOCK
+        let _g = crate::session_context::SESSION_TEST_LOCK
             .lock()
             .unwrap_or_else(|e| e.into_inner());
         crate::session_context::reset_session();
@@ -1831,7 +1831,7 @@ mod tests {
 
     #[test]
     fn test_compress_pipeline_safe_recovers_from_dedup_panic() {
-        let _guard = crate::session_context::TEST_LOCK
+        let _g = crate::session_context::SESSION_TEST_LOCK
             .lock()
             .unwrap_or_else(|e| e.into_inner());
         crate::session_context::reset_session();
@@ -1854,7 +1854,7 @@ mod tests {
 
     #[test]
     fn test_focus_bypasses_compression_on_large_doc_context() {
-        let _guard = crate::session_context::TEST_LOCK
+        let _g = crate::session_context::SESSION_TEST_LOCK
             .lock()
             .unwrap_or_else(|e| e.into_inner());
         crate::session_context::reset_session();
@@ -1896,7 +1896,7 @@ mod tests {
 
     #[test]
     fn test_focus_also_skips_dedup_placeholder() {
-        let _guard = crate::session_context::TEST_LOCK
+        let _g = crate::session_context::SESSION_TEST_LOCK
             .lock()
             .unwrap_or_else(|e| e.into_inner());
         crate::session_context::reset_session();

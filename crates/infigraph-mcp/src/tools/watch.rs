@@ -73,6 +73,9 @@ pub fn auto_start_watch_opportunistic(path: &str) -> Option<String> {
 }
 
 fn auto_start_watch_inner(path: &str, skip_disabled_check: bool) -> Option<String> {
+    if is_remote_mode() {
+        return None;
+    }
     if !skip_disabled_check && watchers_disabled() {
         return None;
     }
@@ -80,10 +83,6 @@ fn auto_start_watch_inner(path: &str, skip_disabled_check: bool) -> Option<Strin
     let root_str = root.to_string_lossy().replace('\\', "/");
 
     if is_watching(&root_str) {
-        return None;
-    }
-
-    if cli_watcher_holds_lock(&root) {
         return None;
     }
 
@@ -104,28 +103,52 @@ fn auto_start_watch_inner(path: &str, skip_disabled_check: bool) -> Option<Strin
     }
 }
 
-fn cli_watcher_holds_lock(root: &std::path::Path) -> bool {
+/// Acquire the per-project watch lock (`.infigraph/watch.lock`), the same
+/// lock the CLI's `infigraph watch` holds for its lifetime. Retries briefly:
+/// a watcher that was just told to stop may take up to its poll interval
+/// (~200ms) to actually exit and release this lock, and without a retry
+/// window a start attempt landing in that gap would spuriously fail.
+fn acquire_project_watch_lock(lock_path: &std::path::Path) -> Result<std::fs::File> {
     use fs2::FileExt;
-    let lock_path = root.join(".infigraph").join("watch.lock");
-    let file = match std::fs::OpenOptions::new()
-        .create(false)
+    if let Some(parent) = lock_path.parent() {
+        std::fs::create_dir_all(parent)?;
+    }
+    let file = std::fs::OpenOptions::new()
+        .create(true)
         .write(true)
         .truncate(false)
-        .open(&lock_path)
-    {
-        Ok(f) => f,
-        Err(_) => return false,
-    };
-    match file.try_lock_exclusive() {
-        Ok(()) => {
-            let _ = file.unlock();
-            false
+        .open(lock_path)?;
+
+    const ATTEMPTS: u32 = 10;
+    const RETRY_DELAY: std::time::Duration = std::time::Duration::from_millis(50);
+    let mut last_err = None;
+    for _ in 0..ATTEMPTS {
+        match file.try_lock_exclusive() {
+            Ok(()) => return Ok(file),
+            Err(e) => {
+                last_err = Some(e);
+                std::thread::sleep(RETRY_DELAY);
+            }
         }
-        Err(_) => true,
     }
+    Err(last_err.unwrap().into())
+}
+
+fn is_remote_mode() -> bool {
+    std::env::var("INFIGRAPH_BACKEND")
+        .map(|v| v == "neo4j")
+        .unwrap_or(false)
 }
 
 pub fn tool_watch_project(args: &Value) -> Result<String> {
+    if is_remote_mode() {
+        return Ok(
+            "File watching is not supported in remote mode (Neo4j backend). \
+                    Reindexing is triggered via webhooks instead."
+                .to_string(),
+        );
+    }
+
     init_watchers();
 
     let path = args
@@ -145,6 +168,15 @@ pub fn tool_watch_project(args: &Value) -> Result<String> {
         .canonicalize()
         .context("invalid path")?;
     let root_str = root.to_string_lossy().replace('\\', "/");
+
+    let lock_path = root.join(".infigraph").join("watch.lock");
+    let watch_lock = acquire_project_watch_lock(&lock_path).map_err(|_| {
+        anyhow::anyhow!(
+            "another watcher is already running for {root_str} \
+             (CLI `infigraph watch` or another MCP worker) — \
+             use get_watch_status to check, or stop it first"
+        )
+    })?;
 
     let (stop_tx, stop_rx) = mpsc::channel::<()>();
     let watcher_id = format!(
@@ -174,6 +206,8 @@ pub fn tool_watch_project(args: &Value) -> Result<String> {
 
     let watcher_id_clone = watcher_id.clone();
     std::thread::spawn(move || {
+        // Held for the watcher's lifetime; released when this thread exits.
+        let _watch_lock = watch_lock;
         let id_short = watcher_id_clone[..12.min(watcher_id_clone.len())].to_string();
         if auto_resolve {
             if let Err(e) = infigraph_core::watch::watch_project_auto_resolve(

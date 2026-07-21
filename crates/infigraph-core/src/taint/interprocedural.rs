@@ -4,8 +4,7 @@ use std::path::Path;
 use anyhow::Result;
 use serde::Serialize;
 
-use crate::graph::GraphQuery;
-use crate::graph::GraphStore;
+use crate::graph::GraphBackend;
 
 use super::sinks::TAINT_SINKS;
 use super::sources::TAINT_SOURCES;
@@ -23,18 +22,12 @@ pub struct InterProcTaintFlow {
 }
 
 pub fn detect_interprocedural_taint(
-    store: &GraphStore,
+    backend: &dyn GraphBackend,
     root: &Path,
     max_depth: u32,
 ) -> Result<Vec<InterProcTaintFlow>> {
-    let conn = store.connection()?;
-    let gq = GraphQuery::new(&conn);
-
-    // Step 1: Find functions that contain taint sources (entry points)
-    let source_functions = find_source_functions(store, root)?;
-
-    // Step 2: Find functions that contain taint sinks
-    let sink_functions = find_sink_functions(store, root)?;
+    let source_functions = find_source_functions(backend, root)?;
+    let sink_functions = find_sink_functions(backend, root)?;
 
     // Step 3: BFS from source functions through CALLS edges to sink functions
     let mut flows = Vec::new();
@@ -67,7 +60,7 @@ pub fn detect_interprocedural_taint(
             }
 
             // Traverse callees
-            if let Ok(callees) = gq.callees_of(&current) {
+            if let Ok(callees) = backend.callees_of(&current) {
                 for callee in callees {
                     if !visited.contains(&callee) {
                         visited.insert(callee.clone());
@@ -84,15 +77,12 @@ pub fn detect_interprocedural_taint(
 }
 
 pub fn detect_interprocedural_taint_with_cache(
-    store: &GraphStore,
+    backend: &dyn GraphBackend,
     functions: &[FuncInfo],
     cache: &SourceCache,
     max_depth: u32,
 ) -> Result<Vec<InterProcTaintFlow>> {
-    let conn = store.connection()?;
-
-    // Preload entire CALLS adjacency list in one query instead of per-node queries
-    let adj = load_call_adjacency(&conn)?;
+    let adj = load_call_adjacency(backend)?;
 
     let (source_functions, sink_functions) = find_sources_and_sinks_from_cache(functions, cache);
 
@@ -135,10 +125,8 @@ pub fn detect_interprocedural_taint_with_cache(
     Ok(flows)
 }
 
-fn load_call_adjacency(conn: &kuzu::Connection<'_>) -> Result<HashMap<String, Vec<String>>> {
-    let result = conn
-        .query("MATCH (a:Symbol)-[:CALLS]->(b:Symbol) RETURN a.id, b.id")
-        .map_err(|e| anyhow::anyhow!("load call adjacency: {e}"))?;
+fn load_call_adjacency(backend: &dyn GraphBackend) -> Result<HashMap<String, Vec<String>>> {
+    let result = backend.raw_query("MATCH (a:Symbol)-[:CALLS]->(b:Symbol) RETURN a.id, b.id")?;
     let mut adj: HashMap<String, Vec<String>> = HashMap::new();
     for row in result {
         if row.len() >= 2 {
@@ -218,11 +206,9 @@ fn find_sources_and_sinks_from_cache(
     (sources, sinks)
 }
 
-fn find_source_functions(store: &GraphStore, root: &Path) -> Result<Vec<(String, String)>> {
-    let conn = store.connection()?;
-    let result = conn
-        .query("MATCH (s:Symbol) WHERE s.kind IN ['Function', 'Method'] AND s.file IS NOT NULL RETURN s.id, s.file, s.start_line, s.end_line")
-        .map_err(|e| anyhow::anyhow!("query: {e}"))?;
+fn find_source_functions(backend: &dyn GraphBackend, root: &Path) -> Result<Vec<(String, String)>> {
+    let result = backend
+        .raw_query("MATCH (s:Symbol) WHERE s.kind IN ['Function', 'Method'] AND s.file IS NOT NULL RETURN s.id, s.file, s.start_line, s.end_line")?;
 
     let mut sources = Vec::new();
     let mut file_cache: HashMap<String, Vec<String>> = HashMap::new();
@@ -277,13 +263,11 @@ fn find_source_functions(store: &GraphStore, root: &Path) -> Result<Vec<(String,
 }
 
 fn find_sink_functions(
-    store: &GraphStore,
+    backend: &dyn GraphBackend,
     root: &Path,
 ) -> Result<HashMap<String, (String, String)>> {
-    let conn = store.connection()?;
-    let result = conn
-        .query("MATCH (s:Symbol) WHERE s.kind IN ['Function', 'Method'] AND s.file IS NOT NULL RETURN s.id, s.file, s.start_line, s.end_line")
-        .map_err(|e| anyhow::anyhow!("query: {e}"))?;
+    let result = backend
+        .raw_query("MATCH (s:Symbol) WHERE s.kind IN ['Function', 'Method'] AND s.file IS NOT NULL RETURN s.id, s.file, s.start_line, s.end_line")?;
 
     let mut sinks: HashMap<String, (String, String)> = HashMap::new();
     let mut file_cache: HashMap<String, Vec<String>> = HashMap::new();

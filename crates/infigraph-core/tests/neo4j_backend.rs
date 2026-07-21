@@ -1,7 +1,10 @@
 //! Integration tests for Neo4jBackend against a live Neo4j instance.
 //!
 //! Requires: `docker run -d -p 7687:7687 -e NEO4J_AUTH=neo4j/testpass neo4j:5-community`
-//! Run: `NEO4J_URI=127.0.0.1:7687 NEO4J_USER=neo4j NEO4J_PASSWORD=testpass cargo test -p infigraph-core --features neo4j --test neo4j_backend -- --ignored`
+//! Run: `NEO4J_URI=127.0.0.1:7687 NEO4J_USER=neo4j NEO4J_PASSWORD=testpass cargo test -p infigraph-core --features neo4j --test neo4j_backend -- --ignored --test-threads=1`
+//!
+//! Tests share a single Neo4j instance and use `DETACH DELETE` for isolation,
+//! so they MUST run with `--test-threads=1`.
 
 #![cfg(feature = "neo4j")]
 
@@ -363,4 +366,225 @@ fn test_neo4j_concurrent_upsert() {
         stats.symbols, 8,
         "8 symbols from 4 concurrent repos (2 each)"
     );
+}
+
+// ── File lifecycle tests (add / delete / modify / move) ─────────────
+
+#[test]
+#[ignore]
+fn test_neo4j_add_file() {
+    let backend = connect();
+    clear_graph(&backend);
+
+    backend
+        .upsert_files_bulk(&fixture(), true)
+        .expect("initial bulk");
+    let stats1 = backend.stats().expect("stats before add");
+    assert_eq!(stats1.files, 2);
+    assert_eq!(stats1.symbols, 3);
+
+    let new_file = vec![FileExtraction {
+        file: "src/utils.py".to_string(),
+        language: "python".to_string(),
+        content_hash: "ccc".to_string(),
+        symbols: vec![sym(
+            "src/utils.py::format_str",
+            "format_str",
+            SymbolKind::Function,
+            "src/utils.py",
+            1,
+            8,
+        )],
+        relations: vec![],
+        statements: vec![],
+    }];
+    backend
+        .upsert_files_bulk(&new_file, false)
+        .expect("add file");
+
+    let stats2 = backend.stats().expect("stats after add");
+    assert_eq!(stats2.files, 3, "new file should appear");
+    assert_eq!(stats2.symbols, 4, "new symbol should appear");
+
+    let syms = backend
+        .symbols_in_file("src/utils.py")
+        .expect("query new file");
+    assert_eq!(syms.len(), 1);
+    assert_eq!(syms[0].name, "format_str");
+
+    let hashes = backend.get_file_hashes().expect("hashes");
+    assert_eq!(
+        hashes.get("src/utils.py").map(|s| s.as_str()),
+        Some("ccc"),
+        "new file hash should be stored"
+    );
+}
+
+#[test]
+#[ignore]
+fn test_neo4j_delete_file_full() {
+    let backend = connect();
+    clear_graph(&backend);
+
+    backend
+        .upsert_files_bulk(&fixture(), true)
+        .expect("initial bulk");
+    let stats1 = backend.stats().expect("stats before delete");
+    assert_eq!(stats1.files, 2);
+    assert_eq!(stats1.symbols, 3);
+
+    backend.remove_file("src/lib.py").expect("remove file");
+
+    let stats2 = backend.stats().expect("stats after delete");
+    assert_eq!(stats2.files, 1, "deleted file should be gone");
+    assert_eq!(
+        stats2.symbols, 2,
+        "symbols from deleted file should be gone"
+    );
+
+    let syms = backend
+        .symbols_in_file("src/lib.py")
+        .expect("query deleted file");
+    assert!(syms.is_empty(), "no symbols should remain for deleted file");
+
+    let hashes = backend.get_file_hashes().expect("hashes");
+    assert!(
+        hashes.get("src/lib.py").is_none(),
+        "hash for deleted file should be gone"
+    );
+
+    let remaining = backend
+        .symbols_in_file("src/main.py")
+        .expect("query surviving file");
+    assert_eq!(remaining.len(), 2, "surviving file symbols untouched");
+}
+
+#[test]
+#[ignore]
+fn test_neo4j_modify_file() {
+    let backend = connect();
+    clear_graph(&backend);
+
+    backend
+        .upsert_files_bulk(&fixture(), true)
+        .expect("initial bulk");
+
+    let modified = vec![FileExtraction {
+        file: "src/lib.py".to_string(),
+        language: "python".to_string(),
+        content_hash: "bbb_v2".to_string(),
+        symbols: vec![
+            sym(
+                "src/lib.py::process",
+                "process",
+                SymbolKind::Function,
+                "src/lib.py",
+                1,
+                20,
+            ),
+            sym(
+                "src/lib.py::validate",
+                "validate",
+                SymbolKind::Function,
+                "src/lib.py",
+                22,
+                35,
+            ),
+        ],
+        relations: vec![rel(
+            "src/lib.py::process",
+            "src/lib.py::validate",
+            RelationKind::Calls,
+        )],
+        statements: vec![],
+    }];
+    backend
+        .upsert_files_bulk(&modified, false)
+        .expect("modify file");
+
+    let stats = backend.stats().expect("stats after modify");
+    assert_eq!(stats.files, 2, "file count unchanged after modify");
+    assert_eq!(
+        stats.symbols, 4,
+        "modified file now has 2 symbols (was 1) + 2 from main"
+    );
+
+    let syms = backend
+        .symbols_in_file("src/lib.py")
+        .expect("query modified file");
+    assert_eq!(syms.len(), 2, "modified file should have 2 symbols");
+    assert!(syms.iter().any(|s| s.name == "process"));
+    assert!(syms.iter().any(|s| s.name == "validate"));
+
+    let hashes = backend.get_file_hashes().expect("hashes");
+    assert_eq!(
+        hashes.get("src/lib.py").map(|s| s.as_str()),
+        Some("bbb_v2"),
+        "hash should be updated"
+    );
+
+    let main_syms = backend
+        .symbols_in_file("src/main.py")
+        .expect("main untouched");
+    assert_eq!(main_syms.len(), 2, "unmodified file should be untouched");
+}
+
+#[test]
+#[ignore]
+fn test_neo4j_move_rename_file() {
+    let backend = connect();
+    clear_graph(&backend);
+
+    backend
+        .upsert_files_bulk(&fixture(), true)
+        .expect("initial bulk");
+
+    backend.remove_file("src/lib.py").expect("remove old path");
+
+    let moved = vec![FileExtraction {
+        file: "src/core/lib.py".to_string(),
+        language: "python".to_string(),
+        content_hash: "bbb".to_string(),
+        symbols: vec![sym(
+            "src/core/lib.py::process",
+            "process",
+            SymbolKind::Function,
+            "src/core/lib.py",
+            1,
+            15,
+        )],
+        relations: vec![],
+        statements: vec![],
+    }];
+    backend
+        .upsert_files_bulk(&moved, false)
+        .expect("add new path");
+
+    let stats = backend.stats().expect("stats after move");
+    assert_eq!(stats.files, 2, "still 2 files (old removed, new added)");
+    assert_eq!(stats.symbols, 3, "still 3 symbols total");
+
+    let old_syms = backend
+        .symbols_in_file("src/lib.py")
+        .expect("query old path");
+    assert!(old_syms.is_empty(), "old path should have no symbols");
+
+    let new_syms = backend
+        .symbols_in_file("src/core/lib.py")
+        .expect("query new path");
+    assert_eq!(new_syms.len(), 1);
+    assert_eq!(new_syms[0].name, "process");
+
+    let hashes = backend.get_file_hashes().expect("hashes");
+    assert!(hashes.get("src/lib.py").is_none(), "old path hash gone");
+    assert_eq!(
+        hashes.get("src/core/lib.py").map(|s| s.as_str()),
+        Some("bbb"),
+        "new path hash present"
+    );
+
+    let main_syms = backend
+        .symbols_in_file("src/main.py")
+        .expect("main untouched");
+    assert_eq!(main_syms.len(), 2, "unrelated file untouched after move");
 }

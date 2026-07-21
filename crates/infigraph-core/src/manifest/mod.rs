@@ -8,7 +8,7 @@ use std::path::Path;
 
 use anyhow::Result;
 
-use crate::graph::GraphStore;
+use crate::graph::GraphBackend;
 
 #[derive(Debug, Clone)]
 pub struct DepEntry {
@@ -27,7 +27,7 @@ pub struct ManifestResult {
 }
 
 /// Scan a project root for manifests, parse them, store deps in graph.
-pub fn index_manifests(root: &Path, store: &GraphStore) -> Result<Vec<ManifestResult>> {
+pub fn index_manifests(root: &Path, backend: &dyn GraphBackend) -> Result<Vec<ManifestResult>> {
     let mut results = Vec::new();
 
     let candidates = [
@@ -49,34 +49,31 @@ pub fn index_manifests(root: &Path, store: &GraphStore) -> Result<Vec<ManifestRe
         let path = root.join(name);
         if path.exists() {
             if let Ok(result) = parse_manifest(&path) {
-                store_manifest(store, &result)?;
+                store_manifest(backend, &result)?;
                 results.push(result);
             }
         }
     }
 
     // Also scan for *.csproj files (can be nested)
-    scan_csproj(root, store, &mut results)?;
+    scan_csproj(root, backend, &mut results)?;
 
     Ok(results)
 }
 
 /// Query dependencies stored in graph for a project.
-pub fn query_deps(store: &GraphStore) -> Result<Vec<DepEntry>> {
-    let conn = store.connection()?;
+pub fn query_deps(backend: &dyn GraphBackend) -> Result<Vec<DepEntry>> {
     let q = "MATCH (d:Dependency) RETURN d.name, d.version, d.ecosystem, d.is_dev ORDER BY d.ecosystem, d.name";
-    let result = conn
-        .query(q)
-        .map_err(|e| anyhow::anyhow!("query failed: {e}"))?;
+    let rows = backend.raw_query(q)?;
 
     let mut deps = Vec::new();
-    for row in result {
+    for row in &rows {
         if row.len() >= 4 {
             deps.push(DepEntry {
-                name: row[0].to_string().trim_matches('"').to_string(),
-                version: row[1].to_string().trim_matches('"').to_string(),
-                ecosystem: row[2].to_string().trim_matches('"').to_string(),
-                is_dev: row[3].to_string() == "True" || row[3].to_string() == "true",
+                name: row[0].trim_matches('"').to_string(),
+                version: row[1].trim_matches('"').to_string(),
+                ecosystem: row[2].trim_matches('"').to_string(),
+                is_dev: row[3] == "True" || row[3] == "true",
             });
         }
     }
@@ -661,16 +658,20 @@ fn parse_pubspec_yaml(content: &str, path: &Path) -> Result<ManifestResult> {
     })
 }
 
-fn scan_csproj(root: &Path, store: &GraphStore, results: &mut Vec<ManifestResult>) -> Result<()> {
+fn scan_csproj(
+    root: &Path,
+    backend: &dyn GraphBackend,
+    results: &mut Vec<ManifestResult>,
+) -> Result<()> {
     let re =
         regex::Regex::new(r#"<PackageReference\s+Include="([^"]+)"\s+Version="([^"]+)""#).unwrap();
-    scan_csproj_dir(root, &re, store, results)
+    scan_csproj_dir(root, &re, backend, results)
 }
 
 fn scan_csproj_dir(
     dir: &Path,
     re: &regex::Regex,
-    store: &GraphStore,
+    backend: &dyn GraphBackend,
     results: &mut Vec<ManifestResult>,
 ) -> Result<()> {
     let ignore = [".git", "node_modules", "target", "bin", "obj"];
@@ -682,7 +683,7 @@ fn scan_csproj_dir(
         let name = entry.file_name();
         let name_str = name.to_string_lossy();
         if path.is_dir() && !ignore.contains(&name_str.as_ref()) {
-            scan_csproj_dir(&path, re, store, results)?;
+            scan_csproj_dir(&path, re, backend, results)?;
         } else if path
             .extension()
             .map(|e| e == "csproj" || e == "fsproj" || e == "vbproj")
@@ -705,7 +706,7 @@ fn scan_csproj_dir(
                         deps,
                         doc_urls: Vec::new(),
                     };
-                    let _ = store_manifest(store, &result);
+                    let _ = store_manifest(backend, &result);
                     results.push(result);
                 }
             }
@@ -714,24 +715,20 @@ fn scan_csproj_dir(
     Ok(())
 }
 
-fn store_manifest(store: &GraphStore, result: &ManifestResult) -> Result<()> {
-    let _lock = store.write_lock()?;
-    let conn = store.connection()?;
-
+fn store_manifest(backend: &dyn GraphBackend, result: &ManifestResult) -> Result<()> {
     for dep in &result.deps {
         let id = format!("{}::{}", dep.ecosystem, dep.name);
-        // Upsert Dependency node
         let check = format!(
             "MATCH (d:Dependency) WHERE d.id = '{}' RETURN d.id",
             escape(&id)
         );
-        let mut r = conn.query(&check).map_err(|e| anyhow::anyhow!("{e}"))?;
-        if r.next().is_none() {
+        let existing = backend.raw_query(&check)?;
+        if existing.is_empty() {
             let insert = format!(
                 "CREATE (d:Dependency {{id: '{}', name: '{}', version: '{}', ecosystem: '{}', is_dev: {}}})",
                 escape(&id), escape(&dep.name), escape(&dep.version), escape(&dep.ecosystem), dep.is_dev
             );
-            let _ = conn.query(&insert);
+            let _ = backend.raw_query(&insert);
         } else {
             let update = format!(
                 "MATCH (d:Dependency) WHERE d.id = '{}' SET d.version = '{}', d.is_dev = {}",
@@ -739,11 +736,9 @@ fn store_manifest(store: &GraphStore, result: &ManifestResult) -> Result<()> {
                 escape(&dep.version),
                 dep.is_dev
             );
-            let _ = conn.query(&update);
+            let _ = backend.raw_query(&update);
         }
 
-        // Wire DEPENDS_ON from the manifest's Module (or first Module in project)
-        let manifest_mod_id = &result.manifest_file;
         let rel = format!(
             "MATCH (m:Module), (d:Dependency) WHERE m.file CONTAINS '{}' AND d.id = '{}' \
              CREATE (m)-[:DEPENDS_ON {{is_dev: {}}}]->(d)",
@@ -751,8 +746,7 @@ fn store_manifest(store: &GraphStore, result: &ManifestResult) -> Result<()> {
             escape(&id),
             dep.is_dev
         );
-        let _ = conn.query(&rel);
-        let _ = manifest_mod_id;
+        let _ = backend.raw_query(&rel);
     }
     Ok(())
 }
@@ -772,12 +766,14 @@ fn escape(s: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::graph::KuzuBackend;
 
     #[test]
     fn test_manifest_upsert_updates_version() {
         let dir = tempfile::TempDir::new().unwrap();
         let db_path = dir.path().join("graph");
         let store = crate::graph::GraphStore::open(&db_path).unwrap();
+        let backend = KuzuBackend::from_store(store);
         let result1 = ManifestResult {
             manifest_file: "pyproject.toml".to_string(),
             ecosystem: "pypi".to_string(),
@@ -789,9 +785,9 @@ mod tests {
             }],
             doc_urls: Vec::new(),
         };
-        store_manifest(&store, &result1).unwrap();
+        store_manifest(&backend, &result1).unwrap();
 
-        let conn = store.connection().unwrap();
+        let conn = backend.inner().connection().unwrap();
         let gq = crate::graph::GraphQuery::new(&conn);
         let rows = gq
             .raw_query("MATCH (d:Dependency) WHERE d.id = 'pypi::requests' RETURN d.version")
@@ -810,7 +806,7 @@ mod tests {
             }],
             doc_urls: Vec::new(),
         };
-        store_manifest(&store, &result2).unwrap();
+        store_manifest(&backend, &result2).unwrap();
 
         let rows2 = gq
             .raw_query("MATCH (d:Dependency) WHERE d.id = 'pypi::requests' RETURN d.version")

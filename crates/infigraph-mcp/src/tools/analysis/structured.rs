@@ -5,7 +5,7 @@ use crate::tools::helpers::open_prism;
 
 pub fn tool_ingest_structured(args: &Value) -> Result<String> {
     let prism = open_prism(args)?;
-    let store = prism.store().context("not initialized")?;
+    let backend = prism.backend().context("not initialized")?;
 
     let schema_id = args.get("schema_id").and_then(|v| v.as_str());
     let data_file = args.get("data_file").and_then(|v| v.as_str());
@@ -48,26 +48,24 @@ pub fn tool_ingest_structured(args: &Value) -> Result<String> {
         .with_context(|| format!("schema '{}' not found", sid))?;
 
     let source_dir = args.get("source").and_then(|v| v.as_str());
-    let _lock = store.write_lock()?;
-    let conn = store.connection()?;
 
     if let Some(dir) = source_dir {
         let path = std::path::Path::new(dir);
-        let result = infigraph_core::structured::ingest_directory(&conn, &schema.schema, path)?;
+        let result = backend.ingest_structured_directory(&schema.schema, path)?;
         Ok(format!(
             "Ingested directory '{}' using schema '{}': {} nodes created, {} edges created",
             dir, sid, result.nodes_created, result.edges_created
         ))
     } else if let Some(file) = data_file {
         let path = std::path::Path::new(file);
-        let result = infigraph_core::structured::ingest_file(&conn, &schema.schema, path)?;
+        let result = backend.ingest_structured_file(&schema.schema, path)?;
         Ok(format!(
             "Ingested '{}' using schema '{}': {} nodes created, {} edges created",
             file, sid, result.nodes_created, result.edges_created
         ))
     } else if let Some(data) = inline_data {
         let data_vec: Vec<serde_json::Value> = data.clone();
-        let result = infigraph_core::structured::ingest_data(&conn, &schema.schema, &data_vec)?;
+        let result = backend.ingest_structured_data(&schema.schema, &data_vec)?;
         Ok(format!(
             "Ingested {} records using schema '{}': {} nodes created, {} edges created",
             data_vec.len(),

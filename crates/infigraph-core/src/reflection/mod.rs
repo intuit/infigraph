@@ -3,7 +3,7 @@ use serde::Serialize;
 use std::collections::HashMap;
 use std::path::Path;
 
-use crate::graph::GraphStore;
+use crate::graph::GraphBackend;
 
 #[derive(Debug, Clone, Serialize)]
 pub struct ReflectionSite {
@@ -89,15 +89,14 @@ static REFLECTION_PATTERNS: &[ReflectionPattern] = &[
     },
 ];
 
-pub fn detect_reflection_sites(store: &GraphStore, root: &Path) -> Result<Vec<ReflectionSite>> {
-    let _lock = store.write_lock()?;
-    let conn = store.connection()?;
+pub fn detect_reflection_sites(
+    backend: &dyn GraphBackend,
+    root: &Path,
+) -> Result<Vec<ReflectionSite>> {
+    let result = backend
+        .raw_query("MATCH (s:Symbol) WHERE s.docstring IS NOT NULL AND s.docstring <> '' RETURN s.id, s.docstring, s.file")?;
 
-    let result = conn
-        .query("MATCH (s:Symbol) WHERE s.docstring IS NOT NULL AND s.docstring <> '' RETURN s.id, s.docstring, s.file")
-        .map_err(|e| anyhow::anyhow!("query failed: {e}"))?;
-
-    let all_symbols = load_symbol_names(store)?;
+    let all_symbols = load_symbol_names(backend)?;
     let config_values = scan_config_files(root);
 
     let mut sites = Vec::new();
@@ -144,7 +143,7 @@ pub fn detect_reflection_sites(store: &GraphStore, root: &Path) -> Result<Vec<Re
     }
 
     if !sites.is_empty() {
-        write_resolves_to(store, &sites)?;
+        write_resolves_to(backend, &sites)?;
     }
 
     Ok(sites)
@@ -182,11 +181,8 @@ fn extract_string_arg(after_pattern: &str) -> String {
     String::new()
 }
 
-fn load_symbol_names(store: &GraphStore) -> Result<HashMap<String, String>> {
-    let conn = store.connection()?;
-    let result = conn
-        .query("MATCH (s:Symbol) RETURN s.id, s.name")
-        .map_err(|e| anyhow::anyhow!("load symbols: {e}"))?;
+fn load_symbol_names(backend: &dyn GraphBackend) -> Result<HashMap<String, String>> {
+    let result = backend.raw_query("MATCH (s:Symbol) RETURN s.id, s.name")?;
 
     let mut map = HashMap::new();
     for row in result {
@@ -344,13 +340,10 @@ fn try_resolve(
     (None, None)
 }
 
-fn write_resolves_to(store: &GraphStore, sites: &[ReflectionSite]) -> Result<()> {
-    let conn = store.connection()?;
+fn write_resolves_to(backend: &dyn GraphBackend, sites: &[ReflectionSite]) -> Result<()> {
+    backend.raw_query("BEGIN TRANSACTION")?;
 
-    conn.query("BEGIN TRANSACTION")
-        .map_err(|e| anyhow::anyhow!("begin txn: {e}"))?;
-
-    let _ = conn.query("MATCH ()-[r:RESOLVES_TO]->() DELETE r");
+    let _ = backend.raw_query("MATCH ()-[r:RESOLVES_TO]->() DELETE r");
 
     for site in sites {
         if let Some(ref target) = site.resolved_to {
@@ -359,15 +352,14 @@ fn write_resolves_to(store: &GraphStore, sites: &[ReflectionSite]) -> Result<()>
             let mech_esc = crate::escape_str(site.mechanism);
             let cfg_esc = crate::escape_str(site.config_source.as_deref().unwrap_or(""));
 
-            let _ = conn.query(&format!(
+            let _ = backend.raw_query(&format!(
                 "MATCH (s:Symbol), (t:Symbol) WHERE s.id = '{src_esc}' AND t.id = '{tgt_esc}' \
                  CREATE (s)-[:RESOLVES_TO {{mechanism: '{mech_esc}', config_source: '{cfg_esc}'}}]->(t)"
             ));
         }
     }
 
-    conn.query("COMMIT")
-        .map_err(|e| anyhow::anyhow!("commit txn: {e}"))?;
+    backend.raw_query("COMMIT")?;
 
     Ok(())
 }

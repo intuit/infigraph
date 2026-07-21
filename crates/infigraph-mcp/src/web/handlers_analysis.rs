@@ -3,36 +3,42 @@ use std::path::PathBuf;
 use serde_json::{json, Value};
 
 use infigraph_core::embed;
-use infigraph_core::graph::GraphQuery;
 
 use super::open_prism;
 
 pub(crate) fn api_architecture(params: &Value) -> Value {
     match open_prism(params) {
         Ok(prism) => {
-            let store = match prism.store() {
-                Some(s) => s,
+            let backend = match prism.backend() {
+                Some(b) => b,
                 None => return json!({"error": "not initialized"}),
             };
-            let conn = match store.connection() {
-                Ok(c) => c,
+            let arch = match backend.get_architecture_stats() {
+                Ok(a) => a,
                 Err(e) => return json!({"error": e.to_string()}),
             };
-            let gq = GraphQuery::new(&conn);
-
-            let langs = gq
-                .raw_query("MATCH (m:Module) RETURN m.language, count(m)")
-                .unwrap_or_default();
-            let kinds = gq
-                .raw_query("MATCH (s:Symbol) RETURN s.kind, count(s)")
-                .unwrap_or_default();
-            let hotspots = gq
-                .raw_query(
-                    "MATCH (s:Symbol) RETURN s.file, count(s) AS cnt ORDER BY cnt DESC LIMIT 10",
-                )
-                .unwrap_or_default();
-            let hubs = gq.raw_query("MATCH ()-[:CALLS]->(s:Symbol) RETURN s.name, s.file, count(*) AS calls ORDER BY calls DESC LIMIT 10").unwrap_or_default();
             let stats = prism.stats().ok();
+
+            let langs: Vec<Value> = arch
+                .languages
+                .iter()
+                .map(|l| json!([l.language, l.count.to_string()]))
+                .collect();
+            let kinds: Vec<Value> = arch
+                .kind_counts
+                .iter()
+                .map(|k| json!([k.kind, k.count.to_string()]))
+                .collect();
+            let hotspots: Vec<Value> = arch
+                .hotspot_files
+                .iter()
+                .map(|h| json!([h.file, h.count.to_string()]))
+                .collect();
+            let hubs: Vec<Value> = arch
+                .hub_functions
+                .iter()
+                .map(|h| json!([h.name, h.file, h.calls.to_string()]))
+                .collect();
 
             json!({
                 "languages": langs,
@@ -55,24 +61,20 @@ pub(crate) fn api_architecture(params: &Value) -> Value {
 pub(crate) fn api_dead_code(params: &Value) -> Value {
     match open_prism(params) {
         Ok(prism) => {
-            let store = match prism.store() {
-                Some(s) => s,
+            let backend = match prism.backend() {
+                Some(b) => b,
                 None => return json!({"error": "not initialized"}),
             };
-            let conn = match store.connection() {
-                Ok(c) => c,
+            let rows = match backend.find_uncalled_symbols() {
+                Ok(r) => r,
                 Err(e) => return json!({"error": e.to_string()}),
             };
-            let gq = GraphQuery::new(&conn);
-            let rows = gq.raw_query(
-                "MATCH (s:Symbol) WHERE s.kind IN ['Function', 'Method'] AND NOT EXISTS { MATCH ()-[:CALLS]->(s) } RETURN s.name, s.kind, s.file ORDER BY s.file"
-            ).unwrap_or_default();
 
             let entry_points = ["main", "__init__", "setUp", "tearDown"];
             let dead: Vec<Value> = rows
                 .iter()
-                .filter(|r| !entry_points.contains(&r[0].as_str()))
-                .map(|r| json!({"name": r[0], "kind": r[1], "file": r[2]}))
+                .filter(|r| !entry_points.contains(&r.name.as_str()))
+                .map(|r| json!({"name": r.name, "kind": r.kind, "file": r.file}))
                 .collect();
 
             json!({"deadCode": dead, "count": dead.len()})
@@ -84,23 +86,18 @@ pub(crate) fn api_dead_code(params: &Value) -> Value {
 pub(crate) fn api_graph_data(params: &Value) -> Value {
     match open_prism(params) {
         Ok(prism) => {
-            let store = match prism.store() {
-                Some(s) => s,
+            let backend = match prism.backend() {
+                Some(b) => b,
                 None => return json!({"error": "not initialized"}),
             };
-            let conn = match store.connection() {
-                Ok(c) => c,
-                Err(e) => return json!({"error": e.to_string()}),
-            };
-            let gq = GraphQuery::new(&conn);
 
-            let nodes = gq
+            let nodes = backend
                 .raw_query("MATCH (s:Symbol) RETURN s.id, s.name, s.kind, s.file")
                 .unwrap_or_default();
-            let calls = gq
+            let calls = backend
                 .raw_query("MATCH (a:Symbol)-[:CALLS]->(b:Symbol) RETURN a.id, b.id")
                 .unwrap_or_default();
-            let inherits = gq
+            let inherits = backend
                 .raw_query("MATCH (a:Symbol)-[:INHERITS]->(b:Symbol) RETURN a.id, b.id")
                 .unwrap_or_default();
 
@@ -143,15 +140,11 @@ pub(crate) fn api_stats(params: &Value) -> Value {
 pub(crate) fn api_cluster(params: &Value) -> Value {
     match open_prism(params) {
         Ok(prism) => {
-            let store = match prism.store() {
-                Some(s) => s,
+            let backend = match prism.backend() {
+                Some(b) => b,
                 None => return json!({"error": "not initialized"}),
             };
-            let conn = match store.connection() {
-                Ok(c) => c,
-                Err(e) => return json!({"error": e.to_string()}),
-            };
-            match infigraph_core::cluster::detect_clusters(&conn) {
+            match infigraph_core::cluster::detect_clusters(backend) {
                 Ok(stats) => json!({
                     "clusters": stats.num_clusters,
                     "modularity": stats.modularity,
@@ -167,16 +160,11 @@ pub(crate) fn api_cluster(params: &Value) -> Value {
 pub(crate) fn api_routes(params: &Value) -> Value {
     match open_prism(params) {
         Ok(prism) => {
-            let store = match prism.store() {
-                Some(s) => s,
+            let backend = match prism.backend() {
+                Some(b) => b,
                 None => return json!({"error": "not initialized"}),
             };
-            let conn = match store.connection() {
-                Ok(c) => c,
-                Err(e) => return json!({"error": e.to_string()}),
-            };
-            let gq = GraphQuery::new(&conn);
-            match infigraph_core::routes::detect_routes(&gq) {
+            match infigraph_core::routes::detect_routes(backend) {
                 Ok(routes) => {
                     let items: Vec<Value> = routes
                         .iter()
@@ -269,26 +257,23 @@ pub(crate) fn api_complexity(params: &Value) -> Value {
         .unwrap_or(5) as i64;
     match open_prism(params) {
         Ok(prism) => {
-            let store = match prism.store() {
-                Some(s) => s,
+            let backend = match prism.backend() {
+                Some(b) => b,
                 None => return json!({"error":"not initialized"}),
             };
-            let conn = match store.connection() {
-                Ok(c) => c,
-                Err(e) => return json!({"error":e.to_string()}),
+            let rows = match backend.get_complexity_ranking(None) {
+                Ok(r) => r,
+                Err(e) => return json!({"error": e.to_string()}),
             };
-            let gq = GraphQuery::new(&conn);
-            let rows = gq.raw_query(
-                "MATCH (s:Symbol) WHERE s.kind IN ['Function','Method','Test'] AND s.complexity IS NOT NULL RETURN s.id, s.name, s.kind, s.file, s.start_line, s.complexity ORDER BY s.complexity DESC"
-            ).unwrap_or_default();
 
             let items: Vec<Value> = rows
                 .iter()
+                .filter(|r| r.complexity > 0)
                 .map(|r| {
                     json!({
-                        "id": r[0], "name": r[1], "kind": r[2], "file": r[3],
-                        "line": r[4].parse::<u32>().unwrap_or(0),
-                        "complexity": r[5].parse::<i64>().unwrap_or(1),
+                        "id": "", "name": r.name, "kind": "", "file": r.file,
+                        "line": r.start_line,
+                        "complexity": r.complexity as i64,
                     })
                 })
                 .collect();
@@ -378,35 +363,30 @@ pub(crate) fn api_clones(params: &Value) -> Value {
         .unwrap_or(0.92) as f32;
     match open_prism(params) {
         Ok(prism) => {
-            let store = match prism.store() {
-                Some(s) => s,
+            let backend = match prism.backend() {
+                Some(b) => b,
                 None => return json!({"error":"not initialized"}),
             };
-            let conn = match store.connection() {
-                Ok(c) => c,
-                Err(e) => return json!({"error":e.to_string()}),
+
+            let syms = match backend.symbols_with_docstring(Some(&["Function", "Method"])) {
+                Ok(s) => s,
+                Err(e) => return json!({"error": e.to_string()}),
             };
-            let gq = GraphQuery::new(&conn);
 
-            let rows = gq.raw_query(
-                "MATCH (s:Symbol) WHERE s.kind IN ['Function','Method'] RETURN s.id, s.name, s.kind, s.file, s.docstring"
-            ).unwrap_or_default();
-
-            if rows.len() < 2 {
+            if syms.len() < 2 {
                 return json!({"pairs": [], "total": 0});
             }
 
             let embedder = embed::best_embedder();
-            let docs: Vec<(String, String)> = rows
+            let docs: Vec<(String, String)> = syms
                 .iter()
-                .map(|row| {
-                    let id = row[0].clone();
-                    let text = if row.get(4).is_some_and(|s| !s.is_empty()) {
-                        format!("{} {}: {}", row[2], row[1], row[4])
+                .map(|s| {
+                    let text = if !s.docstring.is_empty() {
+                        format!("{} {}: {}", s.kind, s.name, s.docstring)
                     } else {
-                        format!("{} {}", row[2], row[1])
+                        format!("{} {}", s.kind, s.name)
                     };
-                    (id, text)
+                    (s.id.clone(), text)
                 })
                 .collect();
 
@@ -427,8 +407,8 @@ pub(crate) fn api_clones(params: &Value) -> Value {
                         .get(id)
                         .cloned()
                         .unwrap_or_else(|| embedder.embed(text).unwrap_or_default());
-                    let row = rows.iter().find(|r| &r[0] == id).unwrap();
-                    (id.clone(), row[1].clone(), row[3].clone(), emb)
+                    let sym = syms.iter().find(|s| &s.id == id).unwrap();
+                    (id.clone(), sym.name.clone(), sym.file.clone(), emb)
                 })
                 .filter(|(_, _, _, e)| !e.is_empty())
                 .collect();

@@ -1,22 +1,19 @@
 use anyhow::{Context, Result};
+use infigraph_core::graph::GraphBackend;
 use serde_json::Value;
 
 use super::super::helpers::{open_prism, save_analysis};
 
 pub fn tool_detect_dead_code(args: &Value) -> Result<String> {
     let prism = open_prism(args)?;
-    let store = prism.store().context("not initialized")?;
-    let conn = store.connection()?;
-    let gq = infigraph_core::graph::GraphQuery::new(&conn);
+    let backend = prism.backend().context("not initialized")?;
 
-    let rows = gq.raw_query(
-        "MATCH (s:Symbol) WHERE s.kind IN ['Function', 'Method'] AND NOT EXISTS { MATCH ()-[:CALLS]->(s) } RETURN s.name, s.kind, s.file ORDER BY s.file, s.name",
-    )?;
+    let rows = backend.find_uncalled_symbols()?;
 
     let entry_points = ["main", "__init__", "setUp", "tearDown"];
-    let dead: Vec<&Vec<String>> = rows
+    let dead: Vec<_> = rows
         .iter()
-        .filter(|row| !entry_points.contains(&row[0].as_str()))
+        .filter(|row| !entry_points.contains(&row.name.as_str()))
         .collect();
 
     if dead.is_empty() {
@@ -25,7 +22,7 @@ pub fn tool_detect_dead_code(args: &Value) -> Result<String> {
 
     let mut out = format!("Potentially dead code ({} symbols):\n", dead.len());
     for row in &dead {
-        out.push_str(&format!("  {} {} ({})\n", row[1], row[0], row[2]));
+        out.push_str(&format!("  {} {} ({})\n", row.kind, row.name, row.file));
     }
 
     let path = args.get("path").and_then(|p| p.as_str()).unwrap_or(".");
@@ -42,11 +39,8 @@ pub fn tool_trace_callers(args: &Value) -> Result<String> {
         .and_then(|s| s.as_str())
         .context("missing 'symbol_id'")?;
 
-    let store = prism.store().context("not initialized")?;
-    let conn = store.connection()?;
-    let gq = infigraph_core::graph::GraphQuery::new(&conn);
-
-    let callers = gq.callers_of(symbol_id)?;
+    let backend = prism.backend().context("not initialized")?;
+    let callers = backend.callers_of(symbol_id)?;
     if callers.is_empty() {
         return Ok(format!("No callers found for '{}'", symbol_id));
     }
@@ -60,11 +54,8 @@ pub fn tool_trace_callees(args: &Value) -> Result<String> {
         .and_then(|s| s.as_str())
         .context("missing 'symbol_id'")?;
 
-    let store = prism.store().context("not initialized")?;
-    let conn = store.connection()?;
-    let gq = infigraph_core::graph::GraphQuery::new(&conn);
-
-    let callees = gq.callees_of(symbol_id)?;
+    let backend = prism.backend().context("not initialized")?;
+    let callees = backend.callees_of(symbol_id)?;
     if callees.is_empty() {
         return Ok(format!("No callees found for '{}'", symbol_id));
     }
@@ -79,11 +70,8 @@ pub fn tool_transitive_impact(args: &Value) -> Result<String> {
         .context("missing 'symbol_id'")?;
     let depth = args.get("depth").and_then(|d| d.as_u64()).unwrap_or(5) as u32;
 
-    let store = prism.store().context("not initialized")?;
-    let conn = store.connection()?;
-    let gq = infigraph_core::graph::GraphQuery::new(&conn);
-
-    let impacted = gq.transitive_impact(symbol_id, depth)?;
+    let backend = prism.backend().context("not initialized")?;
+    let impacted = backend.transitive_impact(symbol_id, depth)?;
     if impacted.is_empty() {
         return Ok(format!("No symbols affected by changes to '{}'", symbol_id));
     }
@@ -97,86 +85,68 @@ pub fn tool_transitive_impact(args: &Value) -> Result<String> {
 
 pub fn tool_get_architecture(args: &Value) -> Result<String> {
     let prism = open_prism(args)?;
-    let store = prism.store().context("not initialized")?;
-    let conn = store.connection()?;
-    let gq = infigraph_core::graph::GraphQuery::new(&conn);
+    let backend = prism.backend().context("not initialized")?;
 
-    build_architecture_report(&gq)
+    build_architecture_report(backend)
 }
 
-pub fn build_architecture_report(gq: &infigraph_core::graph::GraphQuery) -> Result<String> {
+pub fn build_architecture_report(backend: &dyn GraphBackend) -> Result<String> {
+    let stats = backend.get_architecture_stats()?;
     let mut out = String::new();
 
-    // 1. Language breakdown
     out.push_str("=== Language Breakdown ===\n");
-    let lang_rows =
-        gq.raw_query("MATCH (m:Module) RETURN m.language, count(m) ORDER BY count(m) DESC")?;
-    if lang_rows.is_empty() {
+    if stats.languages.is_empty() {
         out.push_str("  (no modules indexed)\n");
     } else {
-        for row in &lang_rows {
-            out.push_str(&format!("  {:>20}: {} files\n", row[0], row[1]));
+        for l in &stats.languages {
+            out.push_str(&format!("  {:>20}: {} files\n", l.language, l.count));
         }
     }
 
-    // 2. Total symbols by kind
     out.push_str("\n=== Symbols by Kind ===\n");
-    let kind_rows =
-        gq.raw_query("MATCH (s:Symbol) RETURN s.kind, count(s) ORDER BY count(s) DESC")?;
-    if kind_rows.is_empty() {
+    if stats.kind_counts.is_empty() {
         out.push_str("  (no symbols indexed)\n");
     } else {
-        for row in &kind_rows {
-            out.push_str(&format!("  {:>20}: {}\n", row[0], row[1]));
+        for k in &stats.kind_counts {
+            out.push_str(&format!("  {:>20}: {}\n", k.kind, k.count));
         }
     }
 
-    // 3. Hotspots: files with most symbols
     out.push_str("\n=== Hotspot Files (most symbols) ===\n");
-    let hotspot_rows =
-        gq.raw_query("MATCH (s:Symbol) RETURN s.file, count(s) AS cnt ORDER BY cnt DESC LIMIT 10")?;
-    if hotspot_rows.is_empty() {
+    if stats.hotspot_files.is_empty() {
         out.push_str("  (no symbols indexed)\n");
     } else {
-        for (i, row) in hotspot_rows.iter().enumerate() {
+        for (i, h) in stats.hotspot_files.iter().enumerate() {
             out.push_str(&format!(
                 "  {:>2}. {:60} {} symbols\n",
                 i + 1,
-                row[0],
-                row[1]
+                h.file,
+                h.count
             ));
         }
     }
 
-    // 4. Hub functions: most-called
     out.push_str("\n=== Hub Functions (most callers) ===\n");
-    let hub_rows = gq.raw_query(
-        "MATCH ()-[r:CALLS]->(s:Symbol) RETURN s.name, s.file, count(r) AS calls ORDER BY calls DESC LIMIT 10",
-    )?;
-    if hub_rows.is_empty() {
+    if stats.hub_functions.is_empty() {
         out.push_str("  (no call edges found)\n");
     } else {
-        for (i, row) in hub_rows.iter().enumerate() {
+        for (i, h) in stats.hub_functions.iter().enumerate() {
             out.push_str(&format!(
                 "  {:>2}. {:30} {:40} {} callers\n",
                 i + 1,
-                row[0],
-                row[1],
-                row[2]
+                h.name,
+                h.file,
+                h.calls
             ));
         }
     }
 
-    // 5. Entry points: functions that call others but are not called themselves
     out.push_str("\n=== Entry Points (call others, never called) ===\n");
-    let entry_rows = gq.raw_query(
-        "MATCH (s:Symbol)-[:CALLS]->() WHERE s.kind IN ['Function', 'Method'] AND NOT EXISTS { MATCH ()-[:CALLS]->(s) } RETURN DISTINCT s.name, s.kind, s.file ORDER BY s.file, s.name LIMIT 20",
-    )?;
-    if entry_rows.is_empty() {
+    if stats.entry_points.is_empty() {
         out.push_str("  (none found)\n");
     } else {
-        for row in &entry_rows {
-            out.push_str(&format!("  {:>8} {:30} {}\n", row[1], row[0], row[2]));
+        for row in &stats.entry_points {
+            out.push_str(&format!("  {:>8} {:30} {}\n", row.kind, row.name, row.file));
         }
     }
 
@@ -185,10 +155,8 @@ pub fn build_architecture_report(gq: &infigraph_core::graph::GraphQuery) -> Resu
 
 pub fn tool_detect_clusters(args: &Value) -> Result<String> {
     let prism = open_prism(args)?;
-    let store = prism.store().context("not initialized")?;
-    let _lock = store.write_lock()?;
-    let conn = store.connection()?;
+    let backend = prism.backend().context("not initialized")?;
 
-    let stats = infigraph_core::cluster::detect_clusters(&conn)?;
+    let stats = infigraph_core::cluster::detect_clusters(backend)?;
     Ok(format!("{}", stats))
 }

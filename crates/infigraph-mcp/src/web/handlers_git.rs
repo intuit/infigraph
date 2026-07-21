@@ -1,7 +1,5 @@
 use serde_json::{json, Value};
 
-use infigraph_core::graph::GraphQuery;
-
 use super::open_prism;
 
 pub(crate) fn api_git_summary(params: &Value) -> Value {
@@ -12,15 +10,10 @@ pub(crate) fn api_git_summary(params: &Value) -> Value {
     match open_prism(params) {
         Ok(prism) => {
             let root = prism.root().to_path_buf();
-            let store = match prism.store() {
-                Some(s) => s,
+            let backend = match prism.backend() {
+                Some(b) => b,
                 None => return json!({"error":"not initialized"}),
             };
-            let conn = match store.connection() {
-                Ok(c) => c,
-                Err(e) => return json!({"error":e.to_string()}),
-            };
-            let gq = GraphQuery::new(&conn);
 
             let n_arg = format!("-{}", n);
             let log_out = std::process::Command::new("git")
@@ -62,7 +55,7 @@ pub(crate) fn api_git_summary(params: &Value) -> Value {
                 let mut touched: Vec<Value> = Vec::new();
                 let mut seen = std::collections::HashSet::new();
                 for (file, start, end) in &hunks {
-                    if let Ok(syms) = gq.symbols_in_range(file, *start, *end) {
+                    if let Ok(syms) = backend.symbols_in_range(file, *start, *end) {
                         for s in syms {
                             if seen.insert(s.id.clone()) {
                                 touched.push(json!({"id":s.id,"name":s.name,"kind":s.kind,"file":s.file,"line":s.start_line}));

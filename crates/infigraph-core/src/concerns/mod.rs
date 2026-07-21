@@ -1,7 +1,7 @@
 use anyhow::Result;
 use serde::Serialize;
 
-use crate::graph::GraphStore;
+use crate::graph::GraphBackend;
 
 #[derive(Debug, Clone, Serialize)]
 pub struct ConcernMatch {
@@ -221,13 +221,9 @@ static CONCERN_PATTERNS: &[ConcernPattern] = &[
     },
 ];
 
-pub fn detect_cross_cutting(store: &GraphStore) -> Result<Vec<ConcernMatch>> {
-    let _lock = store.write_lock()?;
-    let conn = store.connection()?;
-
-    let result = conn
-        .query("MATCH (s:Symbol) WHERE s.docstring IS NOT NULL AND s.docstring <> '' RETURN s.id, s.docstring")
-        .map_err(|e| anyhow::anyhow!("query failed: {e}"))?;
+pub fn detect_cross_cutting(backend: &dyn GraphBackend) -> Result<Vec<ConcernMatch>> {
+    let result = backend
+        .raw_query("MATCH (s:Symbol) WHERE s.docstring IS NOT NULL AND s.docstring <> '' RETURN s.id, s.docstring")?;
 
     let mut matches = Vec::new();
 
@@ -254,7 +250,7 @@ pub fn detect_cross_cutting(store: &GraphStore) -> Result<Vec<ConcernMatch>> {
     }
 
     if !matches.is_empty() {
-        write_concerns(store, &matches)?;
+        write_concerns(backend, &matches)?;
     }
 
     Ok(matches)
@@ -269,14 +265,10 @@ fn extract_matched_line(docstring: &str, pattern: &str) -> String {
     pattern.to_string()
 }
 
-fn write_concerns(store: &GraphStore, matches: &[ConcernMatch]) -> Result<()> {
-    let conn = store.connection()?;
+fn write_concerns(backend: &dyn GraphBackend, matches: &[ConcernMatch]) -> Result<()> {
+    backend.raw_query("BEGIN TRANSACTION")?;
 
-    conn.query("BEGIN TRANSACTION")
-        .map_err(|e| anyhow::anyhow!("begin txn: {e}"))?;
-
-    // Clear old concern data
-    let _ = conn.query("MATCH (c:Concern) DETACH DELETE c");
+    let _ = backend.raw_query("MATCH (c:Concern) DETACH DELETE c");
 
     for m in matches {
         let sym_esc = crate::escape_str(&m.symbol_id);
@@ -285,16 +277,15 @@ fn write_concerns(store: &GraphStore, matches: &[ConcernMatch]) -> Result<()> {
         let concern_id = format!("{}::{}", m.symbol_id, m.kind);
         let id_esc = crate::escape_str(&concern_id);
 
-        let _ = conn.query(&format!(
+        let _ = backend.raw_query(&format!(
             "CREATE (c:Concern {{id: '{id_esc}', kind: '{kind_esc}', detail: '{detail_esc}'}})"
         ));
-        let _ = conn.query(&format!(
+        let _ = backend.raw_query(&format!(
             "MATCH (s:Symbol), (c:Concern) WHERE s.id = '{sym_esc}' AND c.id = '{id_esc}' CREATE (s)-[:HAS_CONCERN]->(c)"
         ));
     }
 
-    conn.query("COMMIT")
-        .map_err(|e| anyhow::anyhow!("commit txn: {e}"))?;
+    backend.raw_query("COMMIT")?;
 
     Ok(())
 }

@@ -4,7 +4,6 @@ use std::path::Path;
 use anyhow::{Context, Result};
 use serde::{Deserialize, Serialize};
 
-use crate::graph::GraphQuery;
 use crate::lang::LanguageRegistry;
 use crate::Infigraph;
 
@@ -142,18 +141,13 @@ pub fn detect_cross_service_deps(
         let mut prism = Infigraph::open(&entry.path, lang_registry)?;
         prism.init()?;
 
-        let store = match prism.store() {
-            Some(s) => s,
+        let backend = match prism.backend() {
+            Some(b) => b,
             None => continue,
         };
-        let conn = match store.connection() {
-            Ok(c) => c,
-            Err(_) => continue,
-        };
-        let gq = GraphQuery::new(&conn);
 
         // Find symbols with URL-like strings in docstrings or search source files
-        let rows = gq.raw_query(
+        let rows = backend.raw_query(
             "MATCH (s:Symbol) WHERE s.docstring IS NOT NULL AND (s.docstring CONTAINS '/api/' OR s.docstring CONTAINS '/v1/' OR s.docstring CONTAINS '/v2/' OR s.docstring CONTAINS '/v3/' OR s.docstring CONTAINS 'http://' OR s.docstring CONTAINS 'https://') RETURN s.id, s.name, s.file, s.docstring",
         ).unwrap_or_default();
 
@@ -207,7 +201,8 @@ pub fn detect_cross_service_deps(
                             "MATCH (s:Symbol) WHERE s.file = '{}' AND s.start_line <= {} AND s.end_line >= {} RETURN s.id ORDER BY (s.end_line - s.start_line) ASC LIMIT 1",
                             escaped_file, line_num, line_num
                         );
-                        gq.raw_query(&q)
+                        backend
+                            .raw_query(&q)
                             .ok()
                             .and_then(|rows| rows.into_iter().next())
                             .and_then(|row| row.into_iter().next())
@@ -245,7 +240,8 @@ pub fn detect_cross_service_deps(
                     "MATCH (s:Symbol) WHERE s.file = '{}' AND s.start_line <= {} AND s.end_line >= {} RETURN s.id ORDER BY (s.end_line - s.start_line) ASC LIMIT 1",
                     escaped_file, line_num, line_num
                 );
-                gq.raw_query(&q)
+                backend
+                    .raw_query(&q)
                     .ok()
                     .and_then(|rows| rows.into_iter().next())
                     .and_then(|row| row.into_iter().next())
@@ -290,22 +286,18 @@ pub fn detect_cross_service_deps(
                     let line_num: i32 = stripped.parse().unwrap_or(0);
                     if let Ok(mut prism) = Infigraph::open(&entry.path, lang_registry) {
                         if prism.init().is_ok() {
-                            if let Some(store) = prism.store() {
-                                if let Ok(conn) = store.connection() {
-                                    let gq = GraphQuery::new(&conn);
-                                    let escaped_file = file.replace('\'', "\\'");
-                                    let q = format!(
-                                        "MATCH (s:Symbol) WHERE s.file = '{}' AND s.start_line <= {} AND s.end_line >= {} RETURN s.id ORDER BY (s.end_line - s.start_line) ASC LIMIT 1",
-                                        escaped_file, line_num, line_num
-                                    );
-                                    gq.raw_query(&q)
-                                        .ok()
-                                        .and_then(|rows| rows.into_iter().next())
-                                        .and_then(|row| row.into_iter().next())
-                                        .unwrap_or_else(|| format!("{}:{}", file, symbol_hint))
-                                } else {
-                                    format!("{}:{}", file, symbol_hint)
-                                }
+                            if let Some(backend) = prism.backend() {
+                                let escaped_file = file.replace('\'', "\\'");
+                                let q = format!(
+                                    "MATCH (s:Symbol) WHERE s.file = '{}' AND s.start_line <= {} AND s.end_line >= {} RETURN s.id ORDER BY (s.end_line - s.start_line) ASC LIMIT 1",
+                                    escaped_file, line_num, line_num
+                                );
+                                backend
+                                    .raw_query(&q)
+                                    .ok()
+                                    .and_then(|rows| rows.into_iter().next())
+                                    .and_then(|row| row.into_iter().next())
+                                    .unwrap_or_else(|| format!("{}:{}", file, symbol_hint))
                             } else {
                                 format!("{}:{}", file, symbol_hint)
                             }
@@ -351,8 +343,8 @@ pub fn detect_cross_service_deps(
                 let lang_reg = build_registry()?;
                 if let Ok(mut prism) = Infigraph::open(&entry.path, lang_reg) {
                     if prism.init().is_ok() {
-                        if let Some(store) = prism.store() {
-                            if let Ok(member_deps) = crate::manifest::query_deps(store) {
+                        if let Some(backend) = prism.backend() {
+                            if let Ok(member_deps) = crate::manifest::query_deps(backend) {
                                 for dep in &member_deps {
                                     if let Some(target_svc) = pkg_name_to_service.get(&dep.name) {
                                         if target_svc != repo_name {
@@ -534,19 +526,10 @@ pub fn link_cross_service_calls(
         let mut prism = Infigraph::open(&entry.path, lang_registry)?;
         prism.init()?;
 
-        let store = match prism.store() {
-            Some(s) => s,
+        let backend = match prism.backend() {
+            Some(b) => b,
             None => continue,
         };
-        let _lock = match store.write_lock() {
-            Ok(l) => l,
-            Err(_) => continue,
-        };
-        let conn = match store.connection() {
-            Ok(c) => c,
-            Err(_) => continue,
-        };
-        let gq = GraphQuery::new(&conn);
 
         for dep in svc_deps {
             let target_id = format!(
@@ -579,14 +562,14 @@ pub fn link_cross_service_calls(
                  t.parent = '', t.docstring = '{}', t.complexity = 0",
                 target_id, target_name, docstring,
             );
-            let _ = gq.raw_query(&create_target);
+            let _ = backend.raw_query(&create_target);
 
             // Check if edge already exists before creating (idempotent)
             let check_edge = format!(
                 "MATCH (caller:Symbol {{id: '{}'}})-[:CALLS_SERVICE]->(target:Symbol {{id: '{}'}}) RETURN caller.id",
                 caller_sym, target_id,
             );
-            let existing = gq.raw_query(&check_edge).unwrap_or_default();
+            let existing = backend.raw_query(&check_edge).unwrap_or_default();
             if !existing.is_empty() {
                 continue;
             }
@@ -596,7 +579,7 @@ pub fn link_cross_service_calls(
                  CREATE (caller)-[:CALLS_SERVICE {{method: '{}', path: '{}', target_service: '{}'}}]->(target)",
                 caller_sym, target_id, target_method, target_path, target_svc,
             );
-            if gq.raw_query(&create_edge).is_ok() {
+            if backend.raw_query(&create_edge).is_ok() {
                 total += 1;
             }
         }
@@ -633,19 +616,10 @@ pub fn link_cross_service_calls(
             let lang_registry = build_registry()?;
             let mut prism = Infigraph::open(&entry.path, lang_registry)?;
             prism.init()?;
-            let store = match prism.store() {
-                Some(s) => s,
+            let backend = match prism.backend() {
+                Some(b) => b,
                 None => continue,
             };
-            let _lock = match store.write_lock() {
-                Ok(l) => l,
-                Err(_) => continue,
-            };
-            let conn = match store.connection() {
-                Ok(c) => c,
-                Err(_) => continue,
-            };
-            let gq = GraphQuery::new(&conn);
 
             // Scan source files for import statements matching the package
             let import_hits =
@@ -657,7 +631,7 @@ pub fn link_cross_service_calls(
                      RETURN s.id ORDER BY (s.end_line - s.start_line) ASC LIMIT 1",
                     escaped_file, line_num, line_num
                 );
-                let caller_sym = gq
+                let caller_sym = backend
                     .raw_query(&q)
                     .ok()
                     .and_then(|rows| rows.into_iter().next())
@@ -668,7 +642,7 @@ pub fn link_cross_service_calls(
                             "MATCH (s:Symbol) WHERE s.file = '{}' RETURN s.id ORDER BY s.start_line ASC LIMIT 1",
                             escaped_file
                         );
-                        gq.raw_query(&fallback_q)
+                        backend.raw_query(&fallback_q)
                             .ok()
                             .and_then(|rows| rows.into_iter().next())
                             .and_then(|row| row.into_iter().next())
@@ -688,13 +662,13 @@ pub fn link_cross_service_calls(
                      t.parent = '', t.docstring = 'Shared package: {}', t.complexity = 0",
                     target_id, target_name, pkg_name,
                 );
-                let _ = gq.raw_query(&create_target);
+                let _ = backend.raw_query(&create_target);
 
                 let check_edge = format!(
                     "MATCH (a:Symbol {{id: '{}'}})-[:CALLS_SERVICE]->(b:Symbol {{id: '{}'}}) RETURN a.id",
                     caller_sym, target_id,
                 );
-                let existing = gq.raw_query(&check_edge).unwrap_or_default();
+                let existing = backend.raw_query(&check_edge).unwrap_or_default();
                 if !existing.is_empty() {
                     continue;
                 }
@@ -704,7 +678,7 @@ pub fn link_cross_service_calls(
                      CREATE (a)-[:CALLS_SERVICE {{method: 'package', path: '{}', target_service: '{}'}}]->(b)",
                     caller_sym, target_id, pkg_name, publisher,
                 );
-                if gq.raw_query(&create_edge).is_ok() {
+                if backend.raw_query(&create_edge).is_ok() {
                     total += 1;
                 }
             }
@@ -1605,17 +1579,12 @@ pub fn detect_shared_package_deps(
         let mut prism = Infigraph::open(&entry.path, lang_registry)?;
         prism.init()?;
 
-        let store = match prism.store() {
-            Some(s) => s,
+        let backend = match prism.backend() {
+            Some(b) => b,
             None => continue,
         };
-        let conn = match store.connection() {
-            Ok(c) => c,
-            Err(_) => continue,
-        };
-        let gq = GraphQuery::new(&conn);
 
-        let dep_rows = gq
+        let dep_rows = backend
             .raw_query("MATCH (d:Dependency) RETURN d.name, d.version")
             .unwrap_or_default();
 

@@ -1,4 +1,3 @@
-use std::collections::HashSet;
 use std::path::Path;
 
 use anyhow::{Context, Result};
@@ -10,92 +9,69 @@ pub(crate) fn cmd_architecture(root: &Path) -> Result<()> {
     let mut prism = Infigraph::open(root, registry)?;
     prism.init()?;
 
-    let store = prism.store().context("graph not initialized")?;
-    let conn = store.connection()?;
-    let gq = infigraph_core::graph::GraphQuery::new(&conn);
+    let backend = prism.backend().context("graph not initialized")?;
+    let arch = backend.get_architecture_stats()?;
 
-    let report = build_architecture_report(&gq)?;
-    println!("{}", report);
-    Ok(())
-}
-
-fn build_architecture_report(gq: &infigraph_core::graph::GraphQuery) -> Result<String> {
     let mut out = String::new();
 
-    // 1. Language breakdown
     out.push_str("=== Language Breakdown ===\n");
-    let lang_rows =
-        gq.raw_query("MATCH (m:Module) RETURN m.language, count(m) ORDER BY count(m) DESC")?;
-    if lang_rows.is_empty() {
+    if arch.languages.is_empty() {
         out.push_str("  (no modules indexed)\n");
     } else {
-        for row in &lang_rows {
-            out.push_str(&format!("  {:>20}: {} files\n", row[0], row[1]));
+        for l in &arch.languages {
+            out.push_str(&format!("  {:>20}: {} files\n", l.language, l.count));
         }
     }
 
-    // 2. Total symbols by kind
     out.push_str("\n=== Symbols by Kind ===\n");
-    let kind_rows =
-        gq.raw_query("MATCH (s:Symbol) RETURN s.kind, count(s) ORDER BY count(s) DESC")?;
-    if kind_rows.is_empty() {
+    if arch.kind_counts.is_empty() {
         out.push_str("  (no symbols indexed)\n");
     } else {
-        for row in &kind_rows {
-            out.push_str(&format!("  {:>20}: {}\n", row[0], row[1]));
+        for k in &arch.kind_counts {
+            out.push_str(&format!("  {:>20}: {}\n", k.kind, k.count));
         }
     }
 
-    // 3. Hotspots: files with most symbols
     out.push_str("\n=== Hotspot Files (most symbols) ===\n");
-    let hotspot_rows =
-        gq.raw_query("MATCH (s:Symbol) RETURN s.file, count(s) AS cnt ORDER BY cnt DESC LIMIT 10")?;
-    if hotspot_rows.is_empty() {
+    if arch.hotspot_files.is_empty() {
         out.push_str("  (no symbols indexed)\n");
     } else {
-        for (i, row) in hotspot_rows.iter().enumerate() {
+        for (i, h) in arch.hotspot_files.iter().enumerate() {
             out.push_str(&format!(
                 "  {:>2}. {:60} {} symbols\n",
                 i + 1,
-                row[0],
-                row[1]
+                h.file,
+                h.count
             ));
         }
     }
 
-    // 4. Hub functions: most-called
     out.push_str("\n=== Hub Functions (most callers) ===\n");
-    let hub_rows = gq.raw_query(
-        "MATCH ()-[r:CALLS]->(s:Symbol) RETURN s.name, s.file, count(r) AS calls ORDER BY calls DESC LIMIT 10",
-    )?;
-    if hub_rows.is_empty() {
+    if arch.hub_functions.is_empty() {
         out.push_str("  (no call edges found)\n");
     } else {
-        for (i, row) in hub_rows.iter().enumerate() {
+        for (i, h) in arch.hub_functions.iter().enumerate() {
             out.push_str(&format!(
                 "  {:>2}. {:30} {:40} {} callers\n",
                 i + 1,
-                row[0],
-                row[1],
-                row[2]
+                h.name,
+                h.file,
+                h.calls
             ));
         }
     }
 
-    // 5. Entry points: functions that call others but are not called themselves
     out.push_str("\n=== Entry Points (call others, never called) ===\n");
-    let entry_rows = gq.raw_query(
-        "MATCH (s:Symbol)-[:CALLS]->() WHERE s.kind IN ['Function', 'Method'] AND NOT EXISTS { MATCH ()-[:CALLS]->(s) } RETURN DISTINCT s.name, s.kind, s.file ORDER BY s.file, s.name LIMIT 20",
-    )?;
-    if entry_rows.is_empty() {
+    if arch.entry_points.is_empty() {
         out.push_str("  (none found)\n");
     } else {
-        for row in &entry_rows {
-            out.push_str(&format!("  {:>8} {:30} {}\n", row[1], row[0], row[2]));
+        for e in &arch.entry_points {
+            out.push_str(&format!("  {:>8} {:30} {}\n", e.kind, e.name, e.file));
         }
     }
 
-    Ok(out)
+    println!("{}", out);
+    Ok(())
 }
 
 pub(crate) fn cmd_cluster(root: &Path) -> Result<()> {
@@ -103,12 +79,10 @@ pub(crate) fn cmd_cluster(root: &Path) -> Result<()> {
     let mut prism = Infigraph::open(root, registry)?;
     prism.init()?;
 
-    let store = prism.store().context("graph not initialized")?;
-    let _lock = store.write_lock()?;
-    let conn = store.connection()?;
+    let backend = prism.backend().context("graph not initialized")?;
 
     println!("Running Louvain community detection...");
-    let stats = infigraph_core::cluster::detect_clusters(&conn)?;
+    let stats = infigraph_core::cluster::detect_clusters(backend)?;
     println!("{}", stats);
     Ok(())
 }
@@ -118,149 +92,15 @@ pub(crate) fn cmd_detect_changes(root: &Path, base: &str, depth: u32) -> Result<
     let mut prism = Infigraph::open(root, registry)?;
     prism.init()?;
 
-    let store = prism.store().context("graph not initialized")?;
-    let conn = store.connection()?;
-    let gq = infigraph_core::graph::GraphQuery::new(&conn);
-
-    let report = build_detect_changes_report(prism.root(), &gq, base, depth)?;
+    let backend = prism.backend().context("graph not initialized")?;
+    let report = infigraph_mcp::tools::analysis::git::build_detect_changes_report(
+        prism.root(),
+        backend,
+        base,
+        depth,
+    )?;
     println!("{}", report);
     Ok(())
-}
-
-/// Parse git diff output and map changed lines to symbols in the graph.
-fn build_detect_changes_report(
-    project_root: &std::path::Path,
-    gq: &infigraph_core::graph::GraphQuery,
-    base: &str,
-    depth: u32,
-) -> Result<String> {
-    // 1. Get changed files
-    let name_output = std::process::Command::new("git")
-        .args(["diff", "--name-only", base])
-        .current_dir(project_root)
-        .output()
-        .context("failed to run git diff --name-only")?;
-
-    if !name_output.status.success() {
-        let stderr = String::from_utf8_lossy(&name_output.stderr);
-        anyhow::bail!("git diff failed: {}", stderr.trim());
-    }
-
-    let changed_files: Vec<String> = String::from_utf8_lossy(&name_output.stdout)
-        .lines()
-        .filter(|l| !l.is_empty())
-        .map(|l| l.to_string())
-        .collect();
-
-    if changed_files.is_empty() {
-        return Ok("No changes detected.".to_string());
-    }
-
-    // 2. Get unified diff with zero context to extract changed line ranges
-    let diff_output = std::process::Command::new("git")
-        .args(["diff", "--unified=0", base])
-        .current_dir(project_root)
-        .output()
-        .context("failed to run git diff --unified=0")?;
-
-    let diff_text = String::from_utf8_lossy(&diff_output.stdout);
-    let hunks = parse_diff_hunks(&diff_text);
-
-    // 3. For each changed file+range, find overlapping symbols
-    let mut directly_changed: Vec<(String, String, String, u32, u32)> = Vec::new();
-    let mut seen_ids: HashSet<String> = HashSet::new();
-
-    for (file, start, end) in &hunks {
-        let symbols = gq.symbols_in_range(file, *start, *end)?;
-        for s in symbols {
-            if seen_ids.insert(s.id.clone()) {
-                directly_changed.push((s.id, s.name, s.file, s.start_line, s.end_line));
-            }
-        }
-    }
-
-    let mut out = String::new();
-    out.push_str(&format!("=== Change Detection (base: {}) ===\n\n", base));
-    out.push_str(&format!("Changed files: {}\n", changed_files.len()));
-    for f in &changed_files {
-        out.push_str(&format!("  {}\n", f));
-    }
-
-    out.push_str(&format!(
-        "\n=== Directly Changed Symbols ({}) ===\n",
-        directly_changed.len()
-    ));
-    if directly_changed.is_empty() {
-        out.push_str("  (no indexed symbols overlap with changed lines)\n");
-    } else {
-        for (id, name, file, start, end) in &directly_changed {
-            out.push_str(&format!("  {:30} {} L{}-{}\n", name, file, start, end));
-            let _ = id;
-        }
-    }
-
-    // 4. Compute blast radius via transitive impact for each directly changed symbol
-    if !directly_changed.is_empty() && depth > 0 {
-        let mut indirectly_affected: Vec<(String, String, String, String)> = Vec::new();
-        let mut indirect_ids: HashSet<String> = HashSet::new();
-
-        for (id, _, _, _, _) in &directly_changed {
-            if let Ok(impacted) = gq.transitive_impact(id, depth) {
-                for row in impacted {
-                    if !seen_ids.contains(&row.id) && indirect_ids.insert(row.id.clone()) {
-                        indirectly_affected.push((row.id, row.name, row.file, row.kind));
-                    }
-                }
-            }
-        }
-
-        out.push_str(&format!(
-            "\n=== Blast Radius (depth={}, {} indirectly affected) ===\n",
-            depth,
-            indirectly_affected.len()
-        ));
-        if indirectly_affected.is_empty() {
-            out.push_str("  (no additional symbols affected)\n");
-        } else {
-            for (_, name, file, kind) in &indirectly_affected {
-                out.push_str(&format!("  {:>8} {:30} {}\n", kind, name, file));
-            }
-        }
-    }
-
-    Ok(out)
-}
-
-/// Parse unified diff output (with --unified=0) to extract (file, start_line, end_line) hunks.
-fn parse_diff_hunks(diff: &str) -> Vec<(String, u32, u32)> {
-    let mut hunks = Vec::new();
-    let mut current_file = String::new();
-
-    for line in diff.lines() {
-        if let Some(path) = line.strip_prefix("+++ b/") {
-            current_file = path.to_string();
-            continue;
-        }
-
-        if line.starts_with("@@") && !current_file.is_empty() {
-            if let Some(plus_part) = line.split('+').nth(1) {
-                let range_part = plus_part.split(' ').next().unwrap_or("");
-                let parts: Vec<&str> = range_part.split(',').collect();
-                let start: u32 = parts[0].parse().unwrap_or(0);
-                let count: u32 = if parts.len() > 1 {
-                    parts[1].parse().unwrap_or(1)
-                } else {
-                    1
-                };
-                if start > 0 {
-                    let end = if count == 0 { start } else { start + count - 1 };
-                    hunks.push((current_file.clone(), start, end));
-                }
-            }
-        }
-    }
-
-    hunks
 }
 
 pub(crate) fn cmd_security(
@@ -291,54 +131,35 @@ pub(crate) fn cmd_complexity(root: &Path, threshold: u32, file: Option<&str>) ->
     let mut prism = Infigraph::open(root, registry)?;
     prism.init()?;
 
-    let store = prism.store().context("graph not initialized")?;
-    let conn = store.connection()?;
-    let gq = infigraph_core::graph::GraphQuery::new(&conn);
-
-    let base_q = if let Some(f) = file {
-        format!(
-            "MATCH (s:Symbol) WHERE (s.kind = 'Function' OR s.kind = 'Method' OR s.kind = 'Test') AND s.file CONTAINS '{}' RETURN s.name, s.file, s.start_line, s.complexity ORDER BY s.complexity DESC",
-            f.replace('\'', "\\'")
-        )
-    } else {
-        "MATCH (s:Symbol) WHERE (s.kind = 'Function' OR s.kind = 'Method' OR s.kind = 'Test') RETURN s.name, s.file, s.start_line, s.complexity ORDER BY s.complexity DESC".to_string()
-    };
-
-    let rows = gq.raw_query(&base_q)?;
+    let backend = prism.backend().context("graph not initialized")?;
+    let rows = backend.get_complexity_ranking(file)?;
     if rows.is_empty() {
         println!("No symbols found. Run 'infigraph index' first.");
         return Ok(());
     }
 
-    let total: u32 = rows
-        .iter()
-        .filter_map(|r| r.get(3).and_then(|v| v.parse::<u32>().ok()))
-        .sum();
+    let total: u32 = rows.iter().map(|r| r.complexity).sum();
     let avg = total as f64 / rows.len() as f64;
-    let hotspots: Vec<_> = rows
-        .iter()
-        .filter(|r| r.get(3).and_then(|v| v.parse::<u32>().ok()).unwrap_or(0) >= threshold)
-        .collect();
+    let hotspot_count = rows.iter().filter(|r| r.complexity >= threshold).count();
 
     println!(
         "Complexity: {} symbols, avg {:.1}, {} hotspots (>= {})\n",
         rows.len(),
         avg,
-        hotspots.len(),
+        hotspot_count,
         threshold
     );
 
-    for row in rows.iter().take(30) {
-        let name = row.first().map(|s| s.as_str()).unwrap_or("?");
-        let file = row.get(1).map(|s| s.as_str()).unwrap_or("?");
-        let line = row.get(2).map(|s| s.as_str()).unwrap_or("?");
-        let cplx = row.get(3).map(|s| s.as_str()).unwrap_or("0");
-        let flag = if cplx.parse::<u32>().unwrap_or(0) >= threshold {
+    for r in rows.iter().take(30) {
+        let flag = if r.complexity >= threshold {
             " ⚠"
         } else {
             ""
         };
-        println!("  [{cplx:>3}] {name}  ({file}:{line}){flag}");
+        println!(
+            "  [{:>3}] {}  ({}:{}){}",
+            r.complexity, r.name, r.file, r.start_line, flag
+        );
     }
     Ok(())
 }
@@ -353,8 +174,7 @@ pub(crate) fn cmd_refactor(
     let mut prism = Infigraph::open(root, registry)?;
     prism.init()?;
 
-    let store = prism.store().context("not initialized")?;
-    let conn = store.connection()?;
+    let backend = prism.backend().context("not initialized")?;
 
     let emb_path = root.join(".infigraph").join("embeddings.bin");
     let emb_ref = if emb_path.exists() {
@@ -364,7 +184,7 @@ pub(crate) fn cmd_refactor(
     };
 
     let focus = infigraph_core::refactor::Focus::parse(focus);
-    let recs = infigraph_core::refactor::analyze(&conn, emb_ref, target, focus, limit)?;
+    let recs = infigraph_core::refactor::analyze(backend, emb_ref, target, focus, limit)?;
     print!(
         "{}",
         infigraph_core::refactor::format_recommendations(&recs, target)
@@ -384,10 +204,8 @@ pub(crate) fn cmd_sequence(root: &Path, symbol_id: &str, depth: u32) -> Result<(
     let registry = bundled_registry()?;
     let mut prism = Infigraph::open(root, registry)?;
     prism.init()?;
-    let store = prism.store().context("not initialized")?;
-    let conn = store.connection()?;
-    let gq = infigraph_core::graph::GraphQuery::new(&conn);
-    let diagram = infigraph_core::sequence::generate_sequence_mermaid(&gq, symbol_id, depth)?;
+    let backend = prism.backend().context("not initialized")?;
+    let diagram = infigraph_core::sequence::generate_sequence_mermaid(backend, symbol_id, depth)?;
     println!("{}", diagram);
     Ok(())
 }
@@ -406,8 +224,8 @@ pub(crate) fn cmd_review(
     let registry = bundled_registry()?;
     let mut prism = Infigraph::open(root, registry)?;
     prism.init()?;
-    let store = prism
-        .store()
+    let backend = prism
+        .backend()
         .context("graph not initialized -- run 'infigraph index' first")?;
 
     let report = if let Some(group_name) = group {
@@ -417,13 +235,13 @@ pub(crate) fn cmd_review(
             base,
             limit,
             prism.registry(),
-            store,
+            backend,
             group_name,
             &multi_reg,
             bundled_registry,
         )?
     } else {
-        infigraph_core::review::review(root, base, limit, prism.registry(), store)?
+        infigraph_core::review::review(root, base, limit, prism.registry(), backend)?
     };
 
     if json && !llm {
@@ -434,7 +252,7 @@ pub(crate) fn cmd_review(
 
     if llm || dry_run {
         use infigraph_core::review::llm;
-        let (prompt, result) = llm::review_with_llm(root, &report, store, dry_run, context)?;
+        let (prompt, result) = llm::review_with_llm(root, &report, backend, dry_run, context)?;
 
         if dry_run {
             println!("{}", prompt);
@@ -462,8 +280,8 @@ pub(crate) fn cmd_check(
     let registry = bundled_registry()?;
     let mut prism = Infigraph::open(root, registry)?;
     prism.init()?;
-    let store = prism
-        .store()
+    let backend = prism
+        .backend()
         .context("graph not initialized -- run 'infigraph index' first")?;
 
     let config_path = config
@@ -476,7 +294,7 @@ pub(crate) fn cmd_check(
         None => CheckSelection::all(),
     };
 
-    let results = check::run_checks(root, &cfg, store, &selection);
+    let results = check::run_checks(root, &cfg, backend, &selection);
 
     if json {
         println!("{}", check::format_json(&results));
@@ -497,9 +315,9 @@ pub(crate) fn cmd_vulns(
     let registry = bundled_registry()?;
     let mut prism = Infigraph::open(root, registry)?;
     prism.init()?;
-    let store = prism.store().context("graph not initialized")?;
+    let backend = prism.backend().context("graph not initialized")?;
 
-    let deps = infigraph_core::manifest::query_deps(store)?;
+    let deps = infigraph_core::manifest::query_deps(backend)?;
     if deps.is_empty() {
         println!("No dependencies found. Run 'infigraph index-manifests' first.");
         return Ok(());
@@ -532,11 +350,11 @@ pub(crate) fn cmd_detect_patterns(root: &Path, pattern: Option<&str>, json: bool
     let registry = bundled_registry()?;
     let mut prism = Infigraph::open(root, registry)?;
     prism.init()?;
-    let store = prism
-        .store()
+    let backend = prism
+        .backend()
         .context("graph not initialized -- run 'infigraph index' first")?;
 
-    let report = infigraph_core::patterns::detect_filtered(store, pattern)?;
+    let report = infigraph_core::patterns::detect_filtered(backend, pattern)?;
 
     if json {
         println!("{}", infigraph_core::patterns::format_json(&report));
@@ -615,23 +433,13 @@ pub(crate) fn cmd_clones(root: &Path, threshold: f64, limit: usize) -> Result<()
     let mut prism = Infigraph::open(root, registry)?;
     prism.init()?;
 
-    let store = prism.store().context("graph not initialized")?;
-    let conn = store.connection()?;
-    let gq = infigraph_core::graph::GraphQuery::new(&conn);
+    let backend = prism.backend().context("graph not initialized")?;
 
     let threshold_f32 = threshold as f32;
-    let kinds = ["Function", "Method"];
-    let kind_filter = kinds
-        .iter()
-        .map(|k| format!("s.kind = '{}'", k))
-        .collect::<Vec<_>>()
-        .join(" OR ");
-    let query = format!(
-        "MATCH (s:Symbol) WHERE ({kind_filter}) RETURN s.id, s.name, s.kind, s.file, s.docstring"
-    );
-    let rows = gq.raw_query(&query)?;
+    let kinds: Vec<&str> = vec!["Function", "Method"];
+    let syms = backend.symbols_with_docstring(Some(&kinds))?;
 
-    if rows.len() < 2 {
+    if syms.len() < 2 {
         println!("Not enough symbols to compare. Run 'infigraph index' first.");
         return Ok(());
     }
@@ -647,20 +455,19 @@ pub(crate) fn cmd_clones(root: &Path, threshold: f64, limit: usize) -> Result<()
         std::collections::HashMap::new()
     };
 
-    let symbol_vecs: Vec<(String, String, String, Vec<f32>)> = rows
+    let symbol_vecs: Vec<(String, String, String, Vec<f32>)> = syms
         .iter()
-        .map(|row| {
-            let id = row[0].clone();
-            let text = if row.get(4).is_some_and(|s| !s.is_empty()) {
-                format!("{} {}: {}", row[2], row[1], row[4])
+        .map(|s| {
+            let text = if !s.docstring.is_empty() {
+                format!("{} {}: {}", s.kind, s.name, s.docstring)
             } else {
-                format!("{} {}", row[2], row[1])
+                format!("{} {}", s.kind, s.name)
             };
             let emb = cached
-                .get(&id)
+                .get(&s.id)
                 .cloned()
                 .unwrap_or_else(|| embedder.embed(&text).unwrap_or_default());
-            (id, row[1].clone(), row[3].clone(), emb)
+            (s.id.clone(), s.name.clone(), s.file.clone(), emb)
         })
         .filter(|(_, _, _, emb)| !emb.is_empty())
         .collect();
@@ -692,19 +499,8 @@ pub(crate) fn cmd_clones(root: &Path, threshold: f64, limit: usize) -> Result<()
         return Ok(());
     }
 
-    // Write SIMILAR_TO edges
-    let write_conn = store.connection()?;
     for (score, i, j) in &pairs {
-        let id_a = &symbol_vecs[*i].0;
-        let id_b = &symbol_vecs[*j].0;
-        let escape = |s: &str| s.replace('\'', "\\'");
-        let _ = write_conn.query(&format!(
-            "MATCH (a:Symbol), (b:Symbol) WHERE a.id = '{}' AND b.id = '{}' \
-             MERGE (a)-[r:SIMILAR_TO]->(b) SET r.score = {}",
-            escape(id_a),
-            escape(id_b),
-            score
-        ));
+        let _ = backend.upsert_similar_edge(&symbol_vecs[*i].0, &symbol_vecs[*j].0, *score);
     }
 
     println!(
@@ -731,8 +527,8 @@ pub(crate) fn cmd_concerns(root: &Path, kind: Option<&str>) -> Result<()> {
     let mut prism = Infigraph::open(root, registry)?;
     prism.init()?;
 
-    let store = prism.store().context("graph not initialized")?;
-    let matches = infigraph_core::concerns::detect_cross_cutting(store)?;
+    let backend = prism.backend().context("graph not initialized")?;
+    let matches = infigraph_core::concerns::detect_cross_cutting(backend)?;
 
     let filtered: Vec<_> = if let Some(k) = kind {
         let k_lower = k.to_lowercase();
@@ -758,8 +554,8 @@ pub(crate) fn cmd_config_bindings(
     let mut prism = Infigraph::open(root, registry)?;
     prism.init()?;
 
-    let store = prism.store().context("graph not initialized")?;
-    let bindings = infigraph_core::config::detect_config_bindings(store)?;
+    let backend = prism.backend().context("graph not initialized")?;
+    let bindings = infigraph_core::config::detect_config_bindings(backend)?;
     let canonical = root.canonicalize().context("invalid project root")?;
     let config_files = infigraph_core::config::detect_config_files(&canonical);
 
@@ -787,9 +583,9 @@ pub(crate) fn cmd_reflection(root: &Path, mechanism: Option<&str>) -> Result<()>
     let mut prism = Infigraph::open(root, registry)?;
     prism.init()?;
 
-    let store = prism.store().context("graph not initialized")?;
+    let backend = prism.backend().context("graph not initialized")?;
     let canonical = root.canonicalize().context("invalid project root")?;
-    let sites = infigraph_core::reflection::detect_reflection_sites(store, &canonical)?;
+    let sites = infigraph_core::reflection::detect_reflection_sites(backend, &canonical)?;
 
     let filtered: Vec<_> = if let Some(m) = mechanism {
         let m_lower = m.to_lowercase();
@@ -820,12 +616,12 @@ pub(crate) fn cmd_taint(
     let mut prism = Infigraph::open(root, registry)?;
     prism.init()?;
 
-    let store = prism.store().context("graph not initialized")?;
+    let backend = prism.backend().context("graph not initialized")?;
     let canonical = root.canonicalize().context("invalid project root")?;
 
     if inter {
         let flows = infigraph_core::taint::interprocedural::detect_interprocedural_taint(
-            store, &canonical, depth,
+            backend, &canonical, depth,
         )?;
 
         let filtered: Vec<_> = if let Some(c) = category {
@@ -844,7 +640,7 @@ pub(crate) fn cmd_taint(
             infigraph_core::taint::interprocedural::format_interprocedural_flows(&filtered)
         );
     } else {
-        let flows = infigraph_core::taint::detect_taint_flows(store, &canonical)?;
+        let flows = infigraph_core::taint::detect_taint_flows(backend, &canonical)?;
 
         let filtered: Vec<_> = flows
             .iter()
@@ -868,9 +664,9 @@ pub(crate) fn cmd_dynamic_urls(root: &Path) -> Result<()> {
     let mut prism = Infigraph::open(root, registry)?;
     prism.init()?;
 
-    let store = prism.store().context("graph not initialized")?;
+    let backend = prism.backend().context("graph not initialized")?;
     let canonical = root.canonicalize().context("invalid project root")?;
-    let urls = infigraph_core::taint::dynamic_urls::detect_dynamic_urls(store, &canonical)?;
+    let urls = infigraph_core::taint::dynamic_urls::detect_dynamic_urls(backend, &canonical)?;
 
     println!(
         "{}",
@@ -884,10 +680,10 @@ pub(crate) fn cmd_path_traversal(root: &Path, depth: u32) -> Result<()> {
     let mut prism = Infigraph::open(root, registry)?;
     prism.init()?;
 
-    let store = prism.store().context("graph not initialized")?;
+    let backend = prism.backend().context("graph not initialized")?;
     let canonical = root.canonicalize().context("invalid project root")?;
     let flows =
-        infigraph_core::taint::path_traversal::detect_path_traversal(store, &canonical, depth)?;
+        infigraph_core::taint::path_traversal::detect_path_traversal(backend, &canonical, depth)?;
 
     println!(
         "{}",
@@ -900,15 +696,13 @@ pub(crate) fn cmd_bridges_promote(root: &Path) -> Result<()> {
     let registry = bundled_registry()?;
     let mut prism = Infigraph::open(root, registry)?;
     prism.init()?;
-    let store = prism
-        .store()
+    let backend = prism
+        .backend()
         .context("graph not initialized -- run 'infigraph index' first")?;
-    let conn = store.connection()?;
-    let gq = infigraph_core::graph::GraphQuery::new(&conn);
 
     // Find BRIDGE_TO edges where both endpoints are resolved symbols, promote to CALLS
     let bridge_rows =
-        gq.raw_query("MATCH (a:Symbol)-[r:BRIDGE_TO]->(b:Symbol) RETURN a.id, b.id")?;
+        backend.raw_query("MATCH (a:Symbol)-[r:BRIDGE_TO]->(b:Symbol) RETURN a.id, b.id")?;
 
     if bridge_rows.is_empty() {
         println!("No BRIDGE_TO edges found to promote.");
@@ -917,7 +711,7 @@ pub(crate) fn cmd_bridges_promote(root: &Path) -> Result<()> {
 
     let count = bridge_rows.len();
     for row in &bridge_rows {
-        let _ = gq.raw_query(&format!(
+        let _ = backend.raw_query(&format!(
             "MATCH (a:Symbol {{id: '{}'}})-[r:BRIDGE_TO]->(b:Symbol {{id: '{}'}}) DELETE r CREATE (a)-[:CALLS]->(b)",
             row[0].replace('\'', "\\'"),
             row[1].replace('\'', "\\'"),

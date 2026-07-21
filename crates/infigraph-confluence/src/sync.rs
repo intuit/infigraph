@@ -4,9 +4,9 @@ use std::path::Path;
 use anyhow::{Context, Result};
 use sha2::{Digest, Sha256};
 
+use infigraph_docs::backend::DocBackend;
 use infigraph_docs::chunk::{chunk_document, Chunk, ChunkStrategy};
 use infigraph_docs::extract::{DocFormat, ExtractedDoc};
-use infigraph_docs::store::DocStore;
 
 use crate::client::{ConfluenceClient, ConfluencePage};
 
@@ -87,7 +87,7 @@ impl ConfluenceSync {
 
     pub fn sync(
         &self,
-        store: &DocStore,
+        store: &dyn DocBackend,
         root: &Path,
         page_ids: Option<&[String]>,
     ) -> Result<SyncResult> {
@@ -96,7 +96,7 @@ impl ConfluenceSync {
 
     pub fn sync_with_options(
         &self,
-        store: &DocStore,
+        store: &dyn DocBackend,
         root: &Path,
         page_ids: Option<&[String]>,
         crawl: &CrawlOptions,
@@ -128,7 +128,7 @@ impl ConfluenceSync {
         if !docs.is_empty() {
             let doc_refs: Vec<&ExtractedDoc> = docs.iter().collect();
             let chunk_refs: Vec<&Chunk> = all_chunks.iter().collect();
-            store.upsert_all_parquet(&doc_refs, &chunk_refs)?;
+            store.upsert_docs(&doc_refs, &chunk_refs)?;
 
             for doc in &docs {
                 store.link_doc_to_source(&doc.file, &self.source_id)?;
@@ -346,7 +346,11 @@ impl ConfluenceSync {
         (docs, all_chunks, page_links)
     }
 
-    fn remove_deleted_pages(&self, store: &DocStore, page_ids: Option<&[String]>) -> Result<usize> {
+    fn remove_deleted_pages(
+        &self,
+        store: &dyn DocBackend,
+        page_ids: Option<&[String]>,
+    ) -> Result<usize> {
         if page_ids.is_some() {
             return Ok(0);
         }
