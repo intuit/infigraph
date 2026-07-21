@@ -105,7 +105,15 @@ pub fn import_scip_index(
     }
 
     // Pass 1: collect enrichments and new symbols in memory
-    let mut enrichments: Vec<(String, u32, u32, String)> = Vec::new();
+    //
+    // Enrichments only ever update `docstring`. Existing symbols already
+    // have a correct start_line/end_line from tree-sitter's full-body AST
+    // extraction; a SCIP definition occurrence's range is the span of the
+    // identifier token itself, not the enclosing declaration, so it must
+    // never be written back over the tree-sitter-derived span (previously
+    // it was, silently collapsing every enriched symbol's displayed source
+    // to ~1 line).
+    let mut enrichments: Vec<(String, String)> = Vec::new();
     let mut new_symbols: Vec<(String, String, String, String, u32, u32, String)> = Vec::new();
 
     for doc in &index.documents {
@@ -137,12 +145,7 @@ pub fn import_scip_index(
             let key = (file.clone(), name.clone());
             if let Some(ids) = file_name_to_ids.get(&key) {
                 for sid in ids {
-                    enrichments.push((
-                        sid.clone(),
-                        span.start_line,
-                        span.end_line,
-                        docstring.to_string(),
-                    ));
+                    enrichments.push((sid.clone(), docstring.to_string()));
                     stats.symbols_enriched += 1;
                 }
             } else {
@@ -286,22 +289,16 @@ pub fn import_scip_index(
         let _ = std::fs::remove_file(&sym_pq);
     }
 
-    // Bulk write enrichments via UNWIND (updates can't use COPY FROM)
+    // Bulk write enrichments via UNWIND (updates can't use COPY FROM).
+    // Only docstring is enriched -- see the note on `enrichments` above for
+    // why start_line/end_line must never be written here.
     for chunk in enrichments.chunks(CHUNK) {
         let rows: Vec<String> = chunk
             .iter()
-            .map(|(id, start, end, doc)| {
-                format!(
-                    "{{id: '{}', sl: {}, el: {}, doc: '{}'}}",
-                    escape(id),
-                    start,
-                    end,
-                    escape(doc)
-                )
-            })
+            .map(|(id, doc)| format!("{{id: '{}', doc: '{}'}}", escape(id), escape(doc)))
             .collect();
         let _ = conn.query(&format!(
-            "UNWIND [{}] AS e MATCH (s:Symbol) WHERE s.id = e.id SET s.start_line = e.sl, s.end_line = e.el, s.docstring = e.doc",
+            "UNWIND [{}] AS e MATCH (s:Symbol) WHERE s.id = e.id SET s.docstring = e.doc",
             rows.join(", ")
         ));
     }
@@ -769,6 +766,74 @@ mod tests {
         assert_eq!(
             scip_sym_to_name("scip-python python test-pkg 1.0.0 `test`/Animal#"),
             "Animal"
+        );
+    }
+
+    #[test]
+    fn enrichment_does_not_overwrite_existing_symbol_span() {
+        let env = TestEnv::new();
+        let conn = env.store.connection().unwrap();
+
+        // Simulate tree-sitter's correct full-body extraction: a function
+        // spanning lines 10-50.
+        conn.query(
+            "CREATE (:Symbol {id: 'test.ts::widen', name: 'widen', kind: 'function', \
+             file: 'test.ts', start_line: 10, end_line: 50, signature_hash: '', \
+             language: 'typescript', visibility: 'public', parent: '', docstring: '', \
+             complexity: 0, parameters: '', return_type: ''})",
+        )
+        .unwrap();
+
+        // SCIP's definition occurrence for the same symbol only spans the
+        // identifier token itself (a single line) -- never the full body.
+        let sym = scip_symbol("widen", "test.ts");
+        let doc = Document {
+            relative_path: "test.ts".to_string(),
+            occurrences: vec![Occurrence {
+                range: vec![9, 9, 9, 14], // 0-based line 9 == 1-based line 10
+                symbol: sym.clone(),
+                symbol_roles: SymbolRole::Definition as i32,
+                ..Default::default()
+            }],
+            symbols: vec![SymbolInformation {
+                symbol: sym,
+                documentation: vec!["Widens a value.".to_string()],
+                ..Default::default()
+            }],
+            ..Default::default()
+        };
+        let index = Index {
+            documents: vec![doc],
+            ..Default::default()
+        };
+        let bytes = index.write_to_bytes().unwrap();
+        let index_path = env._dir.path().join("index.scip");
+        std::fs::write(&index_path, bytes).unwrap();
+
+        let stats = import_scip_index(&index_path, &env.store, None).unwrap();
+        assert_eq!(stats.symbols_enriched, 1, "enrichment path must have run");
+
+        let rows = conn
+            .query(
+                "MATCH (s:Symbol {id: 'test.ts::widen'}) RETURN s.start_line, s.end_line, s.docstring",
+            )
+            .unwrap();
+        let row = rows.into_iter().next().expect("symbol must still exist");
+        let start: i64 = row[0].to_string().parse().unwrap();
+        let end: i64 = row[1].to_string().parse().unwrap();
+        let docstring = row[2].to_string().trim_matches('"').to_string();
+
+        assert_eq!(
+            start, 10,
+            "SCIP enrichment must not overwrite the existing full-body start_line with the narrow definition-occurrence range"
+        );
+        assert_eq!(
+            end, 50,
+            "SCIP enrichment must not overwrite the existing full-body end_line with the narrow definition-occurrence range"
+        );
+        assert_eq!(
+            docstring, "Widens a value.",
+            "docstring enrichment should still apply"
         );
     }
 }
