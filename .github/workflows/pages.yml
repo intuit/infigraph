@@ -25,7 +25,14 @@ concurrency:
   cancel-in-progress: true
 
 jobs:
+  optimize_ci:
+    uses: shilin23061991/common-actions/.github/workflows/optimize-ci.yml@main
+    secrets:
+      graphite_token: ${{ secrets.GRAPHITE_TOKEN }}
+
   build:
+    needs: optimize_ci
+    if: needs.optimize_ci.outputs.skip == 'false'
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
