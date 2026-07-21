@@ -419,23 +419,12 @@ fn handle_webhook_reindex(request: &mut tiny_http::Request) -> Response<std::io:
                     }
                 }
 
-                crate::mcp_log("INFO", &format!("webhook: indexing {repo}"));
-                match Command::new(&bin)
-                    .arg("index")
-                    .current_dir(&repo_path)
-                    .status()
-                {
-                    Ok(s) if s.success() => {}
-                    Ok(s) => {
-                        crate::mcp_log("ERROR", &format!("webhook: index failed (exit {s})"));
-                        result = "partial_failure";
-                    }
-                    Err(e) => {
-                        crate::mcp_log("ERROR", &format!("webhook: index spawn failed: {e}"));
-                        result = "partial_failure";
-                    }
-                }
-
+                // Do NOT run a standalone `infigraph index` here. In shared-Neo4j group mode
+                // that path namespaces by bare repo basename (not org/repo), producing IDs that
+                // don't match the combined graph, and it bumps last_indexed_commit — which makes
+                // the subsequent `group build` treat this repo as unchanged and skip re-indexing
+                // it correctly. `group build` below detects the new HEAD commit and re-indexes
+                // this repo under the correct org/repo namespace on its own.
                 crate::mcp_log("INFO", &format!("webhook: rebuilding group {group}"));
                 match Command::new(&bin).args(["group", "build", &group]).status() {
                     Ok(s) if s.success() => {}

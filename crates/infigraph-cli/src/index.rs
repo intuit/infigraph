@@ -46,15 +46,31 @@ pub(crate) fn cmd_index(root: &Path, full: bool, no_embed: bool) -> Result<()> {
     let mut prism = Infigraph::open(root, registry)?;
     prism.init()?;
 
-    // In shared Neo4j mode, namespace-prefix all file/symbol IDs to prevent collisions
-    if remote {
-        let canonical = std::fs::canonicalize(root).unwrap_or_else(|_| root.to_path_buf());
-        let repo_name = canonical
-            .file_name()
-            .map(|n| n.to_string_lossy().to_string())
-            .unwrap_or_else(|| "unknown".to_string());
-        prism.set_namespace(&repo_name);
-    }
+    // In shared Neo4j mode, a repo's identity is defined by the group registry, not by its
+    // directory name. Resolve the `org/repo` namespace from the registry so a standalone
+    // `infigraph index` writes data consistent with `group build` and the read filters.
+    // Refuse to index an unregistered repo: writing a locally-invented namespace into the
+    // shared graph produces orphaned, mis-namespaced nodes (the original reindter bug).
+    #[cfg(feature = "remote")]
+    let remote_ns = if remote {
+        let reg = infigraph_core::multi::Registry::load()?;
+        let ns = reg.resolve_repo_namespace(root).ok_or_else(|| {
+            anyhow::anyhow!(
+                "repo at '{}' is not registered in any group; in remote mode run \
+                 `infigraph group add <group> <path>` first so its org/repo namespace is defined. \
+                 (A standalone index cannot invent a namespace for a shared graph.)",
+                root.display()
+            )
+        })?;
+        prism.set_namespace(&ns);
+        // Scope reads (get_file_hashes / stale-prune) to THIS repo. Without this, a
+        // standalone index fetches every repo's file hashes from the shared graph and the
+        // stale-file prune deletes all OTHER repos' data — same hazard as group indexing.
+        prism.set_repo_filter(&ns);
+        Some(ns)
+    } else {
+        None
+    };
 
     println!("Indexing project...");
     let result = prism.index()?;
@@ -193,10 +209,12 @@ pub(crate) fn cmd_index(root: &Path, full: bool, no_embed: bool) -> Result<()> {
             registry.register_repo(&repo_name, root, &prism)?;
             println!("Registered '{}' in Postgres registry", repo_name);
 
-            // Create Repo node in Neo4j and link all files
+            // Create Repo node in Neo4j keyed by the org/repo namespace (matching f.repo),
+            // and link only this repo's files.
             if let Some(backend) = prism.backend() {
-                backend.upsert_repo(&repo_name)?;
-                println!("Created Repo node '{}' with BELONGS_TO edges", repo_name);
+                let repo_key = remote_ns.as_deref().unwrap_or(&repo_name);
+                backend.upsert_repo(repo_key)?;
+                println!("Created Repo node '{}' with BELONGS_TO edges", repo_key);
             }
         }
     }

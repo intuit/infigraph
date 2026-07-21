@@ -23,8 +23,9 @@ GitHub Enterprise (GHE)
 │                                                 │
 │  Background thread:                             │
 │    ├─ git pull --ff-only <changed repo>         │
-│    ├─ infigraph index <repo>                    │
 │    ├─ infigraph group build <group>             │
+│    │    (reindexes only the changed repo under  │
+│    │     its org/repo namespace; skips others)  │
 │    └─ Log completion + update status            │
 │                                                 │
 │  During reindex: serve from existing graph      │

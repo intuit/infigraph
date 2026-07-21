@@ -158,6 +158,61 @@ impl Registry {
         self.save()
     }
 
+    /// Resolve a user-supplied group name to the actual stored key.
+    /// Tries the name as-is first (already qualified or org-less), then the
+    /// `INFIGRAPH_ORG`-qualified form `org/name`. This lets CLI commands and the
+    /// webhook accept the bare group name even when it was created with an org
+    /// (create stores `org/name`; without this, every later lookup would miss).
+    pub fn resolve_group_key(&self, name: &str) -> String {
+        // 1. Exact match (already-qualified or org-less).
+        if self.groups.contains_key(name) {
+            return name.to_string();
+        }
+        // 2. INFIGRAPH_ORG-qualified form.
+        let qualified = qualified_group_name(&default_org(), name);
+        if self.groups.contains_key(&qualified) {
+            return qualified;
+        }
+        // 3. Unique `<org>/name` match, regardless of INFIGRAPH_ORG. Lets a group
+        //    created with an explicit --org be referenced by its bare name even when
+        //    the env var is unset or set to a different org.
+        let suffix = format!("/{name}");
+        let mut matches = self.groups.keys().filter(|k| k.ends_with(&suffix));
+        if let Some(first) = matches.next() {
+            if matches.next().is_none() {
+                return first.clone();
+            }
+        }
+        name.to_string()
+    }
+
+    /// Resolve the shared-graph namespace (`org/repo`) for a repo on disk, using the
+    /// group registry as the single source of truth for repo identity. Returns `None`
+    /// if the path is not registered in any group.
+    ///
+    /// A standalone remote `index` must use this rather than deriving a namespace from
+    /// the directory name: the latter can disagree with the group's `org/repo` and write
+    /// orphaned, mis-namespaced nodes into the shared graph.
+    pub fn resolve_repo_namespace(&self, path: &Path) -> Option<String> {
+        let want = std::fs::canonicalize(path).unwrap_or_else(|_| path.to_path_buf());
+        // Find the registered repo whose canonical path matches.
+        let repo_name = self.repos.iter().find_map(|(name, entry)| {
+            let ep = std::fs::canonicalize(&entry.path).unwrap_or_else(|_| entry.path.clone());
+            if ep == want {
+                Some(name.clone())
+            } else {
+                None
+            }
+        })?;
+        // Find a group containing this repo and use its org for the namespace.
+        let org = self
+            .groups
+            .values()
+            .find(|g| g.repos.contains(&repo_name))
+            .map(|g| g.org.clone())?;
+        Some(qualified_group_name(&org, &repo_name))
+    }
+
     /// Add a repo to a group.
     pub fn group_add(&mut self, group_name: &str, repo_name: &str) -> Result<()> {
         let group = self
@@ -633,6 +688,12 @@ pub fn index_group(
                     format!("{org}/{repo_name}")
                 };
                 prism.set_namespace(&ns);
+                // Scope reads (get_file_hashes / stale-prune) to THIS repo. Without this,
+                // incremental indexing fetches every repo's file hashes from the shared graph
+                // and the stale-file prune deletes all OTHER repos' data. Must match the
+                // write namespace exactly.
+                #[cfg(feature = "neo4j")]
+                prism.set_repo_filter(&ns);
             }
             let result = prism.index()?;
             Ok((
@@ -671,6 +732,16 @@ pub fn index_group(
                 if let Some(backend) = prism.backend() {
                     if let Err(e) = crate::manifest::index_manifests(prism.root(), backend) {
                         eprintln!("[group] manifest indexing failed for '{}': {e}", repo_name);
+                    }
+                    // Create the Repo node + BELONGS_TO edges keyed by the SAME org/repo
+                    // namespace stamped onto f.repo, so read filters and BELONGS_TO agree.
+                    let ns = if org.is_empty() {
+                        repo_name.clone()
+                    } else {
+                        format!("{org}/{repo_name}")
+                    };
+                    if let Err(e) = backend.upsert_repo(&ns) {
+                        eprintln!("[group] repo node creation failed for '{}': {e}", repo_name);
                     }
                 }
 

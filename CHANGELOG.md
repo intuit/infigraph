@@ -7,6 +7,31 @@ Versions follow [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
 
+## [3.2.3] - 2026-07-21
+
+### Fixed
+
+- Remote (shared-Neo4j) mode: a single-repo webhook no longer re-indexes every
+  repo in the group, and combined-graph queries no longer return 0 while
+  per-repo queries succeed. Root cause was read/write disagreement on repo
+  identity plus a Kùzu-only transaction statement leaking into Neo4j:
+  - Webhook now pulls and runs `group build` only — the standalone `index`
+    step (wrong namespace + stole the commit-change signal) is removed.
+  - `f.repo` is stamped as `org/repo` at write time in both the per-file and
+    bulk write paths; the global unfiltered `f.repo` backfill in `upsert_repo`
+    (which stole orphan files across repos) is removed.
+  - Group indexing scopes reads to the repo being indexed, so reindexing one
+    repo no longer deletes every other repo's data from the shared graph.
+  - Read filters resolve the same `org/repo` key that writes use.
+  - `BEGIN TRANSACTION`/`COMMIT`/`ROLLBACK` are no-ops on the Neo4j backend
+    (valid Kùzu, invalid Cypher), fixing concern/taint/reflection/config/
+    dynamic-URL analysis in remote mode.
+  - Org-scoped groups are usable from the CLI: `group add`/`build`/`index`
+    resolve a bare group name to its org-qualified key.
+- Remote mode `index` now resolves a repo's `org/repo` namespace from the group
+  registry and refuses to index a repo that isn't registered in any group,
+  instead of inventing a namespace from the directory name.
+
 ## [0.10.1] - 2026-05-11
 
 ### Added

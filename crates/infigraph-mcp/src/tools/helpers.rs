@@ -84,7 +84,9 @@ pub fn open_prism_read_only(args: &Value) -> Result<Infigraph> {
 }
 
 /// In Neo4j (remote) mode, scope read queries to the repo matching this path.
-/// Derives repo name from the last path component (e.g., `/data/repos/my-svc` → `my-svc`).
+/// Uses the same `org/repo` key that the group write path stamps onto `f.repo`
+/// (bare repo name = last path component, org from `INFIGRAPH_ORG`). Read and write
+/// MUST agree on this key or repo-scoped queries return nothing.
 #[cfg(feature = "remote")]
 fn apply_repo_filter(prism: &mut Infigraph, raw_path: &str) {
     if std::env::var("INFIGRAPH_BACKEND").as_deref() == Ok("neo4j") {
@@ -92,7 +94,13 @@ fn apply_repo_filter(prism: &mut Infigraph, raw_path: &str) {
             .file_name()
             .map(|n| n.to_string_lossy().to_string())
             .unwrap_or_else(|| raw_path.to_string());
-        prism.set_repo_filter(&repo_name);
+        let org = infigraph_core::multi::default_org();
+        let key = if org.is_empty() {
+            repo_name
+        } else {
+            format!("{org}/{repo_name}")
+        };
+        prism.set_repo_filter(&key);
     }
 }
 

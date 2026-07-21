@@ -316,6 +316,11 @@ impl Infigraph {
     /// All file paths and symbol IDs will be prefixed with `{namespace}/`.
     pub fn set_namespace(&mut self, ns: &str) {
         self.namespace = Some(ns.to_string());
+        // Mirror to the Neo4j backend so File nodes get f.repo = ns at write time.
+        #[cfg(feature = "neo4j")]
+        if let BackendKind::Neo4j(ref mut neo) = self.backend_kind {
+            neo.set_write_namespace(ns);
+        }
     }
 
     /// Scope Neo4j read queries to a single repo by its directory name.

@@ -20,6 +20,7 @@ pub(crate) fn cmd_group(root: &Path, action: GroupAction) -> Result<()> {
             println!("Created group '{}'", key);
         }
         GroupAction::Add { group, repo } => {
+            let group = registry.resolve_group_key(&group);
             let repo_path = std::path::Path::new(&repo);
             let (repo_name, actual_path) = if repo_path.is_dir() {
                 let name = repo_path
@@ -47,6 +48,7 @@ pub(crate) fn cmd_group(root: &Path, action: GroupAction) -> Result<()> {
             );
         }
         GroupAction::Remove { group, repo } => {
+            let group = registry.resolve_group_key(&group);
             registry.group_remove(&group, &repo)?;
             registry.save()?;
             println!("Removed repo '{}' from group '{}'", repo, group);
@@ -64,6 +66,7 @@ pub(crate) fn cmd_group(root: &Path, action: GroupAction) -> Result<()> {
             }
         }
         GroupAction::Index { group, full } => {
+            let group = registry.resolve_group_key(&group);
             let g = registry
                 .groups
                 .get(&group)
@@ -168,6 +171,7 @@ pub(crate) fn cmd_group(root: &Path, action: GroupAction) -> Result<()> {
             );
         }
         GroupAction::Combined { group } => {
+            let group = registry.resolve_group_key(&group);
             let g = registry
                 .groups
                 .get(&group)
@@ -189,6 +193,7 @@ pub(crate) fn cmd_group(root: &Path, action: GroupAction) -> Result<()> {
             );
         }
         GroupAction::CombinedDocs { group } => {
+            let group = registry.resolve_group_key(&group);
             let stats = infigraph_docs::combined::build_combined_docs(&registry, &group)?;
             println!(
                 "Combined document store ready: {} documents, {} chunks, {} links ({} intra-repo, {} cross-repo), {} sources, {} embeddings.",
@@ -202,6 +207,7 @@ pub(crate) fn cmd_group(root: &Path, action: GroupAction) -> Result<()> {
             );
         }
         GroupAction::Sync { group } => {
+            let group = registry.resolve_group_key(&group);
             let count = infigraph_core::multi::sync_group_contracts(
                 &mut registry,
                 &group,
@@ -210,6 +216,7 @@ pub(crate) fn cmd_group(root: &Path, action: GroupAction) -> Result<()> {
             println!("Synced {} contracts in group '{}'", count, group);
         }
         GroupAction::Contracts { group } => {
+            let group = registry.resolve_group_key(&group);
             let g = registry
                 .groups
                 .get(&group)
@@ -230,6 +237,7 @@ pub(crate) fn cmd_group(root: &Path, action: GroupAction) -> Result<()> {
             }
         }
         GroupAction::Deps { group } => {
+            let group = registry.resolve_group_key(&group);
             let deps = infigraph_core::multi::detect_cross_service_deps(
                 &registry,
                 &group,
@@ -257,6 +265,7 @@ pub(crate) fn cmd_group(root: &Path, action: GroupAction) -> Result<()> {
             }
         }
         GroupAction::Link { group } => {
+            let group = registry.resolve_group_key(&group);
             let count = infigraph_core::multi::link_cross_service_calls(
                 &registry,
                 &group,
@@ -272,6 +281,7 @@ pub(crate) fn cmd_group(root: &Path, action: GroupAction) -> Result<()> {
             cypher,
             combined,
         } => {
+            let group = registry.resolve_group_key(&group);
             if combined {
                 let rows = infigraph_core::multi::combined::combined_query(&group, &cypher)?;
                 for row in &rows {
@@ -288,6 +298,7 @@ pub(crate) fn cmd_group(root: &Path, action: GroupAction) -> Result<()> {
             }
         }
         GroupAction::Build { group, full } => {
+            let group = registry.resolve_group_key(&group);
             // Step 1: Index (uses index_group for namespace isolation + parallel on Neo4j)
             let results =
                 infigraph_core::multi::index_group(&mut registry, &group, full, bundled_registry)?;
@@ -411,6 +422,7 @@ pub(crate) fn cmd_group(root: &Path, action: GroupAction) -> Result<()> {
             alpha,
             deep,
         } => {
+            let group = registry.resolve_group_key(&group);
             if deep {
                 let output = infigraph_core::multi::combined::combined_search_deep(
                     &group, &query, limit, alpha,
@@ -448,6 +460,7 @@ pub(crate) fn cmd_group(root: &Path, action: GroupAction) -> Result<()> {
             limit,
             alpha,
         } => {
+            let group = registry.resolve_group_key(&group);
             let results =
                 infigraph_docs::combined::combined_doc_search(&group, &query, limit, alpha)?;
             if results.is_empty() {
@@ -466,6 +479,7 @@ pub(crate) fn cmd_group(root: &Path, action: GroupAction) -> Result<()> {
             }
         }
         GroupAction::Watch { group, debounce } => {
+            let group = registry.resolve_group_key(&group);
             let g = registry
                 .groups
                 .get(&group)

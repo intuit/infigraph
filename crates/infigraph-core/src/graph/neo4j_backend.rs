@@ -47,6 +47,9 @@ pub struct Neo4jBackend {
     graph: Graph,
     handle: Handle,
     repo_filter: Option<String>,
+    /// Namespace (`org/repo`) to stamp onto File nodes as `f.repo` at write time,
+    /// so repo-scoped read queries work without a global backfill. Set via `set_write_namespace`.
+    write_namespace: Option<String>,
 }
 
 impl Neo4jBackend {
@@ -58,6 +61,7 @@ impl Neo4jBackend {
             graph,
             handle,
             repo_filter: None,
+            write_namespace: None,
         })
     }
 
@@ -73,6 +77,11 @@ impl Neo4jBackend {
 
     pub fn set_repo_filter(&mut self, repo: &str) {
         self.repo_filter = Some(repo.to_string());
+    }
+
+    /// Set the namespace (`org/repo`) stamped onto File nodes as `f.repo` at write time.
+    pub fn set_write_namespace(&mut self, ns: &str) {
+        self.write_namespace = Some(ns.to_string());
     }
 
     /// Initialize schema constraints (idempotent).
@@ -177,15 +186,28 @@ impl Neo4jBackend {
     }
 
     fn upsert_extraction(&self, ext: &FileExtraction) -> Result<()> {
-        // File node
-        self.block_on(
-            self.graph.run(
-                query("MERGE (f:File {id: $id}) SET f.language = $lang")
-                    .param("id", ext.file.clone())
-                    .param("lang", ext.language.clone()),
-            ),
-        )
-        .map_err(|e| anyhow::anyhow!("upsert file failed: {e}"))?;
+        // File node — stamp f.repo from the write namespace so repo-scoped read queries
+        // (stats, get_file_hashes, get_all_symbols, ...) work without a global backfill.
+        if let Some(ns) = &self.write_namespace {
+            self.block_on(
+                self.graph.run(
+                    query("MERGE (f:File {id: $id}) SET f.language = $lang, f.repo = $repo")
+                        .param("id", ext.file.clone())
+                        .param("lang", ext.language.clone())
+                        .param("repo", ns.clone()),
+                ),
+            )
+            .map_err(|e| anyhow::anyhow!("upsert file failed: {e}"))?;
+        } else {
+            self.block_on(
+                self.graph.run(
+                    query("MERGE (f:File {id: $id}) SET f.language = $lang")
+                        .param("id", ext.file.clone())
+                        .param("lang", ext.language.clone()),
+                ),
+            )
+            .map_err(|e| anyhow::anyhow!("upsert file failed: {e}"))?;
+        }
 
         // Module node
         self.block_on(
@@ -966,6 +988,18 @@ impl GraphBackend for Neo4jBackend {
     }
 
     fn raw_query(&self, cypher: &str) -> Result<Vec<Vec<String>>> {
+        // Kuzu accepts `BEGIN TRANSACTION`/`COMMIT`/`ROLLBACK` as statements; Neo4j does not
+        // (transactions are driver-level, not Cypher). Analysis passes (concerns, taint,
+        // reflection, config, dynamic-urls) wrap writes in these — no-op them here so those
+        // passes don't fail with Statement.SyntaxError against Neo4j.
+        let trimmed = cypher.trim_end_matches(';').trim();
+        if trimmed.eq_ignore_ascii_case("BEGIN TRANSACTION")
+            || trimmed.eq_ignore_ascii_case("BEGIN")
+            || trimmed.eq_ignore_ascii_case("COMMIT")
+            || trimmed.eq_ignore_ascii_case("ROLLBACK")
+        {
+            return Ok(Vec::new());
+        }
         let keys = parse_return_columns(cypher);
         let rows = self.run_query(query(cypher))?;
         if keys.is_empty() {
@@ -1383,23 +1417,32 @@ impl GraphBackend for Neo4jBackend {
 
         // ── Phase 1: All nodes (File, Module, Symbol, Statement) ─────
 
-        // File nodes — one batch per chunk
+        // File nodes — one batch per chunk. Stamp f.repo from the write namespace so
+        // repo-scoped read queries work (same as upsert_extraction; this is the bulk path
+        // used by group build).
         let file_params: Vec<HashMap<String, String>> = extractions
             .iter()
             .map(|ext| {
                 let mut m = HashMap::new();
                 m.insert("id".into(), ext.file.clone());
                 m.insert("lang".into(), ext.language.clone());
+                if let Some(ns) = &self.write_namespace {
+                    m.insert("repo".into(), ns.clone());
+                }
                 m
             })
             .collect();
+        let file_set = if self.write_namespace.is_some() {
+            "SET file.language = f.lang, file.repo = f.repo"
+        } else {
+            "SET file.language = f.lang"
+        };
         for chunk in file_params.chunks(BATCH_SIZE) {
             self.block_on(
                 self.graph.run(
-                    query(
-                        "UNWIND $batch AS f \
-                     MERGE (file:File {id: f.id}) SET file.language = f.lang",
-                    )
+                    query(&format!(
+                        "UNWIND $batch AS f MERGE (file:File {{id: f.id}}) {file_set}"
+                    ))
                     .param("batch", chunk.to_vec()),
                 ),
             )
@@ -1658,18 +1701,9 @@ impl GraphBackend for Neo4jBackend {
                 .run(query("MERGE (r:Repo {name: $name})").param("name", repo_name)),
         )
         .map_err(|e| anyhow::anyhow!("upsert Repo node failed: {e}"))?;
-        self.block_on(
-            self.graph.run(
-                query(
-                    "MATCH (f:File) \
-                 WHERE (f.repo IS NULL OR f.repo = '') \
-                   AND NOT (f)-[:BELONGS_TO]->(:Repo) \
-                 SET f.repo = $repo",
-                )
-                .param("repo", repo_name),
-            ),
-        )
-        .map_err(|e| anyhow::anyhow!("set file repo failed: {e}"))?;
+        // f.repo is stamped at write time in upsert_extraction. Only link the files that
+        // already belong to THIS repo — never a global unfiltered `MATCH (f:File)`, which
+        // would steal orphan files from every other repo sharing the Neo4j instance.
         self.block_on(
             self.graph.run(
                 query(
