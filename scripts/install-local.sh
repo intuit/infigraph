@@ -47,11 +47,18 @@ for bin in infigraph infigraph-mcp; do
   chmod +x "$tmp"
 done
 
+# Validate the staged binaries BEFORE replacing the active install, so a
+# broken build never displaces a working one. (infigraph-mcp ignores
+# --version and starts its server loop, but exits 0 immediately once stdin
+# hits EOF — so </dev/null both prevents a hang and still proves the binary
+# loads and runs.)
+"$INSTALL_DIR/.infigraph.tmp.$$" --version >/dev/null
+"$INSTALL_DIR/.infigraph-mcp.tmp.$$" --version </dev/null >/dev/null 2>&1
+
 for bin in infigraph infigraph-mcp; do
   mv -f "$INSTALL_DIR/.$bin.tmp.$$" "$INSTALL_DIR/$bin"
 done
 
 echo "Installed to $INSTALL_DIR:"
 "$INSTALL_DIR/infigraph" --version
-"$INSTALL_DIR/infigraph-mcp" --version 2>/dev/null || true
 echo "(running processes keep working on the old inode until restarted)"

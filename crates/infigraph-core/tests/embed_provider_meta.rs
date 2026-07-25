@@ -37,6 +37,16 @@ fn provider_switch_is_stale_at_same_dimension() {
 }
 
 #[test]
+fn dimension_switch_is_stale_within_same_provider_and_model() {
+    let dir = tempfile::tempdir().unwrap();
+    write_embedder_identity(dir.path(), "voyage:voyage-code-3:256").unwrap();
+    assert!(embedder_identity_stale(
+        dir.path(),
+        "voyage:voyage-code-3:512"
+    ));
+}
+
+#[test]
 fn model_switch_is_stale_within_same_provider() {
     let dir = tempfile::tempdir().unwrap();
     write_embedder_identity(dir.path(), "voyage:voyage-code-3:256").unwrap();

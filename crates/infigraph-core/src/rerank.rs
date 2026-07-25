@@ -34,14 +34,16 @@ fn model() -> String {
 /// relevance in `[0, 1]`). `docs` maps symbol IDs to embedding text; symbols
 /// missing from it fall back to a `kind name in file` description. Best-effort:
 /// on any API failure the local ordering is kept and a warning is printed.
+/// Returns `true` when a Cohere rerank was applied (scores replaced), so
+/// callers can re-apply any local score adjustments (e.g. grep boosts).
 pub fn maybe_rerank(
     query: &str,
     results: &mut Vec<SearchResult>,
     docs: &[(String, String)],
     limit: usize,
-) {
+) -> bool {
     if !cohere_enabled() || results.is_empty() {
-        return;
+        return false;
     }
     let candidate_count = results
         .len()
@@ -73,8 +75,12 @@ pub fn maybe_rerank(
             }
             reordered.extend(results[candidate_count..].iter().cloned());
             *results = reordered;
+            true
         }
-        Err(e) => eprintln!("warning: cohere rerank failed, using local ranking: {e}"),
+        Err(e) => {
+            eprintln!("warning: cohere rerank failed, using local ranking: {e}");
+            false
+        }
     }
 }
 
@@ -202,6 +208,14 @@ mod tests {
             { "index": 2, "relevance_score": 0.7 },
         ]));
         assert!(parse_rerank_response(&json, 2).is_err());
+    }
+
+    #[test]
+    fn maybe_rerank_returns_false_when_not_applied() {
+        // Empty results short-circuit regardless of COHERE_API_KEY, so the
+        // caller knows local score adjustments were left intact.
+        let mut results: Vec<SearchResult> = Vec::new();
+        assert!(!maybe_rerank("query", &mut results, &[], 10));
     }
 
     #[test]

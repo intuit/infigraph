@@ -12,6 +12,7 @@ use anyhow::{Context, Result};
 use super::EmbedProvider;
 
 pub struct VoyageEmbedder {
+    agent: ureq::Agent,
     api_key: String,
     model: String,
     dim: usize,
@@ -23,6 +24,8 @@ impl VoyageEmbedder {
     const ENDPOINT: &'static str = "https://api.voyageai.com/v1/embeddings";
     /// Voyage allows up to 1000 inputs per request; stay well under token limits.
     const BATCH_SIZE: usize = 128;
+    /// Bound each API request so a hung connection cannot stall indexing.
+    const REQUEST_TIMEOUT_SECS: u64 = 60;
 
     /// Build from `VOYAGE_API_KEY`; returns None when the key is not set.
     pub fn from_env() -> Option<Self> {
@@ -35,6 +38,9 @@ impl VoyageEmbedder {
             api_key,
             model,
             dim: Self::OUTPUT_DIMENSION,
+            agent: ureq::AgentBuilder::new()
+                .timeout(std::time::Duration::from_secs(Self::REQUEST_TIMEOUT_SECS))
+                .build(),
         })
     }
 
@@ -44,7 +50,9 @@ impl VoyageEmbedder {
             "model": self.model,
             "output_dimension": self.dim,
         });
-        let resp = ureq::post(Self::ENDPOINT)
+        let resp = self
+            .agent
+            .post(Self::ENDPOINT)
             .set("Authorization", &format!("Bearer {}", self.api_key))
             .set("Content-Type", "application/json")
             .send_json(body)
@@ -97,8 +105,13 @@ fn parse_embeddings_response(
         for v in arr {
             let f = v
                 .as_f64()
-                .ok_or_else(|| anyhow::anyhow!("voyage embeddings: non-numeric embedding value"))?;
-            emb.push(f as f32);
+                .ok_or_else(|| anyhow::anyhow!("voyage embeddings: non-numeric embedding value"))?
+                as f32;
+            anyhow::ensure!(
+                f.is_finite(),
+                "voyage embeddings: non-finite embedding value"
+            );
+            emb.push(f);
         }
         anyhow::ensure!(
             emb.len() == dim,
@@ -189,6 +202,16 @@ mod tests {
         ]));
         let err = parse_embeddings_response(&json, 1, 2).unwrap_err();
         assert!(err.to_string().contains("non-numeric"), "{err}");
+    }
+
+    #[test]
+    fn rejects_non_finite_values() {
+        // 1e100 overflows f32 to +inf after narrowing.
+        let json = resp(serde_json::json!([
+            { "index": 0, "embedding": [1.0, 1e100] },
+        ]));
+        let err = parse_embeddings_response(&json, 1, 2).unwrap_err();
+        assert!(err.to_string().contains("non-finite"), "{err}");
     }
 
     #[test]

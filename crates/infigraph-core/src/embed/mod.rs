@@ -509,19 +509,28 @@ pub fn update_embeddings(
 
     if !to_embed.is_empty() {
         const BATCH: usize = 256;
+        // Propagate batch failures instead of silently dropping vectors: a
+        // partial index must never be persisted (nor its identity recorded)
+        // as a successful build.
         let results: Vec<Vec<(String, Vec<f32>)>> = to_embed
             .par_chunks(BATCH)
-            .map(|chunk| {
+            .map(|chunk| -> Result<Vec<(String, Vec<f32>)>> {
                 let emb = Arc::clone(&embedder);
                 let texts: Vec<&str> = chunk.iter().map(|(_, t)| t.as_str()).collect();
-                let vecs = emb.embed_batch(&texts).unwrap_or_default();
-                chunk
+                let vecs = emb.embed_batch(&texts)?;
+                anyhow::ensure!(
+                    vecs.len() == chunk.len(),
+                    "embedder returned {} vectors for {} texts",
+                    vecs.len(),
+                    chunk.len()
+                );
+                Ok(chunk
                     .iter()
-                    .enumerate()
-                    .filter_map(|(i, (id, _))| vecs.get(i).map(|v| (id.clone(), v.clone())))
-                    .collect()
+                    .zip(vecs)
+                    .map(|((id, _), v)| (id.clone(), v))
+                    .collect())
             })
-            .collect();
+            .collect::<Result<Vec<_>>>()?;
         for batch in results {
             for (id, v) in batch {
                 existing.insert(id, v);
