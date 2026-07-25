@@ -430,41 +430,8 @@ pub fn tool_search(args: &Value) -> Result<String> {
         });
     }
 
-    // Optional second-stage reranking via Cohere (COHERE_API_KEY).
-    // Best-effort: on API failure, keep the local score ordering.
-    if infigraph_core::rerank::cohere_enabled() && !symbol_results.is_empty() {
-        let candidate_count = symbol_results.len().min((limit * 2).max(limit)).min(100);
-        let doc_text: std::collections::HashMap<&str, &str> = docs_ref
-            .iter()
-            .map(|(id, text)| (id.as_str(), text.as_str()))
-            .collect();
-        let texts: Vec<String> = symbol_results[..candidate_count]
-            .iter()
-            .map(|r| {
-                doc_text
-                    .get(r.symbol_id.as_str())
-                    .map(|t| (*t).to_string())
-                    .unwrap_or_else(|| format!("{} {} in {}", r.kind, r.name, r.file))
-            })
-            .collect();
-        match infigraph_core::rerank::cohere_rerank(query, &texts, candidate_count) {
-            Ok(ranked) => {
-                let mut reordered: Vec<infigraph_core::search::SearchResult> = ranked
-                    .iter()
-                    .filter_map(|(idx, score)| {
-                        symbol_results.get(*idx).map(|r| {
-                            let mut r = r.clone();
-                            r.score = *score;
-                            r
-                        })
-                    })
-                    .collect();
-                reordered.extend(symbol_results[candidate_count..].iter().cloned());
-                symbol_results = reordered;
-            }
-            Err(e) => eprintln!("warning: cohere rerank failed, using local ranking: {e}"),
-        }
-    }
+    // Local-dev hook: optional Cohere second-stage rerank (COHERE_API_KEY).
+    infigraph_core::rerank::maybe_rerank(query, &mut symbol_results, docs_ref, limit);
 
     symbol_results.truncate(limit);
 

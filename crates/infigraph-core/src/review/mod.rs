@@ -10,6 +10,7 @@
 //! ```
 
 pub mod llm;
+mod ollama; // local-dev add-on: optional Ollama LLM review backend
 
 use std::collections::HashSet;
 use std::path::Path;
