@@ -2,9 +2,10 @@
 //!
 //! Local-development add-on: everything Ollama-specific lives in this file so
 //! upstream `review/llm.rs` only carries a single dispatch hook in
-//! `review_with_llm`. Activated when `OLLAMA_API_KEY` is set (takes precedence
-//! over `ANTHROPIC_API_KEY`). Talks to the Ollama chat API (`/api/chat`) —
-//! works with Ollama Cloud (`https://ollama.com`) or any self-hosted server.
+//! `review_with_llm`. Activated when `INFIGRAPH_LLM_PROVIDER=ollama`, or when
+//! `OLLAMA_API_KEY` is set and no `ANTHROPIC_API_KEY` is present. Talks to the
+//! Ollama chat API (`/api/chat`) — works with Ollama Cloud
+//! (`https://ollama.com`) or any self-hosted server.
 //!
 //! Overridable via `INFIGRAPH_LLM_MODEL`, `INFIGRAPH_LLM_BASE_URL`,
 //! `INFIGRAPH_LLM_MAX_TOKENS`.
@@ -17,11 +18,19 @@ use anyhow::{Context, Result};
 
 use super::llm::{LlmFinding, LlmReviewResult, RiskItem, TestCase, TokenUsage};
 
-/// Whether the Ollama provider is enabled (`OLLAMA_API_KEY` set and non-empty).
+/// Whether the Ollama provider is enabled.
+///
+/// Explicit selection via `INFIGRAPH_LLM_PROVIDER=ollama` always wins (any
+/// other value disables Ollama). Without a selector, Ollama is used only when
+/// `OLLAMA_API_KEY` is set and `ANTHROPIC_API_KEY` is not — so a shared env
+/// file containing both keys still routes to the Anthropic-compatible backend
+/// (Claude / Kimi / Grok).
 pub fn enabled() -> bool {
-    std::env::var("OLLAMA_API_KEY")
-        .map(|k| !k.is_empty())
-        .unwrap_or(false)
+    let has_key = |name: &str| std::env::var(name).map(|k| !k.is_empty()).unwrap_or(false);
+    match std::env::var("INFIGRAPH_LLM_PROVIDER") {
+        Ok(p) if !p.is_empty() => p.eq_ignore_ascii_case("ollama"),
+        _ => has_key("OLLAMA_API_KEY") && !has_key("ANTHROPIC_API_KEY"),
+    }
 }
 
 /// Run a review prompt through Ollama and parse the structured result.

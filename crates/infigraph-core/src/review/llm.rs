@@ -706,13 +706,8 @@ pub fn call_claude(config: &LlmConfig, prompt: &str) -> Result<LlmReviewResult> 
 
         let resp_body: serde_json::Value = resp.into_json().context("parse Claude response")?;
 
-        let chunk = resp_body["content"]
-            .as_array()
-            .and_then(|arr| arr.first())
-            .and_then(|block| block["text"].as_str())
-            .unwrap_or("");
-
-        full_text.push_str(chunk);
+        let chunk = extract_text_blocks(&resp_body["content"]);
+        full_text.push_str(&chunk);
         total_input += resp_body["usage"]["input_tokens"].as_u64().unwrap_or(0);
         total_output += resp_body["usage"]["output_tokens"].as_u64().unwrap_or(0);
 
@@ -757,6 +752,22 @@ pub fn call_claude(config: &LlmConfig, prompt: &str) -> Result<LlmReviewResult> 
         deployment_notes,
         token_usage: Some(usage),
     })
+}
+
+/// Concatenate all `text` content blocks from an Anthropic Messages API
+/// response. Reasoning models (Claude extended thinking, Kimi, Grok) may
+/// return a `thinking` block before `text`, so we can't just take the first
+/// block.
+fn extract_text_blocks(content: &serde_json::Value) -> String {
+    content
+        .as_array()
+        .map(|arr| {
+            arr.iter()
+                .filter(|b| b["type"] == "text")
+                .filter_map(|b| b["text"].as_str())
+                .collect()
+        })
+        .unwrap_or_default()
 }
 
 fn parse_json_array<T: serde::de::DeserializeOwned>(val: &serde_json::Value) -> Vec<T> {
@@ -933,4 +944,24 @@ pub fn format_llm_review(result: &LlmReviewResult) -> String {
 
 pub fn format_llm_review_json(result: &LlmReviewResult) -> String {
     serde_json::to_string_pretty(result).unwrap_or_else(|_| "{}".to_string())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::extract_text_blocks;
+
+    #[test]
+    fn extract_text_blocks_skips_thinking_and_joins_text() {
+        let content = serde_json::json!([
+            {"type": "thinking", "thinking": "internal reasoning"},
+            {"type": "text", "text": "Hello "},
+            {"type": "text", "text": "world"},
+        ]);
+        assert_eq!(extract_text_blocks(&content), "Hello world");
+    }
+
+    #[test]
+    fn extract_text_blocks_handles_missing_content() {
+        assert_eq!(extract_text_blocks(&serde_json::Value::Null), "");
+    }
 }
