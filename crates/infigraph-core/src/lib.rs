@@ -22,6 +22,7 @@ pub mod patterns;
 pub mod refactor;
 pub mod reflection;
 mod report;
+pub mod rerank;
 pub mod resolve;
 pub mod review;
 pub mod routes;
