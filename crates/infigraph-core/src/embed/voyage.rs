@@ -52,41 +52,77 @@ impl VoyageEmbedder {
         let json: serde_json::Value = resp
             .into_json()
             .context("voyage embeddings: invalid JSON response")?;
-        let data = json["data"]
-            .as_array()
-            .ok_or_else(|| anyhow::anyhow!("voyage embeddings: missing 'data' in response"))?;
-        anyhow::ensure!(
-            data.len() == texts.len(),
-            "voyage embeddings: expected {} vectors, got {}",
-            texts.len(),
-            data.len()
-        );
-        // Order by 'index' to be robust against out-of-order responses.
-        let mut out = vec![Vec::new(); texts.len()];
-        for item in data {
-            let idx = item["index"].as_u64().unwrap_or(0) as usize;
-            let emb: Vec<f32> = item["embedding"]
-                .as_array()
-                .ok_or_else(|| anyhow::anyhow!("voyage embeddings: missing 'embedding'"))?
-                .iter()
-                .filter_map(|v| v.as_f64().map(|f| f as f32))
-                .collect();
-            anyhow::ensure!(
-                emb.len() == self.dim,
-                "voyage embeddings: expected dim {}, got {}",
-                self.dim,
-                emb.len()
-            );
-            anyhow::ensure!(idx < out.len(), "voyage embeddings: index out of range");
-            out[idx] = emb;
-        }
-        Ok(out)
+        parse_embeddings_response(&json, texts.len(), self.dim)
     }
+}
+
+/// Parse a Voyage embeddings API response into vectors ordered by `index`.
+///
+/// Strict about malformed responses: every item must carry a valid, unique,
+/// in-range integer `index`, every embedding coordinate must be numeric, and
+/// every output slot must be populated.
+fn parse_embeddings_response(
+    json: &serde_json::Value,
+    expected: usize,
+    dim: usize,
+) -> Result<Vec<Vec<f32>>> {
+    let data = json["data"]
+        .as_array()
+        .ok_or_else(|| anyhow::anyhow!("voyage embeddings: missing 'data' in response"))?;
+    anyhow::ensure!(
+        data.len() == expected,
+        "voyage embeddings: expected {} vectors, got {}",
+        expected,
+        data.len()
+    );
+    // Order by 'index' to be robust against out-of-order responses.
+    let mut out: Vec<Option<Vec<f32>>> = vec![None; expected];
+    for item in data {
+        let idx = item["index"]
+            .as_u64()
+            .ok_or_else(|| anyhow::anyhow!("voyage embeddings: missing or invalid 'index'"))?
+            as usize;
+        anyhow::ensure!(
+            idx < expected,
+            "voyage embeddings: index {idx} out of range"
+        );
+        anyhow::ensure!(
+            out[idx].is_none(),
+            "voyage embeddings: duplicate index {idx}"
+        );
+        let arr = item["embedding"]
+            .as_array()
+            .ok_or_else(|| anyhow::anyhow!("voyage embeddings: missing 'embedding'"))?;
+        let mut emb = Vec::with_capacity(arr.len());
+        for v in arr {
+            let f = v
+                .as_f64()
+                .ok_or_else(|| anyhow::anyhow!("voyage embeddings: non-numeric embedding value"))?;
+            emb.push(f as f32);
+        }
+        anyhow::ensure!(
+            emb.len() == dim,
+            "voyage embeddings: expected dim {}, got {}",
+            dim,
+            emb.len()
+        );
+        out[idx] = Some(emb);
+    }
+    out.into_iter()
+        .enumerate()
+        .map(|(i, v)| {
+            v.ok_or_else(|| anyhow::anyhow!("voyage embeddings: missing vector for index {i}"))
+        })
+        .collect()
 }
 
 impl EmbedProvider for VoyageEmbedder {
     fn dimension(&self) -> usize {
         self.dim
+    }
+
+    fn identity(&self) -> String {
+        format!("voyage:{}:{}", self.model, self.dim)
     }
 
     fn embed_batch(&self, texts: &[&str]) -> Result<Vec<Vec<f32>>> {
@@ -95,5 +131,72 @@ impl EmbedProvider for VoyageEmbedder {
             all.extend(self.request_batch(chunk)?);
         }
         Ok(all)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn resp(items: serde_json::Value) -> serde_json::Value {
+        serde_json::json!({ "data": items })
+    }
+
+    #[test]
+    fn parses_out_of_order_response() {
+        let json = resp(serde_json::json!([
+            { "index": 1, "embedding": [3.0, 4.0] },
+            { "index": 0, "embedding": [1.0, 2.0] },
+        ]));
+        let out = parse_embeddings_response(&json, 2, 2).unwrap();
+        assert_eq!(out, vec![vec![1.0, 2.0], vec![3.0, 4.0]]);
+    }
+
+    #[test]
+    fn rejects_missing_index() {
+        let json = resp(serde_json::json!([
+            { "embedding": [1.0, 2.0] },
+            { "index": 1, "embedding": [3.0, 4.0] },
+        ]));
+        let err = parse_embeddings_response(&json, 2, 2).unwrap_err();
+        assert!(err.to_string().contains("index"), "{err}");
+    }
+
+    #[test]
+    fn rejects_duplicate_index() {
+        let json = resp(serde_json::json!([
+            { "index": 0, "embedding": [1.0, 2.0] },
+            { "index": 0, "embedding": [3.0, 4.0] },
+        ]));
+        let err = parse_embeddings_response(&json, 2, 2).unwrap_err();
+        assert!(err.to_string().contains("duplicate"), "{err}");
+    }
+
+    #[test]
+    fn rejects_out_of_range_index() {
+        let json = resp(serde_json::json!([
+            { "index": 0, "embedding": [1.0, 2.0] },
+            { "index": 5, "embedding": [3.0, 4.0] },
+        ]));
+        let err = parse_embeddings_response(&json, 2, 2).unwrap_err();
+        assert!(err.to_string().contains("out of range"), "{err}");
+    }
+
+    #[test]
+    fn rejects_non_numeric_values() {
+        let json = resp(serde_json::json!([
+            { "index": 0, "embedding": [1.0, "oops"] },
+        ]));
+        let err = parse_embeddings_response(&json, 1, 2).unwrap_err();
+        assert!(err.to_string().contains("non-numeric"), "{err}");
+    }
+
+    #[test]
+    fn rejects_wrong_count_and_dim() {
+        let json = resp(serde_json::json!([
+            { "index": 0, "embedding": [1.0, 2.0] },
+        ]));
+        assert!(parse_embeddings_response(&json, 2, 2).is_err());
+        assert!(parse_embeddings_response(&json, 1, 3).is_err());
     }
 }

@@ -717,8 +717,12 @@ pub fn call_claude(config: &LlmConfig, prompt: &str) -> Result<LlmReviewResult> 
             break;
         }
 
-        // Truncated — ask LLM to continue
-        messages.push(serde_json::json!({"role": "assistant", "content": chunk}));
+        // Truncated — ask LLM to continue. Preserve the raw content blocks
+        // (including `thinking`/`redacted_thinking`) in the assistant turn:
+        // reasoning models require them on continuation requests.
+        messages.push(
+            serde_json::json!({"role": "assistant", "content": resp_body["content"].clone()}),
+        );
         messages.push(serde_json::json!({"role": "user", "content": "Continue from where you left off. Complete the JSON."}));
     }
 

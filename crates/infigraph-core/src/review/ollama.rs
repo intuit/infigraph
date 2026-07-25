@@ -35,8 +35,11 @@ pub fn enabled() -> bool {
 
 /// Run a review prompt through Ollama and parse the structured result.
 pub fn review(prompt: &str) -> Result<LlmReviewResult> {
-    let api_key = std::env::var("OLLAMA_API_KEY").context("OLLAMA_API_KEY not set")?;
-    let model = std::env::var("INFIGRAPH_LLM_MODEL").unwrap_or_else(|_| "glm-5.2".to_string());
+    // Optional: self-hosted Ollama needs no key; the Authorization header is
+    // only sent when a key is configured (e.g. for ollama.com cloud).
+    let api_key = std::env::var("OLLAMA_API_KEY").unwrap_or_default();
+    let model =
+        std::env::var("INFIGRAPH_LLM_MODEL").unwrap_or_else(|_| "glm-5.2:cloud".to_string());
     let base_url = std::env::var("INFIGRAPH_LLM_BASE_URL")
         .unwrap_or_else(|_| "https://ollama.com".to_string());
     let max_tokens: u32 = std::env::var("INFIGRAPH_LLM_MAX_TOKENS")

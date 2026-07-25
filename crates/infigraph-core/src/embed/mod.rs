@@ -57,6 +57,10 @@ pub fn invalidate_embeddings_cache() {
 /// Embedding engine trait. Implementations can use ONNX, API calls, etc.
 pub trait EmbedProvider: Send + Sync {
     fn dimension(&self) -> usize;
+    /// Stable identity of the provider+model producing vectors. Persisted next
+    /// to `embeddings.bin` so switching providers/models invalidates old
+    /// vectors even when the dimension is unchanged.
+    fn identity(&self) -> String;
     fn embed_batch(&self, texts: &[&str]) -> Result<Vec<Vec<f32>>>;
 
     fn embed(&self, text: &str) -> Result<Vec<f32>> {
@@ -176,6 +180,10 @@ impl Default for TrigramEmbedder {
 impl EmbedProvider for TrigramEmbedder {
     fn dimension(&self) -> usize {
         self.dim
+    }
+
+    fn identity(&self) -> String {
+        format!("trigram:{}", self.dim)
     }
 
     fn embed_batch(&self, texts: &[&str]) -> Result<Vec<Vec<f32>>> {
@@ -301,6 +309,10 @@ impl EmbedProvider for Model2VecEmbedder {
         256 // potion-base-8M outputs 256-dim
     }
 
+    fn identity(&self) -> String {
+        format!("model2vec:potion-base-8M:{}", self.dimension())
+    }
+
     fn embed_batch(&self, texts: &[&str]) -> Result<Vec<Vec<f32>>> {
         let owned: Vec<String> = texts.iter().map(|s| s.to_string()).collect();
         Ok(self.model.encode(&owned))
@@ -346,6 +358,30 @@ pub fn best_embedder() -> Box<dyn EmbedProvider> {
             Box::new(TrigramEmbedder::default())
         }
     }
+}
+
+/// Sidecar recording which embedder (provider:model:dim) produced `embeddings.bin`.
+fn embedder_meta_path(infigraph_dir: &Path) -> PathBuf {
+    infigraph_dir.join("embeddings.provider")
+}
+
+/// Whether the recorded embedder identity differs from `identity`.
+///
+/// A missing or unreadable record is treated as stale: existing vectors of
+/// unknown provenance may live in an incompatible embedding space, so the
+/// fail-safe is a one-time re-embed. Callers only consult this when
+/// embeddings already exist, so fresh indexes are unaffected.
+pub fn embedder_identity_stale(infigraph_dir: &Path, identity: &str) -> bool {
+    match std::fs::read_to_string(embedder_meta_path(infigraph_dir)) {
+        Ok(prev) => prev.trim() != identity,
+        Err(_) => true,
+    }
+}
+
+/// Record the embedder identity that produced the current `embeddings.bin`.
+pub fn write_embedder_identity(infigraph_dir: &Path, identity: &str) -> Result<()> {
+    std::fs::write(embedder_meta_path(infigraph_dir), identity)
+        .context("write embeddings provider sidecar")
 }
 
 /// Count the number of embeddings in the binary file at `root/.infigraph/embeddings.bin`.
@@ -434,11 +470,21 @@ pub fn update_embeddings(
         return Ok(0);
     }
 
-    let emb_path = root.join(".infigraph").join("embeddings.bin");
+    let embedder: Arc<Box<dyn EmbedProvider>> = Arc::new(best_embedder());
+    let identity = embedder.identity();
+    let infigraph_dir = root.join(".infigraph");
+    let emb_path = infigraph_dir.join("embeddings.bin");
     let mut existing: std::collections::HashMap<String, Vec<f32>> = load_embeddings(&emb_path)
         .unwrap_or_default()
         .into_iter()
         .collect();
+
+    // Provider/model changed since the last build: old vectors live in an
+    // incompatible embedding space (even at the same dimension) — discard them
+    // and re-embed everything.
+    if !existing.is_empty() && embedder_identity_stale(&infigraph_dir, &identity) {
+        existing.clear();
+    }
 
     let changed_set: std::collections::HashSet<&str> = changed_files.iter().copied().collect();
 
@@ -462,7 +508,6 @@ pub fn update_embeddings(
         .collect();
 
     if !to_embed.is_empty() {
-        let embedder: Arc<Box<dyn EmbedProvider>> = Arc::new(best_embedder());
         const BATCH: usize = 256;
         let results: Vec<Vec<(String, Vec<f32>)>> = to_embed
             .par_chunks(BATCH)
@@ -490,6 +535,7 @@ pub fn update_embeddings(
     let symbol_embeddings: Vec<(String, Vec<f32>)> = existing.into_iter().collect();
     let count = symbol_embeddings.len();
     save_embeddings(&emb_path, &symbol_embeddings)?;
+    write_embedder_identity(&infigraph_dir, &identity)?;
 
     // Below 200K symbols, brute-force rayon dot-product is faster than HNSW.
     // Build/rebuild HNSW only when above threshold OR when an existing index

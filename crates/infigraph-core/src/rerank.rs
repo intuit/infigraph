@@ -14,6 +14,9 @@ const ENDPOINT: &str = "https://api.cohere.com/v2/rerank";
 /// Cohere recommends at most 1000 documents per request; we cap far lower
 /// since only top search candidates are reranked.
 const MAX_DOCUMENTS: usize = 200;
+/// Overall request deadline (connect + write + read). Reranking is a
+/// best-effort second stage inside interactive search — never hang on it.
+const REQUEST_TIMEOUT_SECS: u64 = 30;
 
 /// Whether Cohere reranking is enabled (`COHERE_API_KEY` set and non-empty).
 pub fn cohere_enabled() -> bool {
@@ -59,16 +62,15 @@ pub fn maybe_rerank(
         .collect();
     match cohere_rerank(query, &texts, candidate_count) {
         Ok(ranked) => {
-            let mut reordered: Vec<SearchResult> = ranked
-                .iter()
-                .filter_map(|(idx, score)| {
-                    results.get(*idx).map(|r| {
-                        let mut r = r.clone();
-                        r.score = *score;
-                        r
-                    })
-                })
-                .collect();
+            // cohere_rerank guarantees a complete permutation of the
+            // candidates (exact count, unique, in-range), so no candidate can
+            // be dropped here.
+            let mut reordered: Vec<SearchResult> = Vec::with_capacity(results.len());
+            for (idx, score) in &ranked {
+                let mut r = results[*idx].clone();
+                r.score = *score;
+                reordered.push(r);
+            }
             reordered.extend(results[candidate_count..].iter().cloned());
             *results = reordered;
         }
@@ -96,7 +98,11 @@ pub fn cohere_rerank(query: &str, documents: &[String], top_n: usize) -> Result<
         "documents": documents,
         "top_n": top_n,
     });
-    let resp = ureq::post(ENDPOINT)
+    let agent = ureq::AgentBuilder::new()
+        .timeout(std::time::Duration::from_secs(REQUEST_TIMEOUT_SECS))
+        .build();
+    let resp = agent
+        .post(ENDPOINT)
         .set("Authorization", &format!("Bearer {api_key}"))
         .set("Content-Type", "application/json")
         .send_json(body)
@@ -104,22 +110,106 @@ pub fn cohere_rerank(query: &str, documents: &[String], top_n: usize) -> Result<
     let json: serde_json::Value = resp
         .into_json()
         .context("cohere rerank: invalid JSON response")?;
+    parse_rerank_response(&json, documents.len())
+}
+
+/// Parse and validate a Cohere rerank API response.
+///
+/// Every item must carry a valid, unique, in-range integer `index` and a
+/// numeric `relevance_score`. Because requests always set
+/// `top_n = documents.len()`, the response must rank every document — an
+/// incomplete or oversized result set is rejected as malformed.
+fn parse_rerank_response(json: &serde_json::Value, doc_count: usize) -> Result<Vec<(usize, f32)>> {
     let results = json["results"]
         .as_array()
         .ok_or_else(|| anyhow::anyhow!("cohere rerank: missing 'results' in response"))?;
+    anyhow::ensure!(
+        results.len() == doc_count,
+        "cohere rerank: {} results for {} documents",
+        results.len(),
+        doc_count
+    );
 
+    let mut seen = vec![false; doc_count];
     let mut ranked = Vec::with_capacity(results.len());
     for item in results {
         let idx = item["index"]
             .as_u64()
-            .ok_or_else(|| anyhow::anyhow!("cohere rerank: missing 'index'"))?
+            .ok_or_else(|| anyhow::anyhow!("cohere rerank: missing or invalid 'index'"))?
             as usize;
         let score = item["relevance_score"]
             .as_f64()
             .ok_or_else(|| anyhow::anyhow!("cohere rerank: missing 'relevance_score'"))?
             as f32;
-        anyhow::ensure!(idx < documents.len(), "cohere rerank: index out of range");
+        anyhow::ensure!(idx < doc_count, "cohere rerank: index {idx} out of range");
+        anyhow::ensure!(!seen[idx], "cohere rerank: duplicate index {idx}");
+        seen[idx] = true;
         ranked.push((idx, score));
     }
     Ok(ranked)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn resp(items: serde_json::Value) -> serde_json::Value {
+        serde_json::json!({ "results": items })
+    }
+
+    #[test]
+    fn parses_valid_response() {
+        let json = resp(serde_json::json!([
+            { "index": 1, "relevance_score": 0.9 },
+            { "index": 0, "relevance_score": 0.4 },
+        ]));
+        let ranked = parse_rerank_response(&json, 2).unwrap();
+        assert_eq!(ranked, vec![(1, 0.9), (0, 0.4)]);
+    }
+
+    #[test]
+    fn rejects_duplicate_index() {
+        let json = resp(serde_json::json!([
+            { "index": 0, "relevance_score": 0.9 },
+            { "index": 0, "relevance_score": 0.4 },
+        ]));
+        let err = parse_rerank_response(&json, 2).unwrap_err();
+        assert!(err.to_string().contains("duplicate"), "{err}");
+    }
+
+    #[test]
+    fn rejects_out_of_range_index() {
+        let json = resp(serde_json::json!([
+            { "index": 7, "relevance_score": 0.9 },
+        ]));
+        let err = parse_rerank_response(&json, 1).unwrap_err();
+        assert!(err.to_string().contains("out of range"), "{err}");
+    }
+
+    #[test]
+    fn rejects_missing_index_or_score() {
+        let json = resp(serde_json::json!([{ "relevance_score": 0.9 }]));
+        assert!(parse_rerank_response(&json, 1).is_err());
+        let json = resp(serde_json::json!([{ "index": 0 }]));
+        assert!(parse_rerank_response(&json, 1).is_err());
+    }
+
+    #[test]
+    fn rejects_more_results_than_documents() {
+        let json = resp(serde_json::json!([
+            { "index": 0, "relevance_score": 0.9 },
+            { "index": 1, "relevance_score": 0.8 },
+            { "index": 2, "relevance_score": 0.7 },
+        ]));
+        assert!(parse_rerank_response(&json, 2).is_err());
+    }
+
+    #[test]
+    fn rejects_incomplete_response() {
+        let json = resp(serde_json::json!([
+            { "index": 2, "relevance_score": 0.9 },
+        ]));
+        let err = parse_rerank_response(&json, 3).unwrap_err();
+        assert!(err.to_string().contains("1 results for 3"), "{err}");
+    }
 }
