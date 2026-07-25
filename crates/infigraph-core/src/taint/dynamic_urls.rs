@@ -140,9 +140,20 @@ pub fn detect_dynamic_urls(backend: &dyn GraphBackend, root: &Path) -> Result<Ve
         urls.extend(detected);
     }
 
-    if !urls.is_empty() {
-        write_calls_service_edges(backend, &urls)?;
-    }
+    let edges: Vec<crate::graph::CallsServiceEdge> = urls
+        .iter()
+        .filter_map(|url| {
+            url.matched_route
+                .as_ref()
+                .map(|matched| crate::graph::CallsServiceEdge {
+                    symbol_id: url.symbol_id.clone(),
+                    target_id: matched.handler_id.clone(),
+                    method: matched.method.clone(),
+                    path: url.url_template.clone(),
+                })
+        })
+        .collect();
+    backend.write_calls_service_edges(&edges)?;
 
     Ok(urls)
 }
@@ -178,9 +189,20 @@ pub fn detect_dynamic_urls_with_cache(
         urls.extend(detected);
     }
 
-    if !urls.is_empty() {
-        write_calls_service_edges(backend, &urls)?;
-    }
+    let edges: Vec<crate::graph::CallsServiceEdge> = urls
+        .iter()
+        .filter_map(|url| {
+            url.matched_route
+                .as_ref()
+                .map(|matched| crate::graph::CallsServiceEdge {
+                    symbol_id: url.symbol_id.clone(),
+                    target_id: matched.handler_id.clone(),
+                    method: matched.method.clone(),
+                    path: url.url_template.clone(),
+                })
+        })
+        .collect();
+    backend.write_calls_service_edges(&edges)?;
 
     Ok(urls)
 }
@@ -397,28 +419,6 @@ fn match_route(template: &str, routes: &[Route]) -> Option<MatchedRoute> {
     }
 
     None
-}
-
-fn write_calls_service_edges(backend: &dyn GraphBackend, urls: &[DynamicUrl]) -> Result<()> {
-    backend.raw_query("BEGIN TRANSACTION")?;
-
-    for url in urls {
-        if let Some(ref matched) = url.matched_route {
-            let src_esc = crate::escape_str(&url.symbol_id);
-            let tgt_esc = crate::escape_str(&matched.handler_id);
-            let method_esc = crate::escape_str(&matched.method);
-            let path_esc = crate::escape_str(&url.url_template);
-
-            let _ = backend.raw_query(&format!(
-                "MATCH (s:Symbol), (t:Symbol) WHERE s.id = '{src_esc}' AND t.id = '{tgt_esc}' \
-                 CREATE (s)-[:CALLS_SERVICE {{method: '{method_esc}', path: '{path_esc}', target_service: ''}}]->(t)"
-            ));
-        }
-    }
-
-    backend.raw_query("COMMIT")?;
-
-    Ok(())
 }
 
 pub fn format_dynamic_urls(urls: &[DynamicUrl]) -> String {

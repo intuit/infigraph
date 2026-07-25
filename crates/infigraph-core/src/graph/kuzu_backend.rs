@@ -7,7 +7,7 @@ use crate::learned::LearnedStore;
 use crate::model::FileExtraction;
 use crate::resolve::ResolveStats;
 
-use super::backend::GraphBackend;
+use super::backend::{CallsServiceEdge, GraphBackend};
 use super::queries::GraphQuery;
 use super::store::GraphStore;
 use super::{
@@ -455,6 +455,34 @@ impl GraphBackend for KuzuBackend {
 
     fn derive_tested_by_edges(&self, _changed_files: Option<&[&str]>) -> Result<usize> {
         self.store.derive_tested_by_edges()
+    }
+
+    fn write_calls_service_edges(&self, edges: &[CallsServiceEdge]) -> Result<()> {
+        if edges.is_empty() {
+            return Ok(());
+        }
+        let conn = self.store.connection()?;
+        conn.query("BEGIN TRANSACTION")
+            .map_err(|e| anyhow::anyhow!("failed to begin transaction: {e}"))?;
+        for edge in edges {
+            let src_esc = crate::escape_str(&edge.symbol_id);
+            let tgt_esc = crate::escape_str(&edge.target_id);
+            let method_esc = crate::escape_str(&edge.method);
+            let path_esc = crate::escape_str(&edge.path);
+            if let Err(e) = conn.query(&format!(
+                "MATCH (s:Symbol), (t:Symbol) WHERE s.id = '{src_esc}' AND t.id = '{tgt_esc}' \
+                 CREATE (s)-[:CALLS_SERVICE {{method: '{method_esc}', path: '{path_esc}', target_service: ''}}]->(t)"
+            )) {
+                // Roll back so we don't leave a half-applied batch or a
+                // dangling open transaction on this connection, then
+                // surface the real error instead of masking it.
+                let _ = conn.query("ROLLBACK");
+                return Err(anyhow::anyhow!("failed to create CALLS_SERVICE edge: {e}"));
+            }
+        }
+        conn.query("COMMIT")
+            .map_err(|e| anyhow::anyhow!("failed to commit CALLS_SERVICE edges: {e}"))?;
+        Ok(())
     }
 
     // ── Resolve ──────────────────────────────────────────────────────

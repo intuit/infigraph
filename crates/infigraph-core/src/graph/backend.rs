@@ -16,6 +16,17 @@ use super::{
     TestCoverage, TypeHierarchy,
 };
 
+/// A single detected dynamic-URL/route match, to be written as a
+/// `CALLS_SERVICE` edge from the calling symbol to the matched route
+/// handler.
+#[derive(Debug, Clone)]
+pub struct CallsServiceEdge {
+    pub symbol_id: String,
+    pub target_id: String,
+    pub method: String,
+    pub path: String,
+}
+
 /// Backend-agnostic graph storage interface.
 ///
 /// KuzuBackend wraps the existing embedded Kùzu store (local mode).
@@ -127,6 +138,12 @@ pub trait GraphBackend: Send + Sync {
     fn repo_filter(&self) -> Option<&str> {
         None
     }
+
+    /// Write a batch of `CALLS_SERVICE` edges as a single atomic operation.
+    /// Backend owns the transaction — callers don't manage connections
+    /// directly (same design as `upsert_files_bulk`/`resolve_calls`). A
+    /// no-op for an empty slice.
+    fn write_calls_service_edges(&self, edges: &[CallsServiceEdge]) -> Result<()>;
 
     // ── Resolve ──────────────────────────────────────────────────────
 
