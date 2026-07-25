@@ -249,7 +249,18 @@ fn collect_file_diffs(root: &Path, base_ref: &str) -> Result<HashMap<String, Str
 // LLM review via Claude API
 // ---------------------------------------------------------------------------
 
+/// Which LLM API the review calls.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum LlmProvider {
+    /// Anthropic Messages API (`/v1/messages`).
+    Anthropic,
+    /// Ollama chat API (`/api/chat`) — works with Ollama Cloud (ollama.com)
+    /// or any self-hosted Ollama server.
+    Ollama,
+}
+
 pub struct LlmConfig {
+    pub provider: LlmProvider,
     pub api_key: String,
     pub model: String,
     pub max_tokens: u32,
@@ -259,6 +270,7 @@ pub struct LlmConfig {
 impl Default for LlmConfig {
     fn default() -> Self {
         Self {
+            provider: LlmProvider::Anthropic,
             api_key: String::new(),
             model: "claude-sonnet-4-20250514".to_string(),
             max_tokens: 16384,
@@ -268,17 +280,39 @@ impl Default for LlmConfig {
 }
 
 impl LlmConfig {
+    /// Provider selection: `OLLAMA_API_KEY` (Ollama Cloud) takes precedence,
+    /// then `ANTHROPIC_API_KEY`. Model/base URL/max tokens are overridable via
+    /// `INFIGRAPH_LLM_MODEL`, `INFIGRAPH_LLM_BASE_URL`, `INFIGRAPH_LLM_MAX_TOKENS`.
     pub fn from_env() -> Result<Self> {
-        let api_key = std::env::var("ANTHROPIC_API_KEY").context("ANTHROPIC_API_KEY not set")?;
-        let model = std::env::var("INFIGRAPH_LLM_MODEL")
-            .unwrap_or_else(|_| "claude-sonnet-4-20250514".to_string());
-        let base_url = std::env::var("INFIGRAPH_LLM_BASE_URL")
-            .unwrap_or_else(|_| "https://api.anthropic.com".to_string());
         let max_tokens: u32 = std::env::var("INFIGRAPH_LLM_MAX_TOKENS")
             .unwrap_or_else(|_| "16384".to_string())
             .parse()
             .unwrap_or(16384);
+
+        if let Ok(api_key) = std::env::var("OLLAMA_API_KEY") {
+            if !api_key.is_empty() {
+                let model =
+                    std::env::var("INFIGRAPH_LLM_MODEL").unwrap_or_else(|_| "glm-5.2".to_string());
+                let base_url = std::env::var("INFIGRAPH_LLM_BASE_URL")
+                    .unwrap_or_else(|_| "https://ollama.com".to_string());
+                return Ok(Self {
+                    provider: LlmProvider::Ollama,
+                    api_key,
+                    model,
+                    max_tokens,
+                    base_url,
+                });
+            }
+        }
+
+        let api_key = std::env::var("ANTHROPIC_API_KEY")
+            .context("no LLM API key set (expected OLLAMA_API_KEY or ANTHROPIC_API_KEY)")?;
+        let model = std::env::var("INFIGRAPH_LLM_MODEL")
+            .unwrap_or_else(|_| "claude-sonnet-4-20250514".to_string());
+        let base_url = std::env::var("INFIGRAPH_LLM_BASE_URL")
+            .unwrap_or_else(|_| "https://api.anthropic.com".to_string());
         Ok(Self {
+            provider: LlmProvider::Anthropic,
             api_key,
             model,
             max_tokens,
@@ -682,6 +716,14 @@ pub fn build_review_prompt(enriched: &EnrichedReport, context: Option<&str>) -> 
     prompt
 }
 
+/// Dispatch the review prompt to the configured LLM provider.
+pub fn call_llm(config: &LlmConfig, prompt: &str) -> Result<LlmReviewResult> {
+    match config.provider {
+        LlmProvider::Anthropic => call_claude(config, prompt),
+        LlmProvider::Ollama => call_ollama(config, prompt),
+    }
+}
+
 pub fn call_claude(config: &LlmConfig, prompt: &str) -> Result<LlmReviewResult> {
     let mut messages: Vec<serde_json::Value> =
         vec![serde_json::json!({"role": "user", "content": prompt})];
@@ -732,7 +774,66 @@ pub fn call_claude(config: &LlmConfig, prompt: &str) -> Result<LlmReviewResult> 
         output_tokens: total_output,
     };
 
-    let json_str = extract_json(&full_text);
+    parse_review_response(&full_text, usage)
+}
+
+/// Call the Ollama chat API (`/api/chat`, non-streaming). Works against
+/// Ollama Cloud (`https://ollama.com` + `OLLAMA_API_KEY`) and self-hosted servers.
+pub fn call_ollama(config: &LlmConfig, prompt: &str) -> Result<LlmReviewResult> {
+    let mut messages: Vec<serde_json::Value> =
+        vec![serde_json::json!({"role": "user", "content": prompt})];
+    let mut full_text = String::new();
+    let mut total_input: u64 = 0;
+    let mut total_output: u64 = 0;
+    let max_continuations = 5;
+
+    for attempt in 0..=max_continuations {
+        let body = serde_json::json!({
+            "model": config.model,
+            "messages": messages,
+            "stream": false,
+            "options": { "num_predict": config.max_tokens },
+        });
+
+        let mut req = ureq::post(&format!("{}/api/chat", config.base_url))
+            .set("content-type", "application/json");
+        if !config.api_key.is_empty() {
+            req = req.set("Authorization", &format!("Bearer {}", config.api_key));
+        }
+        let resp = req
+            .send_string(&body.to_string())
+            .context("Ollama API request failed")?;
+
+        let resp_body: serde_json::Value = resp.into_json().context("parse Ollama response")?;
+
+        let chunk = resp_body["message"]["content"].as_str().unwrap_or("");
+
+        full_text.push_str(chunk);
+        total_input += resp_body["prompt_eval_count"].as_u64().unwrap_or(0);
+        total_output += resp_body["eval_count"].as_u64().unwrap_or(0);
+
+        let done_reason = resp_body["done_reason"].as_str().unwrap_or("stop");
+
+        if done_reason != "length" || attempt == max_continuations {
+            break;
+        }
+
+        // Truncated — ask LLM to continue
+        messages.push(serde_json::json!({"role": "assistant", "content": chunk}));
+        messages.push(serde_json::json!({"role": "user", "content": "Continue from where you left off. Complete the JSON."}));
+    }
+
+    let usage = TokenUsage {
+        input_tokens: total_input,
+        output_tokens: total_output,
+    };
+
+    parse_review_response(&full_text, usage)
+}
+
+/// Parse the model's raw text into a structured review result.
+fn parse_review_response(full_text: &str, usage: TokenUsage) -> Result<LlmReviewResult> {
+    let json_str = extract_json(full_text);
     let parsed: serde_json::Value = serde_json::from_str(json_str).unwrap_or_else(|_| {
         serde_json::json!({
             "summary": full_text,
@@ -797,7 +898,7 @@ pub fn review_with_llm(
     }
 
     let config = LlmConfig::from_env()?;
-    let result = call_claude(&config, &prompt)?;
+    let result = call_llm(&config, &prompt)?;
     Ok((prompt, Some(result)))
 }
 
@@ -928,4 +1029,46 @@ pub fn format_llm_review(result: &LlmReviewResult) -> String {
 
 pub fn format_llm_review_json(result: &LlmReviewResult) -> String {
     serde_json::to_string_pretty(result).unwrap_or_else(|_| "{}".to_string())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn default_config_is_anthropic() {
+        let config = LlmConfig::default();
+        assert_eq!(config.provider, LlmProvider::Anthropic);
+        assert!(config.model.starts_with("claude-"));
+        assert_eq!(config.base_url, "https://api.anthropic.com");
+    }
+
+    #[test]
+    fn parse_review_response_extracts_json() {
+        let text = r#"Here is my review:
+{"summary": "Looks good", "findings": [], "risk_assessment": "low"}
+Done."#;
+        let usage = TokenUsage {
+            input_tokens: 10,
+            output_tokens: 20,
+        };
+        let result = parse_review_response(text, usage).unwrap();
+        assert_eq!(result.summary, "Looks good");
+        assert!(result.findings.is_empty());
+        let usage = result.token_usage.unwrap();
+        assert_eq!(usage.input_tokens, 10);
+        assert_eq!(usage.output_tokens, 20);
+    }
+
+    #[test]
+    fn parse_review_response_falls_back_to_raw_text() {
+        let text = "not json at all";
+        let usage = TokenUsage {
+            input_tokens: 1,
+            output_tokens: 2,
+        };
+        let result = parse_review_response(text, usage).unwrap();
+        assert_eq!(result.summary, "not json at all");
+        assert!(result.findings.is_empty());
+    }
 }
