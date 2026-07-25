@@ -11,7 +11,7 @@ use crate::learned::LearnedStore;
 use crate::model::FileExtraction;
 use crate::resolve::ResolveStats;
 
-use super::backend::GraphBackend;
+use super::backend::{CallsServiceEdge, GraphBackend};
 use super::{
     ApiSymbol, ArchitectureStats, BranchInfo, ComplexityRow, DeadCodeRow, FileDeps, FileHotspot,
     GraphStats, HubFunction, ImpactRow, KindCount, LanguageCount, ReferenceRow, SymbolDetail,
@@ -1698,6 +1698,35 @@ impl GraphBackend for Neo4jBackend {
         }
         let count = self.count_query("MATCH ()-[r:TESTED_BY]->() RETURN count(r) AS c", "c")?;
         Ok(count as usize)
+    }
+
+    fn write_calls_service_edges(&self, edges: &[CallsServiceEdge]) -> Result<()> {
+        if edges.is_empty() {
+            return Ok(());
+        }
+        let edge_maps: Vec<HashMap<&str, String>> = edges
+            .iter()
+            .map(|e| {
+                let mut m = HashMap::new();
+                m.insert("symbol_id", e.symbol_id.clone());
+                m.insert("target_id", e.target_id.clone());
+                m.insert("method", e.method.clone());
+                m.insert("path", e.path.clone());
+                m
+            })
+            .collect();
+        self.block_on(
+            self.graph.run(
+                query(
+                    "UNWIND $edges AS e \
+                     MATCH (s:Symbol), (t:Symbol) WHERE s.id = e.symbol_id AND t.id = e.target_id \
+                     CREATE (s)-[:CALLS_SERVICE {method: e.method, path: e.path, target_service: ''}]->(t)",
+                )
+                .param("edges", edge_maps),
+            ),
+        )
+        .map_err(|e| anyhow::anyhow!("write_calls_service_edges failed: {e}"))?;
+        Ok(())
     }
 
     fn clear_all_data(&self) -> Result<()> {

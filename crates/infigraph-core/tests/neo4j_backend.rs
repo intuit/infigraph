@@ -8,7 +8,7 @@
 
 #![cfg(feature = "neo4j")]
 
-use infigraph_core::graph::{GraphBackend, Neo4jBackend};
+use infigraph_core::graph::{CallsServiceEdge, GraphBackend, Neo4jBackend};
 use infigraph_core::model::{FileExtraction, Relation, RelationKind, Span, Symbol, SymbolKind};
 
 fn span(file: &str, start: u32, end: u32) -> Span {
@@ -291,6 +291,97 @@ fn test_neo4j_raw_query() {
         .raw_query("MATCH (s:Symbol) RETURN s.name ORDER BY s.name")
         .expect("raw");
     assert_eq!(rows.len(), 3);
+}
+
+// ── CALLS_SERVICE edge tests ──────────────────────────────────────────
+
+fn seed_two_symbols(backend: &Neo4jBackend) {
+    let extractions = vec![
+        FileExtraction {
+            file: "caller.py".to_string(),
+            language: "python".to_string(),
+            content_hash: "h1".to_string(),
+            symbols: vec![sym(
+                "caller.py::handler",
+                "handler",
+                SymbolKind::Function,
+                "caller.py",
+                1,
+                5,
+            )],
+            relations: vec![],
+            statements: vec![],
+        },
+        FileExtraction {
+            file: "target.py".to_string(),
+            language: "python".to_string(),
+            content_hash: "h2".to_string(),
+            symbols: vec![sym(
+                "target.py::endpoint",
+                "endpoint",
+                SymbolKind::Function,
+                "target.py",
+                1,
+                5,
+            )],
+            relations: vec![],
+            statements: vec![],
+        },
+    ];
+    backend
+        .upsert_files_bulk(&extractions, true)
+        .expect("seed bulk");
+}
+
+#[test]
+#[ignore]
+fn test_neo4j_write_calls_service_edges_creates_all_edges_in_one_call() {
+    let backend = connect();
+    clear_graph(&backend);
+    seed_two_symbols(&backend);
+
+    let edges = vec![
+        CallsServiceEdge {
+            symbol_id: "caller.py::handler".to_string(),
+            target_id: "target.py::endpoint".to_string(),
+            method: "GET".to_string(),
+            path: "/api/one".to_string(),
+        },
+        CallsServiceEdge {
+            symbol_id: "caller.py::handler".to_string(),
+            target_id: "target.py::endpoint".to_string(),
+            method: "POST".to_string(),
+            path: "/api/two".to_string(),
+        },
+    ];
+
+    backend.write_calls_service_edges(&edges).expect(
+        "write_calls_service_edges must succeed, not fail with 'No active transaction for COMMIT'",
+    );
+
+    let rows = backend
+        .raw_query(
+            "MATCH (:Symbol)-[r:CALLS_SERVICE]->(:Symbol) RETURN r.method, r.path ORDER BY r.method",
+        )
+        .expect("raw");
+    assert_eq!(
+        rows.len(),
+        2,
+        "expected both edges to be created, got {rows:?}"
+    );
+    assert_eq!(rows[0][0], "GET");
+    assert_eq!(rows[0][1], "/api/one");
+    assert_eq!(rows[1][0], "POST");
+    assert_eq!(rows[1][1], "/api/two");
+}
+
+#[test]
+#[ignore]
+fn test_neo4j_write_calls_service_edges_empty_is_a_noop() {
+    let backend = connect();
+    clear_graph(&backend);
+
+    backend.write_calls_service_edges(&[]).expect("empty noop");
 }
 
 // ── Namespace isolation tests ────────────────────────────────────────
