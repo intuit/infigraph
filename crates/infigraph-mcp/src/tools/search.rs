@@ -439,22 +439,27 @@ pub fn tool_search(args: &Value) -> Result<String> {
     }
 
     // Local-dev hook: optional Cohere second-stage rerank (COHERE_API_KEY).
-    // Cohere replaces scores wholesale, which would silently drop the grep
-    // correlation boost applied above (important when regex=true and the
-    // pattern differs from the query) — re-apply it and re-sort.
-    if infigraph_core::rerank::maybe_rerank(query, &mut symbol_results, docs_ref, limit)
-        && !grep_by_symbol.is_empty()
+    // Cohere replaces the reranked prefix's scores wholesale, which would
+    // silently drop the grep correlation boost applied above (important when
+    // regex=true and the pattern differs from the query) — re-apply it to the
+    // reranked prefix only (the tail keeps local-scale scores, already
+    // boosted) and re-sort just that prefix so the two scales never mix.
+    if let Some(n) =
+        infigraph_core::rerank::maybe_rerank(query, &mut symbol_results, docs_ref, limit)
     {
-        for r in symbol_results.iter_mut() {
-            if let Some(gms) = grep_by_symbol.get(r.symbol_id.as_str()) {
-                r.score += 0.05 * gms.len() as f32;
+        if !grep_by_symbol.is_empty() {
+            let prefix = &mut symbol_results[..n];
+            for r in prefix.iter_mut() {
+                if let Some(gms) = grep_by_symbol.get(r.symbol_id.as_str()) {
+                    r.score += 0.05 * gms.len() as f32;
+                }
             }
+            prefix.sort_by(|a, b| {
+                b.score
+                    .partial_cmp(&a.score)
+                    .unwrap_or(std::cmp::Ordering::Equal)
+            });
         }
-        symbol_results.sort_by(|a, b| {
-            b.score
-                .partial_cmp(&a.score)
-                .unwrap_or(std::cmp::Ordering::Equal)
-        });
     }
 
     symbol_results.truncate(limit);

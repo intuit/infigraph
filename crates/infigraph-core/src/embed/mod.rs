@@ -63,6 +63,13 @@ pub trait EmbedProvider: Send + Sync {
     fn identity(&self) -> String;
     fn embed_batch(&self, texts: &[&str]) -> Result<Vec<Vec<f32>>>;
 
+    /// Whether `embed_batch` makes network calls to a remote API. Remote
+    /// providers are batched sequentially during index builds so parallel
+    /// chunks don't hammer the API into rate-limit failures.
+    fn is_remote(&self) -> bool {
+        false
+    }
+
     fn embed(&self, text: &str) -> Result<Vec<f32>> {
         let mut results = self.embed_batch(&[text])?;
         results
@@ -512,25 +519,34 @@ pub fn update_embeddings(
         // Propagate batch failures instead of silently dropping vectors: a
         // partial index must never be persisted (nor its identity recorded)
         // as a successful build.
-        let results: Vec<Vec<(String, Vec<f32>)>> = to_embed
-            .par_chunks(BATCH)
-            .map(|chunk| -> Result<Vec<(String, Vec<f32>)>> {
-                let emb = Arc::clone(&embedder);
-                let texts: Vec<&str> = chunk.iter().map(|(_, t)| t.as_str()).collect();
-                let vecs = emb.embed_batch(&texts)?;
-                anyhow::ensure!(
-                    vecs.len() == chunk.len(),
-                    "embedder returned {} vectors for {} texts",
-                    vecs.len(),
-                    chunk.len()
-                );
-                Ok(chunk
-                    .iter()
-                    .zip(vecs)
-                    .map(|((id, _), v)| (id.clone(), v))
-                    .collect())
-            })
-            .collect::<Result<Vec<_>>>()?;
+        let embed_chunk = |chunk: &[(String, String)]| -> Result<Vec<(String, Vec<f32>)>> {
+            let texts: Vec<&str> = chunk.iter().map(|(_, t)| t.as_str()).collect();
+            let vecs = embedder.embed_batch(&texts)?;
+            anyhow::ensure!(
+                vecs.len() == chunk.len(),
+                "embedder returned {} vectors for {} texts",
+                vecs.len(),
+                chunk.len()
+            );
+            Ok(chunk
+                .iter()
+                .zip(vecs)
+                .map(|((id, _), v)| (id.clone(), v))
+                .collect())
+        };
+        // Remote APIs get sequential batches (rate limits); local models get
+        // the full rayon pool.
+        let results: Vec<Vec<(String, Vec<f32>)>> = if embedder.is_remote() {
+            to_embed
+                .chunks(BATCH)
+                .map(embed_chunk)
+                .collect::<Result<Vec<_>>>()?
+        } else {
+            to_embed
+                .par_chunks(BATCH)
+                .map(embed_chunk)
+                .collect::<Result<Vec<_>>>()?
+        };
         for batch in results {
             for (id, v) in batch {
                 existing.insert(id, v);

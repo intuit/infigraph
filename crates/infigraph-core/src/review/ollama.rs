@@ -18,6 +18,10 @@ use anyhow::{Context, Result};
 
 use super::llm::{LlmFinding, LlmReviewResult, RiskItem, TestCase, TokenUsage};
 
+/// Per-request timeout. Reviews of large diffs on slow models legitimately
+/// take minutes, so this only guards against a fully stalled server.
+const REQUEST_TIMEOUT_SECS: u64 = 600;
+
 /// Whether the Ollama provider is enabled.
 ///
 /// Explicit selection via `INFIGRAPH_LLM_PROVIDER=ollama` always wins (any
@@ -54,6 +58,12 @@ pub fn review(prompt: &str) -> Result<LlmReviewResult> {
     let mut total_output: u64 = 0;
     let max_continuations = 5;
 
+    // Bound each request so a stalled server can't hang the review forever.
+    // Reviews of large diffs on slow models legitimately take minutes.
+    let agent = ureq::AgentBuilder::new()
+        .timeout(std::time::Duration::from_secs(REQUEST_TIMEOUT_SECS))
+        .build();
+
     for attempt in 0..=max_continuations {
         let body = serde_json::json!({
             "model": model,
@@ -62,8 +72,9 @@ pub fn review(prompt: &str) -> Result<LlmReviewResult> {
             "options": { "num_predict": max_tokens },
         });
 
-        let mut req =
-            ureq::post(&format!("{base_url}/api/chat")).set("content-type", "application/json");
+        let mut req = agent
+            .post(&format!("{base_url}/api/chat"))
+            .set("content-type", "application/json");
         if !api_key.is_empty() {
             req = req.set("Authorization", &format!("Bearer {api_key}"));
         }
@@ -73,13 +84,20 @@ pub fn review(prompt: &str) -> Result<LlmReviewResult> {
 
         let resp_body: serde_json::Value = resp.into_json().context("parse Ollama response")?;
 
-        let chunk = resp_body["message"]["content"].as_str().unwrap_or("");
+        // Reject structurally incomplete responses (e.g. `{ "done": true }`)
+        // instead of silently treating them as an empty, finished reply.
+        let chunk = resp_body
+            .pointer("/message/content")
+            .and_then(serde_json::Value::as_str)
+            .context("Ollama response missing string message.content")?;
 
         full_text.push_str(chunk);
         total_input += resp_body["prompt_eval_count"].as_u64().unwrap_or(0);
         total_output += resp_body["eval_count"].as_u64().unwrap_or(0);
 
-        let done_reason = resp_body["done_reason"].as_str().unwrap_or("stop");
+        let done_reason = resp_body["done_reason"]
+            .as_str()
+            .context("Ollama response missing string done_reason")?;
 
         if done_reason != "length" || attempt == max_continuations {
             break;
@@ -138,12 +156,20 @@ fn parse_json_array<T: serde::de::DeserializeOwned>(val: &serde_json::Value) -> 
 }
 
 fn extract_json(text: &str) -> &str {
-    // Strip markdown code fences if present
+    // Find the first position where a complete, valid JSON value can be
+    // parsed. A first-`{`-to-last-`}` slice would break when the model emits
+    // prose containing brace-like examples before the actual JSON object.
     let trimmed = text.trim();
-    if let Some(start) = trimmed.find('{') {
-        if let Some(end) = trimmed.rfind('}') {
-            return &trimmed[start..=end];
+    let mut search_from = 0;
+    while let Some(rel) = trimmed[search_from..].find('{') {
+        let start = search_from + rel;
+        let mut stream =
+            serde_json::Deserializer::from_str(&trimmed[start..]).into_iter::<serde_json::Value>();
+        if let Some(Ok(_)) = stream.next() {
+            let end = start + stream.byte_offset();
+            return &trimmed[start..end];
         }
+        search_from = start + 1;
     }
     trimmed
 }
@@ -167,6 +193,15 @@ Done."#;
         let usage = result.token_usage.unwrap();
         assert_eq!(usage.input_tokens, 10);
         assert_eq!(usage.output_tokens, 20);
+    }
+
+    #[test]
+    fn extract_json_skips_brace_like_prose_before_json() {
+        let text = r#"The format is {summary, findings} as discussed.
+{"summary": "ok", "findings": []}"#;
+        let extracted = extract_json(text);
+        let parsed: serde_json::Value = serde_json::from_str(extracted).unwrap();
+        assert_eq!(parsed["summary"], "ok");
     }
 
     #[test]

@@ -138,6 +138,10 @@ impl EmbedProvider for VoyageEmbedder {
         format!("voyage:{}:{}", self.model, self.dim)
     }
 
+    fn is_remote(&self) -> bool {
+        true
+    }
+
     fn embed_batch(&self, texts: &[&str]) -> Result<Vec<Vec<f32>>> {
         let mut all = Vec::with_capacity(texts.len());
         for chunk in texts.chunks(Self::BATCH_SIZE) {

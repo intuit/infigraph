@@ -34,16 +34,19 @@ fn model() -> String {
 /// relevance in `[0, 1]`). `docs` maps symbol IDs to embedding text; symbols
 /// missing from it fall back to a `kind name in file` description. Best-effort:
 /// on any API failure the local ordering is kept and a warning is printed.
-/// Returns `true` when a Cohere rerank was applied (scores replaced), so
-/// callers can re-apply any local score adjustments (e.g. grep boosts).
+/// Returns `Some(n)` when a Cohere rerank was applied — the first `n`
+/// results had their scores replaced with Cohere relevance (the tail keeps
+/// local scores, on a different scale) — so callers can re-apply any local
+/// score adjustments (e.g. grep boosts) to that prefix. Returns `None` when
+/// rerank was disabled, skipped, or failed (local scores left intact).
 pub fn maybe_rerank(
     query: &str,
     results: &mut Vec<SearchResult>,
     docs: &[(String, String)],
     limit: usize,
-) -> bool {
+) -> Option<usize> {
     if !cohere_enabled() || results.is_empty() {
-        return false;
+        return None;
     }
     let candidate_count = results
         .len()
@@ -75,11 +78,11 @@ pub fn maybe_rerank(
             }
             reordered.extend(results[candidate_count..].iter().cloned());
             *results = reordered;
-            true
+            Some(candidate_count)
         }
         Err(e) => {
             eprintln!("warning: cohere rerank failed, using local ranking: {e}");
-            false
+            None
         }
     }
 }
@@ -87,10 +90,20 @@ pub fn maybe_rerank(
 /// Rerank `documents` against `query` with the Cohere Rerank API.
 ///
 /// Returns `(original_index, relevance_score)` pairs ordered from most to
-/// least relevant, truncated to `top_n`. Relevance scores are in `[0, 1]`.
+/// least relevant. `top_n` must equal `documents.len()` — the result is a
+/// complete permutation of the candidates. Relevance scores are in `[0, 1]`.
 pub fn cohere_rerank(query: &str, documents: &[String], top_n: usize) -> Result<Vec<(usize, f32)>> {
     let api_key = std::env::var("COHERE_API_KEY").context("COHERE_API_KEY not set")?;
     anyhow::ensure!(!documents.is_empty(), "cohere rerank: no documents");
+    // Contract: callers must rerank the full candidate set. The response
+    // validation below requires a complete permutation, so a smaller top_n
+    // (a legitimate partial Cohere response) would be misreported as an
+    // incomplete-response error.
+    anyhow::ensure!(
+        top_n == documents.len(),
+        "cohere rerank: top_n ({top_n}) must equal document count ({})",
+        documents.len()
+    );
     anyhow::ensure!(
         documents.len() <= MAX_DOCUMENTS,
         "cohere rerank: too many documents ({}, max {})",
@@ -211,11 +224,11 @@ mod tests {
     }
 
     #[test]
-    fn maybe_rerank_returns_false_when_not_applied() {
+    fn maybe_rerank_returns_none_when_not_applied() {
         // Empty results short-circuit regardless of COHERE_API_KEY, so the
         // caller knows local score adjustments were left intact.
         let mut results: Vec<SearchResult> = Vec::new();
-        assert!(!maybe_rerank("query", &mut results, &[], 10));
+        assert_eq!(maybe_rerank("query", &mut results, &[], 10), None);
     }
 
     #[test]

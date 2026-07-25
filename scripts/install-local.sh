@@ -34,10 +34,13 @@ done
 
 mkdir -p "$INSTALL_DIR"
 
-# Atomic replacement: stage BOTH binaries in the destination directory first,
-# so a failed copy cannot leave a mixed-version install. Then rename each over
-# its target — rename(2) replaces the directory entry even when the old binary
-# is running (the running process keeps the old inode).
+# Stage BOTH binaries in the destination directory first, so a failed copy or
+# a broken build never displaces a working install. Each rename(2) below is
+# individually atomic (and replaces the entry even while the old binary runs —
+# the running process keeps the old inode), but the pair is not: a crash
+# between the two renames can briefly leave a mixed-version install. Rerunning
+# this script fixes that; full pair-atomicity would need a versioned dir +
+# symlink switch, which is overkill for a local dev install.
 cleanup() { rm -f "$INSTALL_DIR"/.infigraph.tmp.$$ "$INSTALL_DIR"/.infigraph-mcp.tmp.$$; }
 trap cleanup EXIT
 
