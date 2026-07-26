@@ -109,7 +109,7 @@ pub fn spawn_parent_monitor() {
 
     let direct_child = current_ppid() == Some(pid);
 
-    std::thread::Builder::new()
+    let spawned = std::thread::Builder::new()
         .name("parent-monitor".into())
         .spawn(move || loop {
             std::thread::sleep(PARENT_POLL_INTERVAL);
@@ -126,8 +126,16 @@ pub fn spawn_parent_monitor() {
                 );
                 std::process::exit(0);
             }
-        })
-        .expect("failed to spawn parent-monitor thread");
+        });
+    if let Err(e) = spawned {
+        // Worker still exits on stdin EOF in MCP mode; a missing monitor
+        // only matters for abnormal supervisor death, so log and continue
+        // rather than killing a healthy worker at startup.
+        crate::mcp_log(
+            "WARN",
+            &format!("failed to spawn parent-monitor thread: {e} — orphan reaping disabled"),
+        );
+    }
 }
 
 #[cfg(test)]
