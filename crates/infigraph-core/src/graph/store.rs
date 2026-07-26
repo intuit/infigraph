@@ -38,6 +38,42 @@ impl WriteLock {
     }
 }
 
+/// Minimum plausible size of a Kuzu database file. A freshly created
+/// database is at least one page (4 KiB); anything smaller is a
+/// truncated/corrupt file that Kuzu's own parser cannot be trusted with.
+const MIN_DB_FILE_SIZE: u64 = 4096;
+
+/// Preflight check before handing a path to `kuzu::Database::new`.
+///
+/// A truncated or corrupt database file can make Kuzu's parser read a bogus
+/// size field and request a huge allocation, which aborts the whole process
+/// on some platforms (observed on Linux) or segfaults later at read time
+/// (observed on macOS) — before any `Result` exists to catch it. Rejecting
+/// obviously-invalid files here turns that abort into a normal error that
+/// callers' wipe-and-rebuild recovery (`Infigraph::init`, `DocIndex::init`)
+/// already handles.
+///
+/// A missing path (fresh create) and a directory (legacy on-disk layout)
+/// are both fine.
+pub fn validate_db_file(path: &Path) -> Result<()> {
+    let meta = match std::fs::metadata(path) {
+        Ok(m) => m,
+        Err(_) => return Ok(()), // doesn't exist yet — fresh create
+    };
+    if meta.is_dir() {
+        return Ok(()); // legacy directory layout — let Kuzu handle it
+    }
+    if meta.len() < MIN_DB_FILE_SIZE {
+        anyhow::bail!(
+            "database file {} is truncated/corrupt ({} bytes, expected at least {})",
+            path.display(),
+            meta.len(),
+            MIN_DB_FILE_SIZE
+        );
+    }
+    Ok(())
+}
+
 /// Persistent graph store backed by Kuzu.
 pub struct GraphStore {
     db: Database,
@@ -50,6 +86,7 @@ impl GraphStore {
         if let Some(parent) = path.parent() {
             std::fs::create_dir_all(parent)?;
         }
+        validate_db_file(path)?;
         let lock_path = path.with_extension("lock");
         let db = Database::new(path, SystemConfig::default())
             .map_err(|e| anyhow::anyhow!("failed to open kuzu db: {e}"))?;
@@ -61,6 +98,7 @@ impl GraphStore {
     /// Open an existing Kuzu database in read-only mode.
     /// Safe for concurrent access while a watcher is writing.
     pub fn open_read_only(path: &Path) -> Result<Self> {
+        validate_db_file(path)?;
         let lock_path = path.with_extension("lock");
         let config = SystemConfig::default()
             .read_only(true)
@@ -253,4 +291,53 @@ fn count_query(conn: &Connection, query: &str) -> Result<u64> {
         }
     }
     Ok(0)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Regression test: a truncated graph file used to be handed straight to
+    /// `kuzu::Database::new`, which parses a bogus size field from the header
+    /// and either aborts the process (Linux) or segfaults later at read time
+    /// (macOS, `BufferManager::optimisticRead`). The preflight must turn this
+    /// into a normal `Err` so `Infigraph::init`'s wipe-and-rebuild path runs.
+    #[test]
+    fn open_truncated_db_file_returns_err_instead_of_aborting() {
+        let dir = tempfile::tempdir().unwrap();
+        let db_path = dir.path().join("graph");
+        std::fs::write(&db_path, b"garbage, way below one page").unwrap();
+
+        let err = GraphStore::open(&db_path)
+            .map(|_| ())
+            .expect_err("truncated file must be rejected");
+        assert!(
+            err.to_string().contains("truncated/corrupt"),
+            "unexpected error: {err}"
+        );
+
+        let err = GraphStore::open_read_only(&db_path)
+            .map(|_| ())
+            .expect_err("truncated file must be rejected in read-only mode too");
+        assert!(err.to_string().contains("truncated/corrupt"));
+    }
+
+    #[test]
+    fn validate_db_file_accepts_missing_path_and_directory() {
+        let dir = tempfile::tempdir().unwrap();
+        // Missing → fresh create, fine.
+        assert!(validate_db_file(&dir.path().join("does-not-exist")).is_ok());
+        // Directory (legacy layout) → fine.
+        assert!(validate_db_file(dir.path()).is_ok());
+    }
+
+    #[test]
+    fn open_fresh_then_reopen_still_works_with_preflight() {
+        let dir = tempfile::tempdir().unwrap();
+        let db_path = dir.path().join("graph");
+        // Fresh create.
+        drop(GraphStore::open(&db_path).expect("fresh create must succeed"));
+        // Reopen of a valid db must pass the preflight.
+        drop(GraphStore::open(&db_path).expect("reopen of valid db must succeed"));
+    }
 }

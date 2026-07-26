@@ -72,6 +72,10 @@ impl DocStore {
         if let Some(parent) = path.parent() {
             std::fs::create_dir_all(parent)?;
         }
+        // Preflight: a truncated/corrupt file can abort or segfault inside
+        // `Database::new` before any `Result` exists. Reject it here so
+        // `DocIndex::init`'s wipe-and-rebuild recovery runs instead.
+        infigraph_core::graph::validate_db_file(path)?;
         let db = Database::new(path, SystemConfig::default())
             .map_err(|e| anyhow::anyhow!("failed to open docs kuzu db: {e}"))?;
         let store = Self {
