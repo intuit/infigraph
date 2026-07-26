@@ -38,6 +38,9 @@ tokenizers = { version = "0.21", default-features = false, features = ["onig"], 
 [target.'cfg(unix)'.dependencies]
 libc = "0.2"
 
+[target.'cfg(windows)'.dependencies]
+windows-sys = { version = "0.59", features = ["Win32_Foundation", "Win32_System_Threading"] }
+
 [features]
 default = ["kompress"]
 kompress = ["dep:ort", "dep:ndarray", "dep:tokenizers"]

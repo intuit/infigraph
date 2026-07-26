@@ -22,8 +22,10 @@ const PARENT_POLL_INTERVAL: Duration = Duration::from_secs(5);
 /// Returns whether a process with the given PID currently exists.
 ///
 /// Unix: `kill(pid, 0)` — success or `EPERM` both mean the process exists.
-/// Windows: conservatively returns `true` (no orphan reaping there yet;
-/// the worker still exits on stdin EOF in MCP mode).
+/// Windows: `OpenProcess` + zero-timeout `WaitForSingleObject`; a handle we
+/// can't open for a reason other than "no such process" is treated as alive
+/// so a healthy worker is never killed spuriously.
+/// Other platforms: conservatively returns `true`.
 pub fn process_alive(pid: u32) -> bool {
     #[cfg(unix)]
     {
@@ -43,7 +45,32 @@ pub fn process_alive(pid: u32) -> bool {
         // EPERM: process exists but we can't signal it — still alive.
         std::io::Error::last_os_error().raw_os_error() == Some(libc::EPERM)
     }
-    #[cfg(not(unix))]
+    #[cfg(windows)]
+    {
+        use windows_sys::Win32::Foundation::{
+            CloseHandle, GetLastError, ERROR_INVALID_PARAMETER, WAIT_TIMEOUT,
+        };
+        use windows_sys::Win32::System::Threading::{
+            OpenProcess, WaitForSingleObject, PROCESS_SYNCHRONIZE,
+        };
+
+        if pid == 0 {
+            return false;
+        }
+        let handle = unsafe { OpenProcess(PROCESS_SYNCHRONIZE, 0, pid) };
+        if handle.is_null() {
+            // ERROR_INVALID_PARAMETER: no such process. Anything else
+            // (e.g. access denied) means it exists but is inaccessible —
+            // err on the side of "alive" so we never exit spuriously.
+            return unsafe { GetLastError() } != ERROR_INVALID_PARAMETER;
+        }
+        // Zero-timeout wait: WAIT_TIMEOUT ⇒ still running; WAIT_OBJECT_0
+        // (or failure) ⇒ terminated.
+        let res = unsafe { WaitForSingleObject(handle, 0) };
+        unsafe { CloseHandle(handle) };
+        res == WAIT_TIMEOUT
+    }
+    #[cfg(not(any(unix, windows)))]
     {
         let _ = pid;
         true
