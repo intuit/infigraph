@@ -27,7 +27,16 @@ const PARENT_POLL_INTERVAL: Duration = Duration::from_secs(5);
 pub fn process_alive(pid: u32) -> bool {
     #[cfg(unix)]
     {
-        let res = unsafe { libc::kill(pid as libc::pid_t, 0) };
+        // pid 0 would signal the whole process group, and values that
+        // don't fit pid_t would wrap negative (group/broadcast semantics) —
+        // neither is a valid single-process PID.
+        let Ok(pid_t) = libc::pid_t::try_from(pid) else {
+            return false;
+        };
+        if pid_t <= 0 {
+            return false;
+        }
+        let res = unsafe { libc::kill(pid_t, 0) };
         if res == 0 {
             return true;
         }
