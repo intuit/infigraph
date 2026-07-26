@@ -1,7 +1,7 @@
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 
-use anyhow::Result;
+use anyhow::{Context, Result};
 use kuzu::{Connection, Database, SystemConfig};
 
 use super::schema::{CREATE_SCHEMA, MIGRATIONS};
@@ -58,7 +58,14 @@ const MIN_DB_FILE_SIZE: u64 = 4096;
 pub fn validate_db_file(path: &Path) -> Result<()> {
     let meta = match std::fs::metadata(path) {
         Ok(m) => m,
-        Err(_) => return Ok(()), // doesn't exist yet — fresh create
+        // Doesn't exist yet — fresh create.
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(()),
+        // Permission errors etc. are real problems — don't mask them as
+        // "fresh create" or Kuzu will fail later with a worse message.
+        Err(e) => {
+            return Err(e)
+                .with_context(|| format!("read database metadata for {}", path.display()));
+        }
     };
     if meta.is_dir() {
         return Ok(()); // legacy directory layout — let Kuzu handle it

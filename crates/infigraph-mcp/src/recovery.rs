@@ -22,7 +22,9 @@ pub fn collect_reindex_targets(
     let mut targets = Vec::new();
 
     let mut push = |path: &Path| {
-        if !path.join(".infigraph").exists() {
+        // Must be a directory — a stray regular file named `.infigraph`
+        // is not an index and must not trigger a reindex.
+        if !path.join(".infigraph").is_dir() {
             return;
         }
         let key = path.canonicalize().unwrap_or_else(|_| path.to_path_buf());
@@ -132,12 +134,27 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         fs::create_dir_all(dir.path().join(".infigraph")).unwrap();
 
-        let registry = vec![dir.path().to_path_buf()];
+        // Syntactic alias of the same directory — dedup must go through
+        // canonicalization, not string equality.
+        let registry = vec![dir.path().join(".")];
         let targets = collect_reindex_targets(Some(dir.path()), &registry, None);
         assert_eq!(
             targets.len(),
             1,
             "same repo via startup dir and registry must be indexed once"
+        );
+    }
+
+    #[test]
+    fn collect_targets_skips_infigraph_regular_file() {
+        let dir = tempfile::tempdir().unwrap();
+        // A stray regular file named `.infigraph` is not an index.
+        fs::write(dir.path().join(".infigraph"), b"not a dir").unwrap();
+
+        let targets = collect_reindex_targets(Some(dir.path()), &[], None);
+        assert!(
+            targets.is_empty(),
+            "regular file named .infigraph must not trigger recovery"
         );
     }
 

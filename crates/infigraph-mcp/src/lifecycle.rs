@@ -41,9 +41,28 @@ pub fn process_alive(pid: u32) -> bool {
     }
 }
 
+/// Returns the current parent PID on Unix, `None` elsewhere.
+fn current_ppid() -> Option<u32> {
+    #[cfg(unix)]
+    {
+        Some(unsafe { libc::getppid() } as u32)
+    }
+    #[cfg(not(unix))]
+    {
+        None
+    }
+}
+
 /// If `INFIGRAPH_SUPERVISOR_PID` is set, spawn a background thread that
-/// exits this process once that PID is gone. No-op when the env var is
-/// absent (e.g. `--worker` launched directly for debugging).
+/// exits this process once the supervisor is gone. No-op when the env var
+/// is absent (e.g. `--worker` launched directly for debugging).
+///
+/// When the worker is a direct child of the supervisor (the normal case),
+/// the check is `getppid() != supervisor_pid`: on supervisor death the
+/// kernel re-parents the worker, so this is immune to PID reuse. If the
+/// worker is not a direct child (unusual debug setups), it falls back to
+/// `process_alive` polling, which can in theory be fooled by PID reuse
+/// but never exits a healthy process spuriously.
 pub fn spawn_parent_monitor() {
     let Some(pid) = std::env::var(SUPERVISOR_PID_ENV)
         .ok()
@@ -52,11 +71,19 @@ pub fn spawn_parent_monitor() {
         return;
     };
 
+    let direct_child = current_ppid() == Some(pid);
+
     std::thread::Builder::new()
         .name("parent-monitor".into())
         .spawn(move || loop {
             std::thread::sleep(PARENT_POLL_INTERVAL);
-            if !process_alive(pid) {
+            let gone = if direct_child {
+                // Re-parented ⇒ the supervisor died. PID-reuse-proof.
+                current_ppid() != Some(pid)
+            } else {
+                !process_alive(pid)
+            };
+            if gone {
                 crate::mcp_log(
                     "INFO",
                     &format!("supervisor (pid {pid}) is gone — worker exiting to avoid orphan"),
