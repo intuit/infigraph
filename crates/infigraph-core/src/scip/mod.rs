@@ -13,6 +13,34 @@ use crate::graph::store_util::{escape, fwd_slash_path, unwind_edges_from_pairs};
 use crate::graph::GraphStore;
 use crate::model::{Span, SymbolKind};
 
+/// True when `scip_sym` is a member (e.g. a parameter) of a symbol we
+/// already know about, per SCIP's own descriptor grammar: strip a single
+/// trailing `(...)` group and check whether what remains is a moniker
+/// already present in `known` (built from every other non-local
+/// definition occurrence in this same import pass, before this check
+/// ever runs -- see `scip_sym_to_file_name`, populated before Pass 1).
+///
+/// Verified against real `scip-typescript` output: a parameter's moniker
+/// is exactly its enclosing method's own moniker (always ending in `.`)
+/// with `(paramName)` appended -- nothing else -- so this is an exact
+/// string match against already-known data, not a re-derived heuristic.
+/// Deliberately does NOT use `SymbolInformation.kind`: verified always
+/// `UnspecifiedKind` in real output, so it carries no usable signal.
+///
+/// A normal top-level definition's own moniker always ends in `.` (Term),
+/// `#` (Type), or `().` (Method) per SCIP's descriptor grammar -- never a
+/// bare `)` -- so this never fires for a legitimately-new symbol; it can
+/// only match nested member descriptors.
+fn is_member_of_known_symbol(scip_sym: &str, known: &HashMap<String, (String, String)>) -> bool {
+    let Some(without_group) = scip_sym.strip_suffix(')') else {
+        return false;
+    };
+    let Some(open) = without_group.rfind('(') else {
+        return false;
+    };
+    known.contains_key(&without_group[..open])
+}
+
 /// Import a SCIP index.scip file into the Infigraph graph store.
 ///
 /// Matches SCIP definitions to existing tree-sitter symbols by (file, name)
@@ -131,6 +159,9 @@ pub fn import_scip_index(
             }
             let scip_sym = &occ.symbol;
             if scip_sym.starts_with("local ") || scip_sym.starts_with('<') {
+                continue;
+            }
+            if is_member_of_known_symbol(scip_sym, &scip_sym_to_file_name) {
                 continue;
             }
 
@@ -834,6 +865,188 @@ mod tests {
         assert_eq!(
             docstring, "Widens a value.",
             "docstring enrichment should still apply"
+        );
+    }
+
+    #[test]
+    fn scip_parameter_descriptor_does_not_become_a_new_symbol() {
+        let env = TestEnv::new();
+        let file = "test.ts";
+        // Real scip-typescript shape, verified against real output: a
+        // parameter's moniker is exactly its enclosing method's own moniker
+        // (always ending in `.`) with `(paramName)` appended.
+        let method_sym = "scip-test npm test 1.0.0 `test.ts`/mintFn().".to_string();
+        let param_sym = "scip-test npm test 1.0.0 `test.ts`/mintFn().(rulesBag)".to_string();
+
+        let doc = Document {
+            relative_path: file.to_string(),
+            occurrences: vec![
+                Occurrence {
+                    range: vec![0, 16, 22],
+                    symbol: method_sym.clone(),
+                    symbol_roles: SymbolRole::Definition as i32,
+                    ..Default::default()
+                },
+                Occurrence {
+                    range: vec![0, 23, 31],
+                    symbol: param_sym.clone(),
+                    symbol_roles: SymbolRole::Definition as i32,
+                    ..Default::default()
+                },
+            ],
+            symbols: vec![
+                SymbolInformation {
+                    symbol: method_sym.clone(),
+                    ..Default::default()
+                },
+                SymbolInformation {
+                    symbol: param_sym.clone(),
+                    ..Default::default()
+                },
+            ],
+            ..Default::default()
+        };
+        let index = Index {
+            documents: vec![doc],
+            ..Default::default()
+        };
+        let bytes = index.write_to_bytes().unwrap();
+        let index_path = env._dir.path().join("index.scip");
+        std::fs::write(&index_path, bytes).unwrap();
+
+        let stats = import_scip_index(&index_path, &env.store, None).unwrap();
+        assert_eq!(
+            stats.symbols_added, 1,
+            "only the method itself should become a new symbol -- the parameter must be suppressed"
+        );
+
+        let conn = env.store.connection().unwrap();
+        let rows = conn.query("MATCH (s:Symbol) RETURN s.name").unwrap();
+        let names: Vec<String> = rows
+            .into_iter()
+            .map(|row| row[0].to_string().trim_matches('"').to_string())
+            .collect();
+        assert_eq!(
+            names,
+            vec!["mintFn".to_string()],
+            "no node should exist for the parameter descriptor, and its name must not \
+             leak through as a raw unparsed moniker on any node"
+        );
+    }
+
+    #[test]
+    fn calls_edge_still_attributes_to_enclosing_method_when_a_parameter_is_suppressed() {
+        let env = TestEnv::new();
+        let conn = env.store.connection().unwrap();
+
+        // Seed two pre-existing tree-sitter symbols with real full-body
+        // spans, the normal case: SCIP enriches an already-known function,
+        // it doesn't need to add it.
+        conn.query(
+            "CREATE (:Symbol {id: 'test.ts::mintFn', name: 'mintFn', kind: 'function', \
+             file: 'test.ts', start_line: 1, end_line: 10, signature_hash: '', \
+             language: 'typescript', visibility: 'public', parent: '', docstring: '', \
+             complexity: 0, parameters: '', return_type: ''})",
+        )
+        .unwrap();
+        conn.query(
+            "CREATE (:Symbol {id: 'test.ts::helper', name: 'helper', kind: 'function', \
+             file: 'test.ts', start_line: 20, end_line: 25, signature_hash: '', \
+             language: 'typescript', visibility: 'public', parent: '', docstring: '', \
+             complexity: 0, parameters: '', return_type: ''})",
+        )
+        .unwrap();
+
+        let file = "test.ts";
+        let method_sym = "scip-test npm test 1.0.0 `test.ts`/mintFn().".to_string();
+        let param_sym = "scip-test npm test 1.0.0 `test.ts`/mintFn().(rulesBag)".to_string();
+        let helper_sym = "scip-test npm test 1.0.0 `test.ts`/helper().".to_string();
+
+        let doc = Document {
+            relative_path: file.to_string(),
+            occurrences: vec![
+                // mintFn's own definition occurrence (identifier token only,
+                // line 0 == 1-based line 1, matching the seeded start_line).
+                Occurrence {
+                    range: vec![0, 16, 22],
+                    symbol: method_sym.clone(),
+                    symbol_roles: SymbolRole::Definition as i32,
+                    ..Default::default()
+                },
+                // Its parameter -- must be suppressed, not create a node
+                // that could steal container_id for the reference below.
+                Occurrence {
+                    range: vec![0, 23, 31],
+                    symbol: param_sym.clone(),
+                    symbol_roles: SymbolRole::Definition as i32,
+                    ..Default::default()
+                },
+                // helper's own definition occurrence (1-based line 20).
+                Occurrence {
+                    range: vec![19, 9, 15],
+                    symbol: helper_sym.clone(),
+                    symbol_roles: SymbolRole::Definition as i32,
+                    ..Default::default()
+                },
+                // A reference to helper() from inside mintFn's body (line 4,
+                // 0-based -> 1-based line 5, within mintFn's seeded [1,10]
+                // span and nowhere near the suppressed parameter's own
+                // narrow single-line range).
+                Occurrence {
+                    range: vec![4, 2, 8],
+                    symbol: helper_sym.clone(),
+                    symbol_roles: 0, // reference, not definition
+                    ..Default::default()
+                },
+            ],
+            symbols: vec![
+                SymbolInformation {
+                    symbol: method_sym.clone(),
+                    ..Default::default()
+                },
+                SymbolInformation {
+                    symbol: param_sym.clone(),
+                    ..Default::default()
+                },
+                SymbolInformation {
+                    symbol: helper_sym.clone(),
+                    ..Default::default()
+                },
+            ],
+            ..Default::default()
+        };
+        let index = Index {
+            documents: vec![doc],
+            ..Default::default()
+        };
+        let bytes = index.write_to_bytes().unwrap();
+        let index_path = env._dir.path().join("index.scip");
+        std::fs::write(&index_path, bytes).unwrap();
+
+        let stats = import_scip_index(&index_path, &env.store, None).unwrap();
+        assert_eq!(
+            stats.symbols_added, 0,
+            "both mintFn and helper already exist -- only enrichment, and the \
+             parameter must be suppressed, not added"
+        );
+
+        let rows = conn
+            .query("MATCH (a:Symbol)-[:CALLS]->(b:Symbol) RETURN a.name, b.name")
+            .unwrap();
+        let pairs: Vec<(String, String)> = rows
+            .into_iter()
+            .map(|row| {
+                (
+                    row[0].to_string().trim_matches('"').to_string(),
+                    row[1].to_string().trim_matches('"').to_string(),
+                )
+            })
+            .collect();
+        assert_eq!(
+            pairs,
+            vec![("mintFn".to_string(), "helper".to_string())],
+            "the CALLS edge must attribute to the real enclosing method, not be \
+             dropped or misattributed to a suppressed parameter pseudo-symbol"
         );
     }
 }
