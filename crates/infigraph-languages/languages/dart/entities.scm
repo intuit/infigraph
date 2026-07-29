@@ -17,14 +17,31 @@
   name: (identifier) @class.name) @class.def
 
 ; Top-level function declarations
+; function_signature genuinely has "parameters"/"return_type" named
+; fields, but they're one level below @func.def (reached via
+; function_declaration's own "signature" field) -- capture them
+; directly here rather than relying on child_by_field_name on the
+; outer node, which can't see through that extra level.
+; Field order below must match the grammar's actual child order
+; (return_type, name, parameters) -- tree-sitter's query matcher is
+; order-sensitive across sibling field patterns even when each is
+; field-qualified, so declaring them out of order silently fails to
+; match the return_type capture.
 (function_declaration
   signature: (function_signature
-    name: (identifier) @func.name)) @func.def
+    return_type: (type)? @func.return_type
+    name: (identifier) @func.name
+    parameters: (formal_parameter_list) @func.params)) @func.def
 
 ; Method signatures
+; method_signature has ZERO named fields of its own -- there is no
+; child_by_field_name path to "parameters" here at any nesting depth,
+; so this capture is required, not just an optimization.
 (method_signature
   (function_signature
-    name: (identifier) @method.name)) @method.def
+    return_type: (type)? @method.return_type
+    name: (identifier) @method.name
+    parameters: (formal_parameter_list) @method.params)) @method.def
 
 ; Constructor signatures
 (constructor_signature

@@ -920,6 +920,113 @@ mod tests {
     }
 
     #[test]
+    fn test_dart_function_extracts_parameters_and_return_type() {
+        // tree-sitter-dart's function_signature DOES have real "parameters"/
+        // "return_type" named fields -- but they're one level below the
+        // captured function_declaration node (reached via its "signature"
+        // field), so extract_child_text's direct child_by_field_name lookup
+        // on the outer node misses them. Verified against the crate's real
+        // node-types.json before writing this test.
+        let grammar = tree_sitter_dart::LANGUAGE.into();
+        let src = b"String greet(String name, int age) {\n  return 'hello';\n}\n";
+        let mut parser = Parser::new();
+        parser.set_language(&grammar).unwrap();
+        let tree = parser.parse(src, None).unwrap();
+        let root = tree.root_node();
+
+        let query = tree_sitter::Query::new(
+            &grammar,
+            "(function_declaration\n  \
+               signature: (function_signature\n    \
+                 return_type: (type)? @func.return_type\n    \
+                 name: (identifier) @func.name\n    \
+                 parameters: (formal_parameter_list) @func.params)) @func.def",
+        )
+        .unwrap();
+
+        let symbols = extract_entities("greet.dart", src, root, &query, "dart");
+        assert_eq!(symbols.len(), 1);
+        assert_eq!(symbols[0].name, "greet");
+        assert!(
+            symbols[0].parameters.is_some(),
+            "parameters should be extracted via the @func.params capture"
+        );
+        assert!(
+            symbols[0].parameters.as_deref().unwrap().contains("name"),
+            "parameters should contain param names: {:?}",
+            symbols[0].parameters
+        );
+        assert_eq!(symbols[0].return_type.as_deref(), Some("String"));
+    }
+
+    #[test]
+    fn test_dart_method_extracts_parameters_and_return_type() {
+        // method_signature has ZERO named fields at all (verified against
+        // node-types.json) -- structurally unreachable via child_by_field_name
+        // from the captured node regardless of nesting depth, unlike the
+        // top-level function case which is merely "one level too shallow".
+        let grammar = tree_sitter_dart::LANGUAGE.into();
+        let src =
+            b"class Greeter {\n  String greet(String name, int age) {\n    return 'hi';\n  }\n}\n";
+        let mut parser = Parser::new();
+        parser.set_language(&grammar).unwrap();
+        let tree = parser.parse(src, None).unwrap();
+        let root = tree.root_node();
+
+        let query = tree_sitter::Query::new(
+            &grammar,
+            "(method_signature\n  \
+               (function_signature\n    \
+                 return_type: (type)? @method.return_type\n    \
+                 name: (identifier) @method.name\n    \
+                 parameters: (formal_parameter_list) @method.params)) @method.def",
+        )
+        .unwrap();
+
+        let symbols = extract_entities("greeter.dart", src, root, &query, "dart");
+        assert_eq!(symbols.len(), 1);
+        assert_eq!(symbols[0].name, "greet");
+        assert!(
+            symbols[0].parameters.is_some(),
+            "parameters should be extracted for Dart methods too, not just top-level functions"
+        );
+        assert!(
+            symbols[0].parameters.as_deref().unwrap().contains("name"),
+            "parameters should contain param names: {:?}",
+            symbols[0].parameters
+        );
+        assert_eq!(symbols[0].return_type.as_deref(), Some("String"));
+    }
+
+    #[test]
+    fn test_dart_constructor_still_works_unchanged() {
+        // constructor_signature has direct name+parameters fields, no
+        // nesting -- already worked before this plan and must keep working,
+        // using the existing child_by_field_name fallback (no @method.params
+        // capture needed or added for constructors).
+        let grammar = tree_sitter_dart::LANGUAGE.into();
+        let src = b"class Greeter {\n  Greeter(String name, int age);\n}\n";
+        let mut parser = Parser::new();
+        parser.set_language(&grammar).unwrap();
+        let tree = parser.parse(src, None).unwrap();
+        let root = tree.root_node();
+
+        let query = tree_sitter::Query::new(
+            &grammar,
+            "(constructor_signature name: (identifier) @method.name) @method.def",
+        )
+        .unwrap();
+
+        let symbols = extract_entities("greeter.dart", src, root, &query, "dart");
+        assert_eq!(symbols.len(), 1);
+        assert_eq!(symbols[0].name, "Greeter");
+        assert!(
+            symbols[0].parameters.is_some(),
+            "constructor parameters must still work via the pre-existing fallback"
+        );
+    }
+
+    #[test]
     fn test_is_test_by_name_and_path_go() {
         assert!(is_test_by_name_and_path(
             "TestFoo",
