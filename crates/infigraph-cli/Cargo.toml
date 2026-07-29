@@ -54,7 +54,7 @@ serde.workspace = true
 serde_json.workspace = true
 clap = { version = "4", features = ["derive", "env"] }
 dirs = "5"
-ctrlc = "3"
+ctrlc = { version = "3", features = ["termination"] }
 rayon = "1"
 ureq = "2"
 sha2 = "0.10"
