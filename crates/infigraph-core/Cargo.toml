@@ -67,6 +67,7 @@ optional = true
 
 [dev-dependencies]
 tree-sitter-python = "0.25"
+tree-sitter-kotlin-ng = "1.1"
 cargo-husky = { version = "1", default-features = false, features = ["user-hooks"] }
 # Dev-dep cycle (infigraph-languages -> infigraph-core) is fine: dev-deps are excluded
 # from the normal build graph. Needed so remote_cross_service.rs can index real
