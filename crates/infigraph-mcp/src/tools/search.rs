@@ -455,8 +455,8 @@ pub fn tool_search(args: &Value) -> Result<String> {
                 _ => String::new(),
             };
             out.push_str(&format!(
-                "{:.3}  {} {} ({}{})\n",
-                r.score, row[2], row[1], row[3], lines
+                "{:.3}  {} {} ({}{})  id={}\n",
+                r.score, row[2], row[1], row[3], lines, r.symbol_id
             ));
             if let Some(doc) = row.get(4).filter(|s| !s.is_empty()) {
                 let preview: String = doc.chars().take(120).collect();
@@ -597,8 +597,8 @@ pub fn tool_search_symbols(args: &Value) -> Result<String> {
                 _ => String::new(),
             };
             out.push_str(&format!(
-                "{:.3}  {} {} ({}{})\n",
-                r.score, row[2], row[1], row[3], lines
+                "{:.3}  {} {} ({}{})  id={}\n",
+                r.score, row[2], row[1], row[3], lines, r.symbol_id
             ));
         }
     }

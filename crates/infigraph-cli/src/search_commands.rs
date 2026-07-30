@@ -92,8 +92,8 @@ pub(crate) fn cmd_search(root: &Path, query: &str, limit: usize, alpha: f32) -> 
     for r in &results {
         if let Some(row) = rows.iter().find(|row| row[0] == r.symbol_id) {
             println!(
-                "  {:.3} (bm25:{:.2} vec:{:.2})  {:>8} {:30} {}",
-                r.score, r.bm25_score, r.vector_score, row[2], row[1], row[3]
+                "  {:.3} (bm25:{:.2} vec:{:.2})  {:>8} {:30} {}  id={}",
+                r.score, r.bm25_score, r.vector_score, row[2], row[1], row[3], r.symbol_id
             );
             let doc = row.get(4).map(|s| s.as_str()).unwrap_or("");
             if !doc.is_empty() {
