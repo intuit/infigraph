@@ -8,7 +8,9 @@ use kuzu::Connection;
 
 use super::parquet_loader;
 use super::store::GraphStore;
-use super::store_util::{escape, fwd_slash_path, unwind_edges_from_pairs};
+use super::store_util::{
+    copy_edges_with_bad_record_retry, escape, fwd_slash_path, unwind_edges_from_pairs,
+};
 use crate::model::{FileExtraction, RelationKind};
 
 fn unique_tmp_dir() -> std::path::PathBuf {
@@ -528,17 +530,14 @@ impl GraphStore {
                 continue;
             }
             let edge_pq = tmp.join(format!("infigraph_index_{}.parquet", table.to_lowercase()));
-            let refs: Vec<(&str, &str)> = pairs
-                .iter()
-                .map(|(a, b)| (a.as_str(), b.as_str()))
-                .collect();
-            parquet_loader::write_edge_parquet(&edge_pq, &refs)?;
-            if let Err(e) = conn.query(&format!("COPY {table} FROM '{}'", fwd_slash_path(&edge_pq)))
-            {
-                eprintln!("warn: COPY {table} via parquet failed ({e}), falling back to UNWIND");
-                unwind_edges_from_pairs(conn, &refs, table, src_label, dst_label);
-            }
-            let _ = std::fs::remove_file(&edge_pq);
+            copy_edges_with_bad_record_retry(
+                conn,
+                table,
+                pairs.to_vec(),
+                src_label,
+                dst_label,
+                &edge_pq,
+            );
         }
 
         // Custom edge tables
@@ -551,23 +550,14 @@ impl GraphStore {
                 "infigraph_index_{}.parquet",
                 edge_name.to_lowercase()
             ));
-            let refs: Vec<(&str, &str)> = pairs
-                .iter()
-                .map(|(a, b)| (a.as_str(), b.as_str()))
-                .collect();
-            parquet_loader::write_edge_parquet(&edge_pq, &refs)?;
-            if let Err(e) = conn.query(&format!(
-                "COPY {} FROM '{}'",
+            copy_edges_with_bad_record_retry(
+                conn,
                 edge_name,
-                fwd_slash_path(&edge_pq)
-            )) {
-                eprintln!(
-                    "warn: COPY {} via parquet failed ({e}), falling back to UNWIND",
-                    edge_name
-                );
-                unwind_edges_from_pairs(conn, &refs, edge_name, "Symbol", "Symbol");
-            }
-            let _ = std::fs::remove_file(&edge_pq);
+                pairs.to_vec(),
+                "Symbol",
+                "Symbol",
+                &edge_pq,
+            );
         }
 
         // Cleanup node parquet files

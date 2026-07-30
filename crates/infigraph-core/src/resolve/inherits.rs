@@ -2,9 +2,10 @@ use std::collections::HashMap;
 
 use anyhow::Result;
 
+use crate::graph::store_util::copy_edges_with_bad_record_retry;
 use crate::model::{FileExtraction, RelationKind};
 
-use super::{escape, shortest_id};
+use super::shortest_id;
 
 const TYPE_KINDS: &[&str] = &["Class", "Interface", "Struct", "Trait", "Enum"];
 
@@ -155,31 +156,12 @@ pub(crate) fn resolve_inherits(
         return Ok(0);
     }
 
-    let refs: Vec<(&str, &str)> = valid_pairs
-        .iter()
-        .map(|(a, b)| (a.as_str(), b.as_str()))
+    let pairs: Vec<(String, String)> = valid_pairs
+        .into_iter()
+        .map(|(a, b)| (a.clone(), b.clone()))
         .collect();
     let pq_path = std::env::temp_dir().join("infigraph_resolve_inherits.parquet");
-    crate::graph::parquet_loader::write_edge_parquet(&pq_path, &refs)?;
-    let copy_result = conn.query(&format!(
-        "COPY INHERITS FROM '{}'",
-        pq_path.to_string_lossy().replace('\\', "/")
-    ));
-    if let Err(e) = copy_result {
-        eprintln!("[resolve] COPY INHERITS FROM parquet failed ({e}), falling back to UNWIND");
-        const CHUNK_SIZE: usize = 500;
-        for chunk in refs.chunks(CHUNK_SIZE) {
-            let pair_list: Vec<String> = chunk
-                .iter()
-                .map(|(a, b)| format!("{{a: '{}', b: '{}'}}", escape(a), escape(b)))
-                .collect();
-            let _ = conn.query(&format!(
-                "UNWIND [{}] AS p MATCH (a:Symbol), (b:Symbol) WHERE a.id = p.a AND b.id = p.b CREATE (a)-[:INHERITS]->(b)",
-                pair_list.join(", ")
-            ));
-        }
-    }
-    let _ = std::fs::remove_file(&pq_path);
+    copy_edges_with_bad_record_retry(conn, "INHERITS", pairs, "Symbol", "Symbol", &pq_path);
 
     Ok(count)
 }

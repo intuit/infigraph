@@ -58,6 +58,17 @@ impl GraphStore {
         Ok(store)
     }
 
+    /// Directory containing the graph database files. Used for disk-space
+    /// preflight checks before a large write (see `store_util::check_disk_headroom`)
+    /// -- Kuzu aborts the whole process with an uncaught C++ exception on
+    /// ENOSPC mid-transaction rather than surfacing a Rust `Result`, so
+    /// callers doing a large bulk write must check headroom themselves
+    /// first (observed on sittir: SCIP enrichment ran the volume out of
+    /// space mid-COPY and crashed the process).
+    pub fn db_dir(&self) -> Option<&Path> {
+        self.lock_path.parent()
+    }
+
     /// Open an existing Kuzu database in read-only mode.
     /// Safe for concurrent access while a watcher is writing.
     pub fn open_read_only(path: &Path) -> Result<Self> {

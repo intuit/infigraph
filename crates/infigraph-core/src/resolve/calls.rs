@@ -4,6 +4,7 @@ use anyhow::Result;
 use rayon::prelude::*;
 
 use crate::graph::store::GraphStore;
+use crate::graph::store_util::copy_edges_with_bad_record_retry;
 use crate::learned::LearnedStore;
 use crate::model::{FileExtraction, RelationKind};
 
@@ -355,31 +356,12 @@ fn resolve_with_map(
             })
             .collect();
 
-        let refs: Vec<(&str, &str)> = valid_pairs
-            .iter()
-            .map(|(a, b)| (a.as_str(), b.as_str()))
+        let pairs: Vec<(String, String)> = valid_pairs
+            .into_iter()
+            .map(|(a, b)| (a.clone(), b.clone()))
             .collect();
         let pq_path = std::env::temp_dir().join("infigraph_resolve_calls.parquet");
-        crate::graph::parquet_loader::write_edge_parquet(&pq_path, &refs)?;
-        let copy_result = conn.query(&format!(
-            "COPY CALLS FROM '{}'",
-            pq_path.to_string_lossy().replace('\\', "/")
-        ));
-        if let Err(e) = copy_result {
-            eprintln!("[resolve] COPY FROM parquet failed ({e}), falling back to UNWIND");
-            const CHUNK_SIZE: usize = 500;
-            for chunk in refs.chunks(CHUNK_SIZE) {
-                let pair_list: Vec<String> = chunk
-                    .iter()
-                    .map(|(a, b)| format!("{{a: '{}', b: '{}'}}", escape(a), escape(b)))
-                    .collect();
-                let _ = conn.query(&format!(
-                    "UNWIND [{}] AS p MATCH (a:Symbol), (b:Symbol) WHERE a.id = p.a AND b.id = p.b CREATE (a)-[:CALLS]->(b)",
-                    pair_list.join(", ")
-                ));
-            }
-        }
-        let _ = std::fs::remove_file(&pq_path);
+        copy_edges_with_bad_record_retry(conn, "CALLS", pairs, "Symbol", "Symbol", &pq_path);
     }
 
     Ok(ResolveStats {

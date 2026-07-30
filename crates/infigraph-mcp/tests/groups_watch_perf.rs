@@ -218,12 +218,19 @@ fn test_groups_watch_perf() {
     // --- group_index ---
     let result = tool_group_index(&json!({"group_name": "test-microservices"})).unwrap();
     assert!(result.contains("Indexed"), "group_index: {result}");
+    // Auto-watch (triggered by the earlier group_add/group_query calls) may
+    // have already indexed both repos in the background by the time this
+    // explicit call runs, in which case index_group correctly reports 0
+    // repos needing work rather than re-listing them by name. Both outcomes
+    // mean the data is indexed (already confirmed via group_query above),
+    // so accept either rather than assuming this call always does the work.
+    let already_current = result.contains("Indexed 0 repos");
     assert!(
-        result.contains("order-service"),
+        already_current || result.contains("order-service"),
         "group_index: missing order-service: {result}"
     );
     assert!(
-        result.contains("user-service"),
+        already_current || result.contains("user-service"),
         "group_index: missing user-service: {result}"
     );
 
