@@ -46,7 +46,7 @@ pub(crate) fn cmd_visualize_symbol(root: &Path, symbol_id: &str, depth: u32) -> 
 pub(crate) fn cmd_routes(root: &Path) -> Result<()> {
     let registry = bundled_registry()?;
     let mut prism = Infigraph::open(root, registry)?;
-    prism.init()?;
+    prism.init_read_only()?;
 
     let backend = prism.backend().context("graph not initialized")?;
 

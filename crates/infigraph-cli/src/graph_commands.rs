@@ -7,7 +7,12 @@ use infigraph_languages::bundled_registry;
 pub(crate) fn cmd_query(root: &Path, cypher: &str) -> Result<()> {
     let registry = bundled_registry()?;
     let mut prism = Infigraph::open(root, registry)?;
-    prism.init()?;
+    // Read-only, matching the `query_graph` MCP tool: `cypher` is arbitrary
+    // user input, but rather than inspect it for write statements, this
+    // relies on the backend's own read-only enforcement to reject them
+    // clearly ("Cannot execute write operations in a read-only database")
+    // -- exactly like `query_graph` already does.
+    prism.init_read_only()?;
 
     let backend = prism.backend().context("graph not initialized")?;
     let rows = backend.raw_query(cypher)?;

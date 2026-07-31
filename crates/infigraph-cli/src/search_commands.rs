@@ -8,7 +8,7 @@ pub(crate) fn cmd_search(root: &Path, query: &str, limit: usize, alpha: f32) -> 
 
     let registry = bundled_registry()?;
     let mut prism = Infigraph::open(root, registry)?;
-    prism.init()?;
+    prism.init_read_only()?;
 
     let backend = prism.backend().context("graph not initialized")?;
     let rows =
@@ -132,7 +132,7 @@ pub(crate) fn cmd_search_code(
 pub(crate) fn cmd_snippet(root: &Path, symbol_id: &str) -> Result<()> {
     let registry = bundled_registry()?;
     let mut prism = Infigraph::open(root, registry)?;
-    prism.init()?;
+    prism.init_read_only()?;
 
     let backend = prism.backend().context("graph not initialized")?;
     let detail = backend
@@ -158,7 +158,7 @@ pub(crate) fn cmd_snippet(root: &Path, symbol_id: &str) -> Result<()> {
 pub(crate) fn cmd_find_refs(root: &Path, symbol: &str) -> Result<()> {
     let registry = bundled_registry()?;
     let mut prism = Infigraph::open(root, registry)?;
-    prism.init()?;
+    prism.init_read_only()?;
     let backend = prism.backend().context("graph not initialized")?;
     let refs = backend.find_all_references(symbol)?;
     if refs.is_empty() {

@@ -129,7 +129,7 @@ pub(crate) fn cmd_security(
 pub(crate) fn cmd_complexity(root: &Path, threshold: u32, file: Option<&str>) -> Result<()> {
     let registry = bundled_registry()?;
     let mut prism = Infigraph::open(root, registry)?;
-    prism.init()?;
+    prism.init_read_only()?;
 
     let backend = prism.backend().context("graph not initialized")?;
     let rows = backend.get_complexity_ranking(file)?;
@@ -203,7 +203,7 @@ pub(crate) fn cmd_semantic_diff(root: &Path, old_ref: &str, new_ref: &str) -> Re
 pub(crate) fn cmd_sequence(root: &Path, symbol_id: &str, depth: u32) -> Result<()> {
     let registry = bundled_registry()?;
     let mut prism = Infigraph::open(root, registry)?;
-    prism.init()?;
+    prism.init_read_only()?;
     let backend = prism.backend().context("not initialized")?;
     let diagram = infigraph_core::sequence::generate_sequence_mermaid(backend, symbol_id, depth)?;
     println!("{}", diagram);
@@ -223,7 +223,7 @@ pub(crate) fn cmd_review(
 ) -> Result<()> {
     let registry = bundled_registry()?;
     let mut prism = Infigraph::open(root, registry)?;
-    prism.init()?;
+    prism.init_read_only()?;
     let backend = prism
         .backend()
         .context("graph not initialized -- run 'infigraph index' first")?;

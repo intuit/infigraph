@@ -8,7 +8,7 @@ use serde_json::json;
 pub(crate) fn cmd_stats(root: &Path) -> Result<()> {
     let registry = bundled_registry()?;
     let mut prism = Infigraph::open(root, registry)?;
-    prism.init()?;
+    prism.init_read_only()?;
     let stats = prism.stats()?;
     println!("{}", stats);
     Ok(())
@@ -35,7 +35,7 @@ pub(crate) fn cmd_languages(project_root: Option<&Path>) -> Result<()> {
 pub(crate) fn cmd_symbols(root: &Path, file: &str) -> Result<()> {
     let registry = bundled_registry()?;
     let mut prism = Infigraph::open(root, registry)?;
-    prism.init()?;
+    prism.init_read_only()?;
 
     let backend = prism.backend().context("graph not initialized")?;
     let symbols = backend.symbols_in_file(file)?;
@@ -60,7 +60,7 @@ pub(crate) fn cmd_symbols(root: &Path, file: &str) -> Result<()> {
 pub(crate) fn cmd_skeleton(root: &Path, file: &str) -> Result<()> {
     let registry = bundled_registry()?;
     let mut prism = Infigraph::open(root, registry)?;
-    prism.init()?;
+    prism.init_read_only()?;
 
     let backend = prism.backend().context("graph not initialized")?;
     let result = backend.skeleton(file)?;
@@ -212,7 +212,7 @@ pub(crate) fn cmd_dependencies(root: &Path, ecosystem: Option<&str>) -> Result<(
 pub(crate) fn cmd_api_surface(root: &Path, file_filter: Option<&str>) -> Result<()> {
     let registry = bundled_registry()?;
     let mut prism = Infigraph::open(root, registry)?;
-    prism.init()?;
+    prism.init_read_only()?;
     let backend = prism.backend().context("graph not initialized")?;
     let mut syms = backend.get_api_surface()?;
     if let Some(f) = file_filter {
@@ -234,7 +234,7 @@ pub(crate) fn cmd_api_surface(root: &Path, file_filter: Option<&str>) -> Result<
 pub(crate) fn cmd_file_deps(root: &Path, file: &str) -> Result<()> {
     let registry = bundled_registry()?;
     let mut prism = Infigraph::open(root, registry)?;
-    prism.init()?;
+    prism.init_read_only()?;
     let backend = prism.backend().context("graph not initialized")?;
     let deps = backend.get_file_deps(file)?;
     println!("File dependencies for '{}':\n", file);
@@ -258,7 +258,7 @@ pub(crate) fn cmd_file_deps(root: &Path, file: &str) -> Result<()> {
 pub(crate) fn cmd_type_hierarchy(root: &Path, symbol: &str, depth: u32) -> Result<()> {
     let registry = bundled_registry()?;
     let mut prism = Infigraph::open(root, registry)?;
-    prism.init()?;
+    prism.init_read_only()?;
     let backend = prism.backend().context("graph not initialized")?;
     let hier = backend.get_type_hierarchy(symbol, depth)?;
     println!("Type hierarchy for '{}':\n", hier.root_name);
@@ -282,7 +282,7 @@ pub(crate) fn cmd_type_hierarchy(root: &Path, symbol: &str, depth: u32) -> Resul
 pub(crate) fn cmd_test_coverage(root: &Path, file_filter: Option<&str>) -> Result<()> {
     let registry = bundled_registry()?;
     let mut prism = Infigraph::open(root, registry)?;
-    prism.init()?;
+    prism.init_read_only()?;
     let backend = prism.backend().context("graph not initialized")?;
     let mut cov = backend.get_test_coverage()?;
     if let Some(f) = file_filter {
@@ -560,7 +560,7 @@ pub(crate) fn cmd_index_confluence(
 pub(crate) fn cmd_list_files(root: &Path, glob: Option<&str>) -> Result<()> {
     let registry = bundled_registry()?;
     let mut prism = Infigraph::open(root, registry)?;
-    prism.init()?;
+    prism.init_read_only()?;
 
     let backend = prism.backend().context("graph not initialized")?;
     let rows = backend.raw_query("MATCH (s:Symbol) RETURN DISTINCT s.file ORDER BY s.file")?;
@@ -592,7 +592,7 @@ pub(crate) fn cmd_generate_test_context(
 ) -> Result<()> {
     let registry = bundled_registry()?;
     let mut prism = Infigraph::open(root, registry)?;
-    prism.init()?;
+    prism.init_read_only()?;
 
     let backend = prism.backend().context("graph not initialized")?;
     let ctx = backend.generate_test_context(file, limit, None)?;
