@@ -1919,6 +1919,9 @@ mod tests {
 
     #[test]
     fn test_compress_pipeline_safe_normal_path() {
+        let _guard = crate::session_context::TEST_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
         crate::session_context::reset_session();
         force_compress_panic(false);
         crate::session_context::record_tool_call("search", false);
