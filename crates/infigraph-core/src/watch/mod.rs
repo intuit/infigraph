@@ -139,6 +139,13 @@ where
 
     let (mut watcher, mut rx) = create_watcher(root, ignore_dirs)?;
 
+    // Reconcile once at startup: a process restart (crash, redeploy, laptop
+    // sleep) has no memory of what happened to the working tree while this
+    // watcher wasn't running. `notify` only reports events going forward, so
+    // without this check a branch switch or commit made during the gap is
+    // silently missed until something else touches those files again.
+    reconcile_on_start(root, &on_event);
+
     loop {
         if stop_rx.try_recv().is_ok() {
             break;
@@ -415,6 +422,44 @@ where
             }
         }
     })
+}
+
+/// Compare the graph's recorded indexed HEAD against live git state when a
+/// watcher starts. `notify` only reports filesystem events going forward, so
+/// a process restart (crash, redeploy, sleep/wake) has no way to learn about
+/// commits or branch switches that happened while it was down. If HEAD moved,
+/// emit one `Modified` event per file the two commits differ on so the
+/// existing pending-reindex path picks them up immediately, instead of
+/// waiting for a future unrelated file write to bring things back in sync.
+fn reconcile_on_start(root: &Path, on_event: &impl Fn(WatchEvent)) {
+    let fresh = crate::freshness::compute_freshness(root, 0);
+    let (Some(indexed), Some(current)) = (&fresh.indexed_head, &fresh.current_head) else {
+        return;
+    };
+    if indexed == current {
+        return;
+    }
+
+    let output = std::process::Command::new("git")
+        .args(["diff", "--name-only", indexed, current])
+        .current_dir(root)
+        .output();
+    let Ok(output) = output else { return };
+    if !output.status.success() {
+        return;
+    }
+
+    for rel in String::from_utf8_lossy(&output.stdout).lines() {
+        if rel.is_empty() {
+            continue;
+        }
+        eprintln!("[watch] reconcile: {rel} changed while watcher was not running (indexed_head={indexed} current_head={current})");
+        on_event(WatchEvent {
+            kind: WatchEventKind::Modified,
+            path: root.join(rel),
+            has_cross_file_calls: true,
+        });
+    }
 }
 
 /// Open a short-lived Infigraph instance for batch work.

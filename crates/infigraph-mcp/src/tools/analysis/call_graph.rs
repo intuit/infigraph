@@ -2,7 +2,7 @@ use anyhow::{Context, Result};
 use infigraph_core::graph::GraphBackend;
 use serde_json::Value;
 
-use super::super::helpers::{open_prism, save_analysis};
+use super::super::helpers::{open_prism, prepend_freshness_warning, save_analysis};
 
 pub fn tool_detect_dead_code(args: &Value) -> Result<String> {
     let prism = open_prism(args)?;
@@ -41,10 +41,12 @@ pub fn tool_trace_callers(args: &Value) -> Result<String> {
 
     let backend = prism.backend().context("not initialized")?;
     let callers = backend.callers_of(symbol_id)?;
-    if callers.is_empty() {
-        return Ok(format!("No callers found for '{}'", symbol_id));
-    }
-    Ok(callers.join("\n"))
+    let out = if callers.is_empty() {
+        format!("No callers found for '{}'", symbol_id)
+    } else {
+        callers.join("\n")
+    };
+    Ok(prepend_freshness_warning(prism.root(), out))
 }
 
 pub fn tool_trace_callees(args: &Value) -> Result<String> {
@@ -56,10 +58,12 @@ pub fn tool_trace_callees(args: &Value) -> Result<String> {
 
     let backend = prism.backend().context("not initialized")?;
     let callees = backend.callees_of(symbol_id)?;
-    if callees.is_empty() {
-        return Ok(format!("No callees found for '{}'", symbol_id));
-    }
-    Ok(callees.join("\n"))
+    let out = if callees.is_empty() {
+        format!("No callees found for '{}'", symbol_id)
+    } else {
+        callees.join("\n")
+    };
+    Ok(prepend_freshness_warning(prism.root(), out))
 }
 
 pub fn tool_transitive_impact(args: &Value) -> Result<String> {
@@ -72,15 +76,16 @@ pub fn tool_transitive_impact(args: &Value) -> Result<String> {
 
     let backend = prism.backend().context("not initialized")?;
     let impacted = backend.transitive_impact(symbol_id, depth)?;
-    if impacted.is_empty() {
-        return Ok(format!("No symbols affected by changes to '{}'", symbol_id));
-    }
-
-    let mut out = String::new();
-    for row in &impacted {
-        out.push_str(&format!("{} {} ({})\n", row.kind, row.name, row.file));
-    }
-    Ok(out)
+    let out = if impacted.is_empty() {
+        format!("No symbols affected by changes to '{}'", symbol_id)
+    } else {
+        let mut out = String::new();
+        for row in &impacted {
+            out.push_str(&format!("{} {} ({})\n", row.kind, row.name, row.file));
+        }
+        out
+    };
+    Ok(prepend_freshness_warning(prism.root(), out))
 }
 
 pub fn tool_get_architecture(args: &Value) -> Result<String> {

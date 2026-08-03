@@ -8,7 +8,7 @@ use infigraph_core::graph::SessionStore;
 use infigraph_core::multi::Registry;
 use infigraph_languages::bundled_registry;
 
-use super::helpers::{glob_matches, open_prism_read_only};
+use super::helpers::{glob_matches, open_prism_read_only, prepend_freshness_warning};
 
 pub fn tool_query_graph(args: &Value) -> Result<String> {
     let prism = open_prism_read_only(args)?;
@@ -307,15 +307,16 @@ pub fn tool_find_all_references(args: &Value) -> Result<String> {
         .context("missing 'symbol_id'")?;
 
     let refs = backend.find_all_references(symbol_id)?;
-    if refs.is_empty() {
-        return Ok(format!("No references found for '{}'", symbol_id));
-    }
-
-    let mut out = format!("References to '{}' ({} total):\n\n", symbol_id, refs.len());
-    for r in &refs {
-        out.push_str(&format!("  {}:{} — in {}\n", r.file, r.line, r.caller_name));
-    }
-    Ok(out)
+    let out = if refs.is_empty() {
+        format!("No references found for '{}'", symbol_id)
+    } else {
+        let mut out = format!("References to '{}' ({} total):\n\n", symbol_id, refs.len());
+        for r in &refs {
+            out.push_str(&format!("  {}:{} — in {}\n", r.file, r.line, r.caller_name));
+        }
+        out
+    };
+    Ok(prepend_freshness_warning(prism.root(), out))
 }
 
 pub fn tool_get_api_surface(args: &Value) -> Result<String> {

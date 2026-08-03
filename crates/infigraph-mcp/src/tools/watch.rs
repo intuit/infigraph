@@ -309,6 +309,17 @@ pub fn tool_get_watch_status(args: &Value) -> Result<String> {
                 if let Some(entry) = map.get(id) {
                     let pending = entry.pending_reindex.lock().unwrap();
                     let mut out = format!("Watcher: {id}\nType: code\nPath: {}\n", entry.path);
+                    let fresh = infigraph_core::freshness::compute_freshness(
+                        std::path::Path::new(&entry.path),
+                        pending.len(),
+                    );
+                    out.push_str(&format!(
+                        "Freshness: {} (indexed_head={} current_head={} working_tree_dirty={})\n",
+                        fresh.status,
+                        fresh.indexed_head.as_deref().unwrap_or("unknown"),
+                        fresh.current_head.as_deref().unwrap_or("unknown"),
+                        fresh.working_tree_dirty
+                    ));
                     if pending.is_empty() {
                         out.push_str("Status: OK — no pending reindex needed\n");
                     } else {

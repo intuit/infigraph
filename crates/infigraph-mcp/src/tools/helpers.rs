@@ -120,6 +120,30 @@ fn apply_repo_filter(prism: &mut Infigraph, raw_path: &str) {
 #[cfg(not(feature = "remote"))]
 fn apply_repo_filter(_prism: &mut Infigraph, _raw_path: &str) {}
 
+/// Prepend a stale-graph warning to a tool's output when the graph may not
+/// reflect the current working tree (branch switch, rebase, uncommitted
+/// changes, or a watcher with reindexing still pending). No-op (returns
+/// `out` unchanged) when the graph is fresh or freshness can't be determined
+/// (e.g. not a git repo).
+pub fn prepend_freshness_warning(root: &std::path::Path, out: String) -> String {
+    let pending = pending_reindex_count(root);
+    let fresh = infigraph_core::freshness::compute_freshness(root, pending);
+    match fresh.warning_line() {
+        Some(warning) => format!("{warning}{out}"),
+        None => out,
+    }
+}
+
+fn pending_reindex_count(root: &std::path::Path) -> usize {
+    let root_str = root.to_string_lossy().replace('\\', "/");
+    let guard = super::watch::get_watchers();
+    guard
+        .as_ref()
+        .and_then(|map| map.values().find(|e| e.path == root_str))
+        .map(|e| e.pending_reindex.lock().unwrap().len())
+        .unwrap_or(0)
+}
+
 pub fn find_infigraph_cli() -> Option<std::path::PathBuf> {
     let bin_name = if cfg!(windows) {
         "infigraph.exe"

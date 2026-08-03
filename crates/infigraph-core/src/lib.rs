@@ -10,6 +10,7 @@ pub mod diff;
 pub mod embed;
 pub mod export;
 pub mod extract;
+pub mod freshness;
 pub mod graph;
 pub mod lang;
 pub mod learned;
@@ -306,6 +307,8 @@ impl Infigraph {
             );
         }
 
+        let _ = freshness::write_index_meta(&self.root);
+
         Ok(IndexResult {
             total_files: total,
             indexed_files: indexed,
@@ -456,6 +459,8 @@ impl Infigraph {
                     inherits_resolved: 0,
                 }
             });
+
+        let _ = freshness::write_index_meta(&self.root);
 
         Ok(IndexResult {
             total_files: paths.len(),

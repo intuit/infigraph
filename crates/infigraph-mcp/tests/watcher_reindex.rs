@@ -1112,3 +1112,75 @@ fn test_is_watching_lifecycle() {
         "should not be watching after stop"
     );
 }
+
+fn git(dir: &std::path::Path, args: &[&str]) {
+    let status = std::process::Command::new("git")
+        .args(args)
+        .current_dir(dir)
+        .status()
+        .expect("git command failed to run");
+    assert!(status.success(), "git {:?} failed", args);
+}
+
+/// Simulates a process restart (crash, redeploy, laptop sleep): index a git
+/// repo, stop the watcher, commit a change *while nothing is watching*, then
+/// start a new watcher. The stale commit should be caught by startup
+/// reconciliation (comparing indexed_head vs current git HEAD) and surface
+/// as a pending reindex immediately — without waiting for any new file-write
+/// event, since none will come for a file that was already changed on disk.
+#[test]
+fn test_watcher_restart_reconciles_missed_commit() {
+    let _guard = WATCHER_LOCK.lock().unwrap();
+    let _cleanup = WatcherCleanup;
+    stop_all_watchers();
+    init_watchers();
+
+    let (dir, path) = make_project(&[("lib.py", "def original(): return 1\n")]);
+    git(dir.path(), &["init", "-q"]);
+    git(dir.path(), &["config", "user.email", "test@example.com"]);
+    git(dir.path(), &["config", "user.name", "Test"]);
+    git(dir.path(), &["add", "."]);
+    git(dir.path(), &["commit", "-q", "-m", "initial"]);
+
+    tool_index_project(&json!({"path": &path})).expect("initial index");
+    stop_all_watchers();
+    std::thread::sleep(Duration::from_millis(200));
+
+    // Commit a change with no watcher running — the scenario a live watcher
+    // would normally catch via a filesystem event, but here nothing is
+    // listening, so this is exactly the "missed while down" gap.
+    std::fs::write(
+        dir.path().join("lib.py"),
+        "def original(): return 1\n\ndef added_while_watcher_down(): return 2\n",
+    )
+    .unwrap();
+    git(dir.path(), &["commit", "-q", "-am", "second"]);
+
+    let result = tool_watch_project(&json!({
+        "path": &path,
+        "debounce_ms": 200
+    }))
+    .unwrap();
+    let id_line = result
+        .lines()
+        .find(|l| l.starts_with("ID:"))
+        .expect("should have ID line");
+    let watcher_id = id_line.trim_start_matches("ID:").trim();
+
+    // Reconciliation runs once at watcher startup, before the event loop —
+    // give the spawned thread a brief moment to reach that point.
+    let reconciled = poll_until(
+        || {
+            let status = tool_get_watch_status(&json!({"watcher_id": watcher_id})).unwrap();
+            status.contains("lib.py")
+        },
+        Duration::from_secs(10),
+        "startup reconciliation should flag lib.py as pending reindex",
+    );
+
+    assert!(
+        reconciled,
+        "watcher restart should detect the commit made while it was down, \
+         without needing a new file-write event"
+    );
+}
