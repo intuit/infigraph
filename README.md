@@ -264,6 +264,12 @@ Automatically reindex on PR merge via GitHub webhook push events. See **[docs/WE
 
 ---
 
+## Index Freshness
+
+Graph-backed MCP tools (`trace_callers`, `trace_callees`, `transitive_impact`, `find_all_references`) warn you when the graph may not match your current code — after a branch switch, rebase, uncommitted edit, or a watcher restart that missed changes. See **[docs/INDEX-FRESHNESS.md](docs/INDEX-FRESHNESS.md)**.
+
+---
+
 ## Installation
 
 ### System Requirements
