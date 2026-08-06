@@ -313,39 +313,20 @@ impl DocIndex {
 
     fn collect_doc_files(&self) -> Result<Vec<PathBuf>> {
         let mut files = Vec::new();
-        self.walk_doc_dir(&self.root, &mut files)?;
-        Ok(files)
-    }
-
-    fn walk_doc_dir(&self, dir: &Path, files: &mut Vec<PathBuf>) -> Result<()> {
-        let ignore_dirs = [
-            ".infigraph",
-            ".git",
-            "node_modules",
-            "__pycache__",
-            ".venv",
-            "venv",
-            "target",
-            "build",
-            "dist",
-            ".tox",
-        ];
-
-        for entry in std::fs::read_dir(dir)? {
-            let entry = entry?;
-            let path = entry.path();
-            let name = entry.file_name();
-            let name_str = name.to_string_lossy();
-
-            if path.is_dir() {
-                if !ignore_dirs.contains(&name_str.as_ref()) && !name_str.starts_with('.') {
-                    self.walk_doc_dir(&path, files)?;
+        let walker = infigraph_core::ignore_rules::walk_builder(&self.root).build();
+        for result in walker {
+            let entry = match result {
+                Ok(e) => e,
+                Err(_) => continue,
+            };
+            if entry.file_type().is_some_and(|ft| ft.is_file()) {
+                let path = entry.path().to_path_buf();
+                if is_document_file(&path) {
+                    files.push(path);
                 }
-            } else if path.is_file() && is_document_file(&path) {
-                files.push(path);
             }
         }
-        Ok(())
+        Ok(files)
     }
 
     fn bfs_follow_links(
