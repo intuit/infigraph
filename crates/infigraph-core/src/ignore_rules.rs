@@ -127,9 +127,28 @@ impl IgnoreMatcher {
         {
             return true;
         }
-        // The Gitignore was built for self.root, and matched() should handle
-        // paths that are within the root, whether absolute or relative
-        self.gitignore.matched(path, is_dir).is_ignore()
+        // Strip root prefix to get relative path for gitignore matching.
+        let rel_path = path.strip_prefix(&self.root).unwrap_or(path);
+
+        // Check if the path itself matches gitignore rules
+        if self.gitignore.matched(rel_path, is_dir).is_ignore() {
+            return true;
+        }
+
+        // Check if any parent directory matches gitignore rules (directories
+        // like "scratchpad/" in .gitignore should exclude all descendants)
+        let mut current = rel_path;
+        while let Some(parent) = current.parent() {
+            if parent == Path::new("") {
+                break;
+            }
+            if self.gitignore.matched(parent, true).is_ignore() {
+                return true;
+            }
+            current = parent;
+        }
+
+        false
     }
 }
 
