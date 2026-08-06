@@ -5,7 +5,6 @@
 //! directory-name list.
 
 use std::path::Path;
-use std::sync::Arc;
 
 use ignore::gitignore::{Gitignore, GitignoreBuilder};
 use ignore::WalkBuilder;
@@ -42,34 +41,12 @@ fn is_safety_excluded(name: &str) -> bool {
 /// configuration (e.g. `.max_depth`) before calling `.build()`.
 pub fn walk_builder(root: &Path) -> WalkBuilder {
     let mut builder = WalkBuilder::new(root);
-
-    // Discover and add all .gitignore and .infigraphignore files
-    let mut gi_builder = GitignoreBuilder::new(root);
-    let mut discovery = WalkBuilder::new(root);
-    discovery
-        .hidden(false)
+    builder
+        .hidden(true)
+        .git_ignore(true)
+        .require_git(false)
+        .add_custom_ignore_filename(".infigraphignore")
         .filter_entry(|entry| !is_safety_excluded(&entry.file_name().to_string_lossy()));
-
-    for result in discovery.build() {
-        let Ok(entry) = result else { continue };
-        let name = entry.file_name().to_string_lossy();
-        if name == ".gitignore" || name == ".infigraphignore" {
-            let _ = gi_builder.add(entry.path());
-        }
-    }
-
-    let gitignore = Arc::new(gi_builder.build().unwrap_or_else(|_| Gitignore::empty()));
-
-    // Apply gitignore rules via filter_entry
-    builder.hidden(true).filter_entry(move |entry| {
-        // Check safety list first
-        if is_safety_excluded(&entry.file_name().to_string_lossy()) {
-            return false;
-        }
-        // Then check gitignore rules
-        let is_dir = entry.file_type().is_some_and(|ft| ft.is_dir());
-        !gitignore.matched(entry.path(), is_dir).is_ignore()
-    });
     builder
 }
 
@@ -79,7 +56,6 @@ pub fn walk_builder(root: &Path) -> WalkBuilder {
 /// discover -- rebuild when those files may have changed (the watcher
 /// rebuilds this on its periodic tick; see `watch_project_with_periodic`).
 pub struct IgnoreMatcher {
-    #[allow(dead_code)]
     root: std::path::PathBuf,
     gitignore: Gitignore,
 }
@@ -92,9 +68,10 @@ impl IgnoreMatcher {
     /// whole directory is always excluded), then builds one matcher from
     /// all of them. `.hidden(false)` here (unlike `walk_builder`) because
     /// the ignore files themselves are dot-prefixed and must be visited as
-    /// walk results to be found; `.git_ignore(true)` still prunes any
-    /// subtree an already-discovered ancestor `.gitignore` excludes, so
-    /// this stays proportional to directory count, not full file count.
+    /// walk results to be found; `.git_ignore(true)` + `.require_git(false)`
+    /// still prune any subtree an already-discovered ancestor `.gitignore`
+    /// excludes (with `require_git(false)` allowing this even in non-git roots),
+    /// so this stays proportional to directory count, not full file count.
     pub fn build(root: &Path) -> Self {
         let root = root.to_path_buf();
         let mut gi_builder = GitignoreBuilder::new(&root);
@@ -102,6 +79,9 @@ impl IgnoreMatcher {
         let mut discovery = WalkBuilder::new(&root);
         discovery
             .hidden(false)
+            .git_ignore(true)
+            .require_git(false)
+            .add_custom_ignore_filename(".infigraphignore")
             .filter_entry(|entry| !is_safety_excluded(&entry.file_name().to_string_lossy()));
 
         for result in discovery.build() {
@@ -234,5 +214,21 @@ mod tests {
             .iter()
             .any(|p| p.to_string_lossy().contains("vendored")));
         assert!(found.iter().any(|p| p.ends_with("real.rs")));
+    }
+
+    #[test]
+    fn ignore_matcher_works_in_git_initialized_directory() {
+        let dir = tempfile::tempdir().unwrap();
+        // Initialize as a git directory
+        let _ = std::fs::create_dir(dir.path().join(".git"));
+
+        fs::write(dir.path().join(".gitignore"), "ignored/\n").unwrap();
+        fs::create_dir_all(dir.path().join("ignored")).unwrap();
+        fs::write(dir.path().join("ignored/file.txt"), "ignored").unwrap();
+        fs::write(dir.path().join("kept.txt"), "kept").unwrap();
+
+        let matcher = IgnoreMatcher::build(dir.path());
+        assert!(matcher.is_ignored(&dir.path().join("ignored/file.txt"), false));
+        assert!(!matcher.is_ignored(&dir.path().join("kept.txt"), false));
     }
 }
