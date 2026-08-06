@@ -10,7 +10,7 @@ use super::rules::{find_sanitizer_for, Finding, ScanStats, RULES};
 pub fn scan_project(root: &Path) -> Result<ScanStats> {
     let mut stats = ScanStats::default();
 
-    walk_and_scan(root, root, &mut stats)?;
+    walk_and_scan(root, &mut stats)?;
     // Sort findings: Critical first, then High, etc.
     stats.findings.sort_by(|a, b| {
         a.severity
@@ -22,44 +22,23 @@ pub fn scan_project(root: &Path) -> Result<ScanStats> {
     Ok(stats)
 }
 
-static IGNORE_DIRS: &[&str] = &[
-    ".git",
-    "node_modules",
-    ".venv",
-    "venv",
-    "target",
-    "build",
-    "dist",
-    "__pycache__",
-    ".tox",
-    ".infigraph",
-    "vendor",
-    ".idea",
-    ".mypy_cache",
-    "coverage",
-    ".pytest_cache",
-];
-
-fn walk_and_scan(root: &Path, dir: &Path, stats: &mut ScanStats) -> Result<()> {
-    for entry in std::fs::read_dir(dir)? {
-        let entry = entry?;
+fn walk_and_scan(root: &Path, stats: &mut ScanStats) -> Result<()> {
+    for result in crate::ignore_rules::walk_builder(root).build() {
+        let entry = match result {
+            Ok(e) => e,
+            Err(_) => continue,
+        };
+        if !entry.file_type().is_some_and(|ft| ft.is_file()) {
+            continue;
+        }
         let path = entry.path();
-        let name = entry.file_name();
-        let name_str = name.to_string_lossy();
-
-        if path.is_dir() {
-            if !IGNORE_DIRS.contains(&name_str.as_ref()) && !name_str.starts_with('.') {
-                walk_and_scan(root, &path, stats)?;
-            }
-        } else if path.is_file() {
-            if let Some(ext) = path.extension().and_then(|e| e.to_str()) {
-                let rel = path
-                    .strip_prefix(root)
-                    .unwrap_or(&path)
-                    .to_string_lossy()
-                    .replace('\\', "/");
-                scan_file(&path, &rel, ext, stats)?;
-            }
+        if let Some(ext) = path.extension().and_then(|e| e.to_str()) {
+            let rel = path
+                .strip_prefix(root)
+                .unwrap_or(path)
+                .to_string_lossy()
+                .replace('\\', "/");
+            scan_file(path, &rel, ext, stats)?;
         }
     }
     Ok(())
@@ -132,4 +111,38 @@ pub(crate) fn scan_file(
     }
 
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn scan_project_skips_gitignored_non_hardcoded_dirs() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(
+            dir.path().join("app.py"),
+            "import os\nos.system(user_input)\n",
+        )
+        .unwrap();
+
+        // Gitignored, non-hardcoded directory -- only a real .gitignore rule
+        // can exclude it.
+        std::fs::write(dir.path().join(".gitignore"), "scratchpad/\n").unwrap();
+        std::fs::create_dir_all(dir.path().join("scratchpad")).unwrap();
+        std::fs::write(
+            dir.path().join("scratchpad/copy.py"),
+            "import os\nos.system(user_input)\n",
+        )
+        .unwrap();
+
+        let stats = scan_project(dir.path()).unwrap();
+        let flagged_files: std::collections::HashSet<&str> =
+            stats.findings.iter().map(|f| f.file.as_str()).collect();
+        assert!(flagged_files.contains("app.py"));
+        assert!(
+            !flagged_files.iter().any(|f| f.contains("scratchpad")),
+            "gitignored scratchpad/ should not be scanned: {flagged_files:?}"
+        );
+    }
 }
