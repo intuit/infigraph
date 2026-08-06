@@ -597,21 +597,8 @@ impl Infigraph {
     }
 
     fn collect_files(&self) -> Result<Vec<PathBuf>> {
-        use ignore::WalkBuilder;
-
         let mut files = Vec::new();
-        let walker = WalkBuilder::new(&self.root)
-            .hidden(true)
-            .add_custom_ignore_filename(".infigraphignore")
-            .git_ignore(true)
-            .filter_entry(|e| {
-                let name = e.file_name().to_string_lossy();
-                !matches!(
-                    name.as_ref(),
-                    ".infigraph" | "node_modules" | "__pycache__" | ".tox"
-                )
-            })
-            .build();
+        let walker = crate::ignore_rules::walk_builder(&self.root).build();
 
         for result in walker {
             let entry = match result {
