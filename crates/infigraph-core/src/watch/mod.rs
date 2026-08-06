@@ -97,24 +97,13 @@ where
     // below silently fails for every event and all changes are dropped.
     let root = &root.canonicalize().unwrap_or_else(|_| root.to_path_buf());
 
-    let ignore_dirs: &[&str] = &[
-        ".infigraph",
-        ".git",
-        "node_modules",
-        "__pycache__",
-        ".venv",
-        "venv",
-        "target",
-        "build",
-        "dist",
-        ".tox",
-    ];
-
     // Build a registry once for file-extension filtering (no DB needed).
     let filter_registry = make_registry()?;
 
     let mut changes_since_periodic: usize = 0;
     let mut last_periodic = std::time::Instant::now();
+    let mut ignore_matcher = crate::ignore_rules::IgnoreMatcher::build(root);
+    let mut last_ignore_rebuild = std::time::Instant::now();
 
     // Batch accumulator: collect file changes over a 1-second window
     // then index them all at once using the bulk write path.
@@ -127,17 +116,15 @@ where
 
     // Create initial watcher — factored into a closure for restart.
     let create_watcher =
-        |root: &Path,
-         ignore_dirs: &[&str]|
-         -> Result<(RecommendedWatcher, mpsc::Receiver<notify::Result<Event>>)> {
+        |root: &Path| -> Result<(RecommendedWatcher, mpsc::Receiver<notify::Result<Event>>)> {
             let (tx, rx) = mpsc::channel::<notify::Result<Event>>();
             let config = Config::default().with_poll_interval(Duration::from_millis(debounce_ms));
             let mut watcher = RecommendedWatcher::new(tx, config)?;
-            register_watch_dirs(&mut watcher, root, ignore_dirs)?;
+            register_watch_dirs(&mut watcher, root)?;
             Ok((watcher, rx))
         };
 
-    let (mut watcher, mut rx) = create_watcher(root, ignore_dirs)?;
+    let (mut watcher, mut rx) = create_watcher(root)?;
 
     loop {
         if stop_rx.try_recv().is_ok() {
@@ -147,6 +134,12 @@ where
         if sentinel.exists() {
             let _ = std::fs::remove_file(&sentinel);
             break;
+        }
+
+        if periodic_secs > 0 && last_ignore_rebuild.elapsed() >= Duration::from_secs(periodic_secs)
+        {
+            ignore_matcher = crate::ignore_rules::IgnoreMatcher::build(root);
+            last_ignore_rebuild = std::time::Instant::now();
         }
 
         // Periodic SCIP refresh: if changes accumulated and enough time passed
@@ -219,7 +212,7 @@ where
                 };
 
                 for path in event.paths {
-                    if should_ignore(&path, ignore_dirs) {
+                    if ignore_matcher.is_ignored(&path, path.is_dir()) {
                         continue;
                     }
 
@@ -244,7 +237,7 @@ where
                         }
                         WatchEventKind::Created | WatchEventKind::Modified => {
                             if path.is_dir() {
-                                register_subdirs(&mut watcher, &path, ignore_dirs);
+                                let _ = register_watch_dirs(&mut watcher, &path);
                             } else if filter_registry.for_file(&rel).is_some() {
                                 batch.add(path);
                             }
@@ -274,7 +267,7 @@ where
                     backoff.as_secs()
                 );
                 std::thread::sleep(backoff);
-                match create_watcher(root, ignore_dirs) {
+                match create_watcher(root) {
                     Ok((new_watcher, new_rx)) => {
                         watcher = new_watcher;
                         rx = new_rx;
@@ -493,41 +486,14 @@ fn has_cross_file_calls(prism: &Infigraph, rel_path: &str) -> bool {
     false
 }
 
-fn should_ignore(path: &Path, ignore_dirs: &[&str]) -> bool {
-    path.components().any(|c| {
-        let s = c.as_os_str().to_string_lossy();
-        ignore_dirs.contains(&s.as_ref()) || s.starts_with('.')
-    })
-}
-
-fn register_watch_dirs(
-    watcher: &mut RecommendedWatcher,
-    root: &Path,
-    ignore_dirs: &[&str],
-) -> Result<()> {
-    watcher.watch(root, RecursiveMode::NonRecursive)?;
-    register_subdirs(watcher, root, ignore_dirs);
-    Ok(())
-}
-
-fn register_subdirs(watcher: &mut RecommendedWatcher, dir: &Path, ignore_dirs: &[&str]) {
-    let entries = match std::fs::read_dir(dir) {
-        Ok(e) => e,
-        Err(_) => return,
-    };
-    for entry in entries.flatten() {
-        let path = entry.path();
-        if !path.is_dir() {
-            continue;
+fn register_watch_dirs(watcher: &mut RecommendedWatcher, root: &Path) -> Result<()> {
+    for result in crate::ignore_rules::walk_builder(root).build() {
+        let Ok(entry) = result else { continue };
+        if entry.file_type().is_some_and(|ft| ft.is_dir()) {
+            let _ = watcher.watch(entry.path(), RecursiveMode::NonRecursive);
         }
-        let name = entry.file_name();
-        let name_str = name.to_string_lossy();
-        if ignore_dirs.contains(&name_str.as_ref()) || name_str.starts_with('.') {
-            continue;
-        }
-        let _ = watcher.watch(&path, RecursiveMode::NonRecursive);
-        register_subdirs(watcher, &path, ignore_dirs);
     }
+    Ok(())
 }
 
 #[cfg(test)]
