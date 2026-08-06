@@ -11,6 +11,7 @@ pub mod embed;
 pub mod export;
 pub mod extract;
 pub mod graph;
+pub mod ignore_rules;
 pub mod lang;
 pub mod learned;
 pub mod lockfile;
