@@ -217,6 +217,43 @@ pub fn hybrid_doc_search(
     hybrid_doc_search_in_dir(query, store, &root.join(".infigraph"), limit, alpha)
 }
 
+/// Cache is usable iff both files exist and the cache is at least as new as
+/// the embeddings sidecar — the same freshness anchor code search uses for
+/// bm25_cache.bin. Doc reindex rewrites docs_embeddings.bin, so a reindex
+/// automatically invalidates the cache.
+fn doc_bm25_cache_fresh(cache_path: &Path, anchor_path: &Path) -> bool {
+    let (Ok(cache_meta), Ok(anchor_meta)) = (
+        std::fs::metadata(cache_path),
+        std::fs::metadata(anchor_path),
+    ) else {
+        return false;
+    };
+    match (cache_meta.modified(), anchor_meta.modified()) {
+        (Ok(c), Ok(a)) => c >= a,
+        _ => false,
+    }
+}
+
+fn load_or_build_doc_index(
+    store: &dyn DocBackend,
+    cache_path: &Path,
+    anchor_path: &Path,
+) -> Result<(Vec<(String, String)>, DocBM25Index)> {
+    if doc_bm25_cache_fresh(cache_path, anchor_path) {
+        if let Ok(idx) = DocBM25Index::load(cache_path) {
+            return Ok((idx.docs().to_vec(), idx));
+        }
+    }
+    let chunks = store.get_all_chunks()?;
+    let idx = DocBM25Index::build(chunks.clone());
+    // Only cache when the anchor exists — without it there is no invalidation
+    // signal. Save failures are non-fatal: worst case is today's per-query rebuild.
+    if anchor_path.exists() && !chunks.is_empty() {
+        let _ = idx.save(cache_path);
+    }
+    Ok((chunks, idx))
+}
+
 pub fn hybrid_doc_search_in_dir(
     query: &str,
     store: &dyn DocBackend,
@@ -224,13 +261,14 @@ pub fn hybrid_doc_search_in_dir(
     limit: usize,
     alpha: f32,
 ) -> Result<Vec<DocSearchResult>> {
-    let chunks = store.get_all_chunks()?;
+    let emb_path = artifact_dir.join("docs_embeddings.bin");
+    let cache_path = artifact_dir.join("docs_bm25_cache.bin");
+    let (chunks, bm25_index) = load_or_build_doc_index(store, &cache_path, &emb_path)?;
 
     if chunks.is_empty() {
         return Ok(Vec::new());
     }
 
-    let bm25_index = DocBM25Index::build(chunks.clone());
     let bm25_results = bm25_index.search(query, limit * 3);
 
     // Normalize BM25
@@ -245,7 +283,6 @@ pub fn hybrid_doc_search_in_dir(
         .collect();
 
     // Vector search
-    let emb_path = artifact_dir.join("docs_embeddings.bin");
     let hnsw_path = artifact_dir.join("docs_hnsw_index.usearch");
 
     let embedder = doc_embedder();
