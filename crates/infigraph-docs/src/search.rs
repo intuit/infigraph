@@ -159,13 +159,7 @@ impl DocBM25Index {
             Ok(v)
         };
         let read_str = |data: &[u8], pos: &mut usize| -> Result<String> {
-            let len = {
-                let end = pos.checked_add(4).filter(|&e| e <= data.len());
-                let end = end.ok_or_else(|| anyhow::anyhow!("truncated doc bm25 cache"))?;
-                let v = u32::from_le_bytes(data[*pos..end].try_into().unwrap()) as usize;
-                *pos = end;
-                v
-            };
+            let len = read_u32(data, pos)? as usize;
             let end = pos.checked_add(len).filter(|&e| e <= data.len());
             let end = end.ok_or_else(|| anyhow::anyhow!("truncated doc bm25 cache"))?;
             let s = String::from_utf8_lossy(&data[*pos..end]).into_owned();

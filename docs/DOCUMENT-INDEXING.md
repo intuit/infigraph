@@ -534,7 +534,7 @@ Standard Okapi BM25 implementation:
 
 ### Persistent cache
 
-BM25 index is persisted as `.infigraph/docs_bm25_cache.bin`, valid only when at least as new as `docs_embeddings.bin` (the freshness anchor — the same pattern code search uses for `bm25_cache.bin`), so a doc reindex that rewrites embeddings automatically invalidates the cache. A missing, stale, or corrupt cache is not an error: `load_or_build_doc_index` silently falls back to rebuilding the index in-memory from the store and best-effort re-saves it (save failures are non-fatal).
+BM25 index is persisted as `.infigraph/docs_bm25_cache.bin`, valid only when at least as new as `docs_embeddings.bin` (the freshness anchor — the same pattern code search uses for `bm25_cache.bin`), so a doc reindex that rewrites embeddings automatically invalidates the cache. A missing, stale, or corrupt cache is not an error: `load_or_build_doc_index` silently falls back to rebuilding the index in-memory from the store and best-effort re-saves it (save failures are non-fatal). The cache is only written when `docs_embeddings.bin` already exists and the chunk set is non-empty — without an anchor there is no invalidation signal, so no cache is written.
 
 ### Result format
 
