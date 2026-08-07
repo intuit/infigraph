@@ -25,6 +25,9 @@ pub struct DocSearchResult {
 const K1: f32 = 1.2;
 const B: f32 = 0.75;
 
+/// On-disk format version for docs_bm25_cache.bin.
+const DOC_BM25_CACHE_VERSION: u8 = 1;
+
 pub struct DocBM25Index {
     docs: Vec<(String, String)>,
     inverted: HashMap<String, Vec<(usize, f32)>>,
@@ -91,6 +94,112 @@ impl DocBM25Index {
         results.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
         results.truncate(limit);
         results
+    }
+
+    pub fn docs(&self) -> &[(String, String)] {
+        &self.docs
+    }
+
+    /// Serialize to `path` atomically (temp file + rename in the same directory).
+    /// Layout: version u8 | avg_doc_len f32 | doc_count u32 |
+    /// [id_len u32, id, text_len u32, text]* | term_count u32 |
+    /// [term_len u32, term, posting_count u32, [doc_idx u32, tf f32]*]*
+    pub fn save(&self, path: &Path) -> Result<()> {
+        let mut buf = Vec::new();
+        buf.push(DOC_BM25_CACHE_VERSION);
+        buf.extend_from_slice(&self.avg_doc_len.to_le_bytes());
+        buf.extend_from_slice(&(self.docs.len() as u32).to_le_bytes());
+        for (id, text) in &self.docs {
+            let id_b = id.as_bytes();
+            buf.extend_from_slice(&(id_b.len() as u32).to_le_bytes());
+            buf.extend_from_slice(id_b);
+            let text_b = text.as_bytes();
+            buf.extend_from_slice(&(text_b.len() as u32).to_le_bytes());
+            buf.extend_from_slice(text_b);
+        }
+        buf.extend_from_slice(&(self.inverted.len() as u32).to_le_bytes());
+        for (term, postings) in &self.inverted {
+            let tb = term.as_bytes();
+            buf.extend_from_slice(&(tb.len() as u32).to_le_bytes());
+            buf.extend_from_slice(tb);
+            buf.extend_from_slice(&(postings.len() as u32).to_le_bytes());
+            for &(doc_idx, tf) in postings {
+                buf.extend_from_slice(&(doc_idx as u32).to_le_bytes());
+                buf.extend_from_slice(&tf.to_le_bytes());
+            }
+        }
+        // Unique temp name per process so concurrent writers can't interleave.
+        let tmp = path.with_extension(format!("{}.tmp", std::process::id()));
+        std::fs::write(&tmp, &buf).map_err(|e| anyhow::anyhow!("write doc bm25 cache: {}", e))?;
+        std::fs::rename(&tmp, path).map_err(|e| anyhow::anyhow!("rename doc bm25 cache: {}", e))
+    }
+
+    /// Bounds-checked deserialization. Any structural problem is an `Err`
+    /// (never a panic): callers treat a bad cache as a miss and rebuild.
+    pub fn load(path: &Path) -> Result<Self> {
+        let data =
+            std::fs::read(path).map_err(|e| anyhow::anyhow!("read doc bm25 cache: {}", e))?;
+        anyhow::ensure!(
+            !data.is_empty() && data[0] == DOC_BM25_CACHE_VERSION,
+            "unsupported doc bm25 cache version"
+        );
+        let mut pos = 1usize;
+        let read_u32 = |data: &[u8], pos: &mut usize| -> Result<u32> {
+            let end = pos.checked_add(4).filter(|&e| e <= data.len());
+            let end = end.ok_or_else(|| anyhow::anyhow!("truncated doc bm25 cache"))?;
+            let v = u32::from_le_bytes(data[*pos..end].try_into().unwrap());
+            *pos = end;
+            Ok(v)
+        };
+        let read_f32 = |data: &[u8], pos: &mut usize| -> Result<f32> {
+            let end = pos.checked_add(4).filter(|&e| e <= data.len());
+            let end = end.ok_or_else(|| anyhow::anyhow!("truncated doc bm25 cache"))?;
+            let v = f32::from_le_bytes(data[*pos..end].try_into().unwrap());
+            *pos = end;
+            Ok(v)
+        };
+        let read_str = |data: &[u8], pos: &mut usize| -> Result<String> {
+            let len = {
+                let end = pos.checked_add(4).filter(|&e| e <= data.len());
+                let end = end.ok_or_else(|| anyhow::anyhow!("truncated doc bm25 cache"))?;
+                let v = u32::from_le_bytes(data[*pos..end].try_into().unwrap()) as usize;
+                *pos = end;
+                v
+            };
+            let end = pos.checked_add(len).filter(|&e| e <= data.len());
+            let end = end.ok_or_else(|| anyhow::anyhow!("truncated doc bm25 cache"))?;
+            let s = String::from_utf8_lossy(&data[*pos..end]).into_owned();
+            *pos = end;
+            Ok(s)
+        };
+
+        let avg_doc_len = read_f32(&data, &mut pos)?;
+        let doc_count = read_u32(&data, &mut pos)? as usize;
+        let mut docs = Vec::with_capacity(doc_count.min(1 << 20));
+        for _ in 0..doc_count {
+            let id = read_str(&data, &mut pos)?;
+            let text = read_str(&data, &mut pos)?;
+            docs.push((id, text));
+        }
+        let term_count = read_u32(&data, &mut pos)? as usize;
+        let mut inverted = HashMap::with_capacity(term_count.min(1 << 20));
+        for _ in 0..term_count {
+            let term = read_str(&data, &mut pos)?;
+            let pc = read_u32(&data, &mut pos)? as usize;
+            let mut postings = Vec::with_capacity(pc.min(1 << 20));
+            for _ in 0..pc {
+                let doc_idx = read_u32(&data, &mut pos)? as usize;
+                let tf = read_f32(&data, &mut pos)?;
+                anyhow::ensure!(doc_idx < docs.len(), "doc bm25 cache posting out of range");
+                postings.push((doc_idx, tf));
+            }
+            inverted.insert(term, postings);
+        }
+        Ok(Self {
+            docs,
+            inverted,
+            avg_doc_len,
+        })
     }
 }
 
@@ -355,4 +464,81 @@ fn hybrid_doc_search_remote(
         .collect();
 
     Ok(results)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn sample_index() -> DocBM25Index {
+        DocBM25Index::build(vec![
+            (
+                "chunk-1".to_string(),
+                "kuzu graph database embedded columnar".to_string(),
+            ),
+            (
+                "chunk-2".to_string(),
+                "hybrid bm25 vector search ranking".to_string(),
+            ),
+            (
+                "chunk-3".to_string(),
+                "watcher debounce reindex freshness".to_string(),
+            ),
+        ])
+    }
+
+    #[test]
+    fn save_load_roundtrip_preserves_docs_and_scores() {
+        let tmp = tempfile::tempdir().unwrap();
+        let path = tmp.path().join("docs_bm25_cache.bin");
+        let idx = sample_index();
+        idx.save(&path).unwrap();
+        let loaded = DocBM25Index::load(&path).unwrap();
+        assert_eq!(idx.docs(), loaded.docs());
+        assert_eq!(
+            idx.search("vector search", 10),
+            loaded.search("vector search", 10)
+        );
+        assert_eq!(idx.search("kuzu", 10), loaded.search("kuzu", 10));
+    }
+
+    #[test]
+    fn load_rejects_empty_wrong_version_and_truncated() {
+        let tmp = tempfile::tempdir().unwrap();
+        let path = tmp.path().join("docs_bm25_cache.bin");
+
+        std::fs::write(&path, b"").unwrap();
+        assert!(
+            DocBM25Index::load(&path).is_err(),
+            "empty file must be rejected"
+        );
+
+        std::fs::write(&path, [9u8, 1, 2, 3, 4, 5, 6, 7, 8]).unwrap();
+        assert!(
+            DocBM25Index::load(&path).is_err(),
+            "unknown version must be rejected"
+        );
+
+        let idx = sample_index();
+        idx.save(&path).unwrap();
+        let full = std::fs::read(&path).unwrap();
+        std::fs::write(&path, &full[..full.len() / 2]).unwrap();
+        // Must be an Err, not a panic: hybrid search falls back to rebuild on Err.
+        assert!(
+            DocBM25Index::load(&path).is_err(),
+            "truncated file must be rejected"
+        );
+    }
+
+    #[test]
+    fn save_is_atomic_leaves_no_temp_file() {
+        let tmp = tempfile::tempdir().unwrap();
+        let path = tmp.path().join("docs_bm25_cache.bin");
+        sample_index().save(&path).unwrap();
+        let names: Vec<String> = std::fs::read_dir(tmp.path())
+            .unwrap()
+            .map(|e| e.unwrap().file_name().to_string_lossy().into_owned())
+            .collect();
+        assert_eq!(names, vec!["docs_bm25_cache.bin".to_string()]);
+    }
 }
