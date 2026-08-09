@@ -1,7 +1,7 @@
 # DESIGN — Data-driven agent-target MCP config (upstream)
 
 **Status:** Approved (design phase) — 2026-08-09
-**Scope:** `crates/infigraph-cli/src/config_targets.rs`, `crates/infigraph-cli/src/install.rs`. Destined for **upstream** (`intuit/infigraph`), not the fork — requires explicit user approval before pushing/opening the PR.
+**Scope:** `crates/infigraph-cli/src/config_targets.rs`, `crates/infigraph-cli/src/hooks.rs`, `crates/infigraph-cli/src/install.rs`. Destined for **upstream** (`intuit/infigraph`), not the fork — requires explicit user approval before pushing/opening the PR.
 
 ## Motivation
 
@@ -10,7 +10,7 @@ Two related upstream issues:
 - **intuit/infigraph#29** — `infigraph install` writes incompatible MCP configurations for several agents. `config_targets.rs`'s `AGENT_TARGETS` hardcodes a single `mcpServers`-shaped JSON writer (`install_json_target`) shared by every JSON-based agent, and a single TOML writer (`install_toml_target`) for Codex. Several agents need a genuinely different file path and/or JSON shape, not just a different top-level key.
 - **intuit/infigraph#50** — "Default installation is too invasive." Wants install *modes* (mcp-server-only / automated / full hooks+session-recording), user-selectable at install time. Out of scope to fully implement here; this design lays groundwork by making `cmd_install()`'s monolithic call sequence composable.
 
-This grew out of fork issue **pradeepmouli/infigraph#65** ("Agent/hook config is hardcoded in Rust source"), which proposed moving static config out of Rust source into bundled/data-driven files, mirroring the existing bundled → user → project discovery pattern already used for grammar plugins (`GRAMMAR_PLUGINS.md`).
+This grew out of fork issue **pradeepmouli/infigraph#65** ("Agent/hook config is hardcoded in Rust source"), which proposed moving static config out of Rust source into bundled/data-driven files, mirroring the existing bundled → user → project discovery pattern already used for grammar plugins (`GRAMMAR_PLUGINS.md`). This PR addresses both halves of #65 in one submission: agent-target MCP config (`config_targets.rs`, driven by #29) and hook-script bundling (`hooks.rs`) — see the "Hooks bundling" section below.
 
 ## Research: verified per-agent schemas
 
@@ -139,9 +139,55 @@ Existing call sites: `main.rs`'s `Commands::Install` dispatch passes `InstallSte
 
 Stale files at old wrong paths (e.g. `~/.opencode/config.json` from before this fix) are inert — the affected tools already don't read them (confirmed in #29's testing). This PR does not clean them up; worth a one-line callout in the PR description, not a feature.
 
+## Hooks bundling (folds in the other half of fork issue #65)
+
+`hooks.rs` (1827 lines on `upstream/main`) has the same hardcoding problem as `config_targets.rs`, and this PR now covers both. Confirmed by reading every `install_*_hook` function: every hook reduces to the same shape — write a bundled script to `~/.claude/hooks/<name>.sh`, register it under one or more settings.json events with an optional matcher/timeout/async, and skip if an entry for that script already exists. `install_claude_allowlist` is the one exception — it writes to `settings.local.json`'s `permissions.allow` list, not a `hooks` event at all, and stays untouched as its own function, outside this mechanism.
+
+### Manifest format
+
+Two sibling bundled files per hook — content and metadata kept separate, so the script gets normal shell tooling (shellcheck, syntax highlighting) instead of living inside a TOML string:
+
+- `crates/infigraph-cli/resources/hooks/<name>.sh` — the script body (today's `*_HOOK_SCRIPT` const content, verbatim).
+- `crates/infigraph-cli/resources/hooks/<name>.toml` — metadata:
+
+```toml
+label = "Edit tracker"
+event = "PostToolUse"          # string, OR an array for a script registered on multiple events
+matcher = "Edit|Write|NotebookEdit"   # optional -- SessionStart/SessionEnd/PreCompact take none
+timeout = 5                    # default 5 if omitted
+async = true                   # default false if omitted
+```
+
+`event` as an array covers `install_session_end_hook`'s existing behavior exactly: one script (`infigraph-session-end-save.sh`), registered under both `SessionEnd` and `PreCompact` with the same matcher/timeout — expressed as `event = ["SessionEnd", "PreCompact"]` in one manifest file instead of two near-identical Rust code blocks. Same parsing rule as `path` above: parse as a `toml::Value` and branch on `Value::String` vs `Value::Array`, not two separate typed fields.
+
+### Discovery
+
+Same two-tier pattern as agent targets: bundled (`include_str!` pairs, `&[(&str, &str, &str)]` — name, script content, manifest content) → `~/.infigraph/hooks/<name>.sh` + `<name>.toml` overrides by name or adds a new hook, no recompile needed. This is also the mechanism the fork's `install_worktree_lifecycle_hook` (not yet upstream) would adopt once this lands, rather than staying a one-off hardcoded `const` — worth noting in the PR description as a forward-looking benefit, not something this PR needs to implement.
+
+### Generic installer
+
+One function replaces all ten `install_*_hook` functions:
+
+1. Write the script, `chmod +x`.
+2. For each event in `event`: find an existing entry in `settings["hooks"][event]` whose `hooks[].command` contains the script's filename (the same substring-match idempotency key every existing function already uses).
+3. **If found:** if its `matcher` differs from the manifest's, update it in place (self-healing on upgrade) and report "updated"; otherwise report "already configured". **If not found:** append a new `{matcher?, hooks: [{command, timeout, async?}]}` entry.
+
+### Two deliberate behavior changes (call out explicitly in the PR description)
+
+- **Matcher self-healing becomes uniform.** Today, only `install_enforcement_hook` updates an existing entry's `matcher` in place if it's drifted from the current hardcoded value; every other hook only checks presence/absence. The generic engine does this for all hooks — strictly additive (closes a real gap: e.g. if `session-reset`'s matcher ever needs to change in a future release, existing installs currently would *not* pick that up automatically).
+- **`install_edit_tracker_hook`'s "merge into an existing matcher-containing entry" special case is dropped.** It's the one function that, instead of always creating its own entry, searches for *any* existing `PostToolUse` entry whose matcher contains `"Edit"` and appends into that entry's `hooks` array — which could mutate an entry that isn't infigraph's. The generic engine always creates/owns its own entry, matching every other hook's existing behavior. Net effect on an existing install: one extra `PostToolUse` array entry with the same `Edit|Write|NotebookEdit` matcher string as before — functionally identical (Claude Code doesn't care about duplicate matcher strings across entries), just not deduplicated at the JSON level anymore.
+
+### Testing
+
+- Per-manifest fixture test (one per bundled hook): apply against empty `settings.json`, assert exact expected entry/entries.
+- Idempotency test: apply twice, second run reports "already configured", no duplicate entries.
+- Matcher self-heal test: apply, hand-edit the resulting matcher, re-apply, assert it's restored and reported as "updated".
+- Multi-event test: the session-end manifest (`event = ["SessionEnd", "PreCompact"]`) produces both entries from one apply call.
+- Discovery override test: same pattern as agent targets, fake `HOME`.
+
 ## Out of scope
 
 - No `--mode` / install-tier flag or UX (that's #50 itself, a separate follow-up PR once this groundwork lands).
 - No JSONC-tolerant parser (Zed's embedded-settings case bails with instructions instead).
-- No project-level (three-tier) discovery for agent targets.
-- No changes to `hooks.rs`'s hook-script bundling (that's fork issue #65's other half — see the "Hooks bundling" open question below for whether it belongs in this PR).
+- No project-level (three-tier) discovery for agent targets or hooks.
+- `install_claude_allowlist` is untouched (different settings file, different section — not a `hooks` event).
