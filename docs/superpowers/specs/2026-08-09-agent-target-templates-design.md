@@ -52,12 +52,14 @@ A file's **extension** plus its **mirrored path** are enough to know what to do 
 - **`.json` or `.toml` file at a path mirroring a real config file** → **deep-merge**. Object keys merge recursively (anything the fragment doesn't mention is preserved untouched). Array entries are trickier — a naive value-tree merge would either duplicate entries on every install or nuke a user's unrelated entries — so array merging uses one small, universal rule instead of per-artifact metadata: **any existing array entry whose serialized content already contains the substring `infigraph` is ours; remove it and replace it with the fragment's corresponding entries, leaving every other entry in that array untouched.** Since every infigraph script/command path already contains `infigraph-` by naming convention, this needs no separate declaration, and it makes self-healing automatic for free — whatever's in the fragment right now becomes the truth on every apply, no drift-tracking needed.
 - **Everything else at a mirrored path** (`.sh`, `.md`, `.mdc`) → **overwrite**, byte for byte.
 
-Both apply purely from a bundled file's *existence* at the mirrored location — no `config.toml` entry required. A manifest entry is needed only for the two things that genuinely can't be inferred from extension + path:
+Both apply purely from a bundled file's *existence*, co-located at its own mirrored path within the integration's directory. That's the actual dividing line — not "which strategy does this need," but **is the content physically where the destination's mirrored path says it should be.** A manifest entry is needed whenever it isn't, for either of two reasons:
 
-1. **Marker-delimited insertion** (`CLAUDE.md`) — a `.md` file could mean "standalone bundled doc" (overwrite) or "insert into existing prose" (marker-delimited); extension alone can't disambiguate, so this needs an explicit declaration.
-2. **Resolver-based path/content** (VS Code, Zed) — the destination isn't a fixed path at all, so there's no mirrored location to infer from.
+1. **The content lives elsewhere** (`shared/`) — CLAUDE.md's instructional text is `../shared/agents.md`, not a local file in `claude-code/`, so discovery can't find it by mirrored-path convention alone. This happens to also need `marker_delimited` (CLAUDE.md already has other content worth preserving), but the *reason* it's registered at all is the shared path, not the strategy — a plain `overwrite` artifact pulling from `shared/` would need the exact same registration. Cursor's and Windsurf's rules content is the same shared text (no local copy, no per-agent duplication) — so they need a minimal `config.toml` too, purely to say "pull this from `../shared/agents.md`," with `overwrite` as the strategy, not `marker_delimited`.
+2. **There's no fixed local path to mirror at all** (VS Code, Zed) — a resolver computes it.
 
-Most integrations (Cursor, Codex, Gemini CLI, OpenCode, Aider, Windsurf, Kiro, GitHub Copilot CLI) need **no `config.toml` whatsoever** — just a bundled `.json`/`.toml` fragment at the mirrored path. Only Claude Code (needs marker-delimited `CLAUDE.md`) and VS Code/Zed (need a resolver) have one.
+This has a forward-looking implication worth naming: today every hook script and the reindex command live locally, one per integration, nothing shared at that level — but if a future hook or command ever became genuinely identical across integrations, it would need the same treatment as CLAUDE.md/Cursor/Windsurf: an `[[artifact]]` entry pointing `content_file` at `../shared/hooks/...`, even with a plain `overwrite` strategy and nothing to "transform." The manifest requirement tracks *where the content lives*, never what happens to it once found.
+
+Codex, Gemini CLI, OpenCode, Aider, Kiro, and GitHub Copilot CLI need **no `config.toml` at all** — just a bundled fragment file, locally, at the mirrored path. Claude Code, Cursor, and Windsurf need one because their content is shared. VS Code and Zed need one because their path is resolver-computed.
 
 ### Directory layout
 
@@ -91,14 +93,14 @@ crates/infigraph-cli/resources/integrations/     (bundled, compiled in)
       search-fallback-sentinel.sh
 
   cursor/
-    .cursor/mcp.json              # convention: JSON deep-merge -- no config.toml needed
-    rules/
-      infigraph.mdc               # convention: overwrite, mirrors ~/.cursor/rules/
+    config.toml                   # rules content is shared -- see "Shared content" below
+    .cursor/mcp.json              # convention: JSON deep-merge, no manifest entry needed for this one
+    rules/                        # empty locally -- content_file in config.toml points at ../shared/agents.md
 
   windsurf/
+    config.toml                   # same reason as Cursor
     .codeium/windsurf/mcp_config.json
     rules/
-      infigraph.md
 
   vscode/       config.toml       # resolver-based path -- the one thing that can't be a mirrored file
   zed/          config.toml       # resolver-based path
@@ -114,7 +116,7 @@ Note the naming collision this makes visible: `codex/.codex/config.toml` is a *c
 
 ### Shared content
 
-Content that's the same (or near-identical, modulo file-format wrapping) across multiple integrations lives once, under `shared/`, referenced via a relative path that escapes the integration's own directory (`../shared/agents.md`) — for `CLAUDE.md`, which still needs an explicit manifest entry for its marker-delimited strategy:
+Content that's identical across multiple integrations lives once, under `shared/`, referenced via a relative path that escapes the integration's own directory (`../shared/agents.md`). Every integration pulling from `shared/` needs a `config.toml` entry for it — the strategy varies (CLAUDE.md needs `marker_delimited` since it may already hold other content worth preserving; Cursor and Windsurf's rules files are infigraph-owned outright, so plain `overwrite` is enough), but the registration itself is required in both cases, for the same reason: the content isn't where the mirrored path would suggest.
 
 ```toml
 # claude-code/config.toml
@@ -128,7 +130,17 @@ end = "<!-- /infigraph-primary-search -->"
 content_file = "../shared/agents.md"
 ```
 
-For integrations whose rules content is convention-based (overwrite, no manifest), the same relative-escape idea would need the convention-based engine to also support "this file's real content lives elsewhere" — worth resolving at plan time whether that's a tiny sidecar (`rules/infigraph.mdc.source = "../shared/agents.md"`) or whether Cursor/Windsurf's rules content is just different enough from Claude Code's (different frontmatter wrapping) that it isn't literally the same bytes and doesn't need this in practice. Not spec-blocking either way.
+```toml
+# cursor/config.toml
+label = "Cursor"
+
+[[artifact]]
+path = ".cursor/rules/infigraph.mdc"
+strategy = "overwrite"
+content_file = "../shared/agents.md"
+```
+
+If Cursor's `.mdc` format ends up needing its own frontmatter wrapper around the shared body (rather than the shared text working verbatim), that's a small addition to the artifact's fields at plan time (a `prefix`/`suffix` around `content_file`, or a per-format wrapper template) — not a change to *whether* this needs registration, only to what the registered artifact looks like.
 
 `shared/` is discovered and overridable the same way as everything else — `~/.infigraph/integrations/shared/agents.md` overrides the bundled copy for every integration that references it, in one edit.
 
