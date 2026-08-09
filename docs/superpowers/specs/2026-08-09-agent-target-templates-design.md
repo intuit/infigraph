@@ -49,7 +49,7 @@ Issue #29's reporter manually tested GitHub Copilot CLI and OpenCode; VS Code, Z
 
 Matches `infigraph-pipeline-plugin`'s own precedent more closely than earlier drafts of this design did: one directory per integration, a well-known manifest filename (`config.toml`, mirroring `plugin.toml`'s role) sitting alongside that integration's content files — not split across a sidecar-per-artifact tree, and not split between a top-level manifest and a same-named sibling content directory.
 
-Content is grouped by *kind*, not by current file count: `hooks/` and `rules/` are categories that can in principle hold more than one file (Cursor/Windsurf hold one rules file today, but nothing guarantees that stays true), so they get a subdirectory regardless of how many files are in it right now. A singular, uniquely-purposed artifact (the CLAUDE.md fragment, the reindex command) isn't a category and stays flat at the integration root.
+Content directories mirror the *real* destination folder structure below the agent's own root (`.claude/`, `.cursor/`, etc.) — not an invented organizational scheme. If the real destination has a `hooks/` or `commands/` subfolder, the content lives under a matching subfolder here; if the destination is a bare file directly in the agent's root (or at `$HOME` with no subdirectory at all, like `.claude.json`), the content stays flat (or inline, needing no content file).
 
 ```
 crates/infigraph-cli/resources/integrations/     (bundled, compiled in)
@@ -57,10 +57,11 @@ crates/infigraph-cli/resources/integrations/     (bundled, compiled in)
 
   claude-code/
     config.toml                # every artifact for this integration, as an [[artifact]] array
-    claude-md.fragment.md      # singular artifact, not a category -- stays flat
-    reindex-command.md
+    claude-md.fragment.md      # ~/.claude.json is $HOME-level, ~/.claude/CLAUDE.md sits directly in .claude/ -- both flat
+    commands/
+      infigraph-reindex.md      # mirrors the real ~/.claude/commands/ subfolder
     hooks/
-      enforce.sh
+      enforce.sh                # mirrors the real ~/.claude/hooks/ subfolder
       edit-tracker.sh
       session-save.sh
       session-reset.sh
@@ -73,12 +74,12 @@ crates/infigraph-cli/resources/integrations/     (bundled, compiled in)
 
   cursor/
     config.toml
-    rules/
+    rules/                      # mirrors ~/.cursor/rules/
       infigraph.mdc
 
   windsurf/
     config.toml
-    rules/
+    rules/                      # mirrors ~/.windsurf/rules/
       infigraph.md
 
   vscode/               config.toml   (resolver-based path -- see below; no content file, mcp-config entry inline)
@@ -114,7 +115,7 @@ content_file = "claude-md.fragment.md"
 [[artifact]]
 path = ".claude/commands/infigraph-reindex.md"
 strategy = "overwrite"
-content_file = "reindex-command.md"
+content_file = "commands/infigraph-reindex.md"
 
 [[artifact]]
 path = ".claude/hooks/infigraph-enforce.sh"
@@ -129,7 +130,7 @@ content_file = "hooks/enforce.sh"
 # ... one [[artifact]] per remaining hook
 ```
 
-Every artifact states its own `path` and `strategy` explicitly — no "plain file needs zero manifest" shortcut. `content_file` is relative to the integration's own directory (organized by content kind, not mirroring `path` — see the layout above); small content (a JSON `entry`, in the first example above) is inline instead.
+Every artifact states its own `path` and `strategy` explicitly — no "plain file needs zero manifest" shortcut. `content_file` is relative to the integration's own directory, and mirrors `path`'s subdirectory structure *below* the agent's root (`.claude/hooks/enforce.sh` → `hooks/enforce.sh`; the leading `.claude/` is dropped since it's already implied by being inside `claude-code/`). Small content (a JSON `entry`, in the first example above) is inline instead of a `content_file`.
 
 ### Merge strategies
 
