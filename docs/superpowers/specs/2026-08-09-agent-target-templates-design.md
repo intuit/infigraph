@@ -55,9 +55,13 @@ Content directories mirror the *real* destination folder structure below the age
 crates/infigraph-cli/resources/integrations/     (bundled, compiled in)
 ~/.infigraph/integrations/                        (user-level override, identical structure)
 
+  shared/                        # content referenced by more than one integration -- not duplicated per-agent
+    agents.md                    # the core instructional text (today's write_claude_md_instructions block)
+    skills/                      # bundled skill content, if/when any integration needs it beyond plain instructions
+      ...
+
   claude-code/
     config.toml                # every artifact for this integration, as an [[artifact]] array
-    claude-md.fragment.md      # ~/.claude.json is $HOME-level, ~/.claude/CLAUDE.md sits directly in .claude/ -- both flat
     commands/
       infigraph-reindex.md      # mirrors the real ~/.claude/commands/ subfolder
     hooks/
@@ -74,13 +78,11 @@ crates/infigraph-cli/resources/integrations/     (bundled, compiled in)
 
   cursor/
     config.toml
-    rules/                      # mirrors ~/.cursor/rules/
-      infigraph.mdc
+    rules/                      # mirrors ~/.cursor/rules/ -- no local content file, references ../shared/agents.md
 
   windsurf/
     config.toml
-    rules/                      # mirrors ~/.windsurf/rules/
-      infigraph.md
+    rules/                      # mirrors ~/.windsurf/rules/ -- also references ../shared/agents.md
 
   vscode/               config.toml   (resolver-based path -- see below; no content file, mcp-config entry inline)
   codex/                config.toml
@@ -91,6 +93,12 @@ crates/infigraph-cli/resources/integrations/     (bundled, compiled in)
   kiro/                 config.toml
   github-copilot-cli/   config.toml
 ```
+
+### Shared content
+
+Content that's the same (or near-identical, modulo file-format wrapping) across multiple integrations lives once, under `shared/`, and is referenced from each integration's `config.toml` via a relative `content_file` that escapes its own directory (`../shared/agents.md`) rather than being copied into `claude-code/`, `cursor/`, and `windsurf/` separately. This is the actual instructional text every agent gets told about infigraph — today it's one hardcoded block in `write_claude_md_instructions`, duplicated in spirit (though not verbatim) by `write_editor_rules`'s Cursor/Windsurf output; unifying it into `shared/agents.md` means editing the instructions once updates every integration, instead of needing to remember all the places it's duplicated.
+
+`shared/` is discovered and overridable the same way as everything else (`~/.infigraph/integrations/shared/agents.md` overrides the bundled copy for every integration that references it, in one edit) — it's not a separate mechanism, just a directory `content_file` paths are allowed to reach into.
 
 `claude-code/config.toml`:
 
@@ -110,7 +118,7 @@ path = ".claude/CLAUDE.md"
 strategy = "marker_delimited"
 start = "<!-- infigraph-primary-search -->"
 end = "<!-- /infigraph-primary-search -->"
-content_file = "claude-md.fragment.md"
+content_file = "../shared/agents.md"
 
 [[artifact]]
 path = ".claude/commands/infigraph-reindex.md"
@@ -130,7 +138,7 @@ content_file = "hooks/enforce.sh"
 # ... one [[artifact]] per remaining hook
 ```
 
-Every artifact states its own `path` and `strategy` explicitly — no "plain file needs zero manifest" shortcut. `content_file` is relative to the integration's own directory, and mirrors `path`'s subdirectory structure *below* the agent's root (`.claude/hooks/enforce.sh` → `hooks/enforce.sh`; the leading `.claude/` is dropped since it's already implied by being inside `claude-code/`). Small content (a JSON `entry`, in the first example above) is inline instead of a `content_file`.
+Every artifact states its own `path` and `strategy` explicitly — no "plain file needs zero manifest" shortcut. `content_file` is relative to the integration's own directory, and mirrors `path`'s subdirectory structure *below* the agent's root (`.claude/hooks/enforce.sh` → `hooks/enforce.sh`; the leading `.claude/` is dropped since it's already implied by being inside `claude-code/`) — except when the content is shared across integrations, in which case `content_file` reaches up into `../shared/` instead (see "Shared content" below). Small content (a JSON `entry`, in the first example above) is inline instead of a `content_file`.
 
 ### Merge strategies
 
@@ -254,6 +262,7 @@ pub(crate) fn cmd_install(steps: &[InstallStep]) -> Result<()> {
 - **Multi-target test**: the session-end hook's two-event `array_path` produces both entries from one apply call.
 - **Matcher self-heal test**: apply, hand-edit the resulting matcher, re-apply, assert it's restored and reported as "updated".
 - **Resolver tests** (VS Code, Zed): a fake resolver script exercising `ok`/`skip`/`error` responses, confirming the artifact engine handles all three without touching the target file on `skip`/`error`.
+- **Shared-content test**: at least two integrations (Claude Code, Cursor) whose `content_file` points at `../shared/agents.md` both apply the same content; overriding `~/.infigraph/integrations/shared/agents.md` changes the output for both without either integration's own `config.toml` changing.
 
 ## Migration
 
