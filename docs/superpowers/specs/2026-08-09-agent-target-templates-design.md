@@ -45,52 +45,91 @@ Issue #29's reporter manually tested GitHub Copilot CLI and OpenCode; VS Code, Z
 
 ## Architecture
 
-### Directory layout — tree position *is* the destination path
+### Directory layout — one manifest per integration
+
+Matches `infigraph-pipeline-plugin`'s own precedent more closely than earlier drafts of this design did: one directory per integration, a well-known manifest filename (`config.toml`, mirroring `plugin.toml`'s role) sitting alongside that integration's content files — not split across a sidecar-per-artifact tree, and not split between a top-level manifest and a same-named sibling content directory.
+
+Content is grouped by *kind*, not by current file count: `hooks/` and `rules/` are categories that can in principle hold more than one file (Cursor/Windsurf hold one rules file today, but nothing guarantees that stays true), so they get a subdirectory regardless of how many files are in it right now. A singular, uniquely-purposed artifact (the CLAUDE.md fragment, the reindex command) isn't a category and stays flat at the integration root.
 
 ```
 crates/infigraph-cli/resources/integrations/     (bundled, compiled in)
 ~/.infigraph/integrations/                        (user-level override, identical structure)
 
   claude-code/
-    .claude.json.toml              # patch descriptor -> ~/.claude.json
-    .claude/
-      CLAUDE.md.toml                # patch descriptor -> ~/.claude/CLAUDE.md
-      CLAUDE.md.fragment.md         # the actual instructions block (referenced by the descriptor)
-      commands/
-        infigraph-reindex.md        # plain file -> deploys verbatim to ~/.claude/commands/infigraph-reindex.md
-      hooks/
-        infigraph-enforce.sh                # plain file -> ~/.claude/hooks/infigraph-enforce.sh
-        infigraph-enforce.sh.toml           # patch descriptor: settings.json wiring for that script
-        infigraph-edit-tracker.sh
-        infigraph-edit-tracker.sh.toml
-        infigraph-session-save.sh + .toml
-        infigraph-session-reset.sh + .toml
-        infigraph-session-start.sh + .toml
-        infigraph-session-end-save.sh + .toml
-        infigraph-clear-suggest.sh + .toml
-        infigraph-clear-guard.sh + .toml
-        infigraph-test-context-sentinel.sh + .toml
-        infigraph-search-fallback-sentinel.sh + .toml
+    config.toml                # every artifact for this integration, as an [[artifact]] array
+    claude-md.fragment.md      # singular artifact, not a category -- stays flat
+    reindex-command.md
+    hooks/
+      enforce.sh
+      edit-tracker.sh
+      session-save.sh
+      session-reset.sh
+      session-start.sh
+      session-end-save.sh
+      clear-suggest.sh
+      clear-guard.sh
+      test-context-sentinel.sh
+      search-fallback-sentinel.sh
 
   cursor/
-    .cursor/mcp.json.toml
-    .cursor/rules/infigraph.mdc     # plain file
+    config.toml
+    rules/
+      infigraph.mdc
 
-  vscode/       .vscode/mcp.json.toml   (resolver — see below)
-  codex/        .codex/config.toml.toml # yes, config.toml.toml — the destination genuinely is config.toml
-  gemini-cli/   .gemini/settings.json.toml
-  zed/          settings.json.toml       (path itself needs a resolver — see below)
-  opencode/     .config/opencode/opencode.json.toml
-  aider/        .aider/mcp.json.toml
-  windsurf/     .codeium/windsurf/mcp_config.json.toml
-  kiro/         .kiro/settings/mcp.json.toml
-  github-copilot-cli/  .copilot/mcp-config.json.toml
+  windsurf/
+    config.toml
+    rules/
+      infigraph.md
+
+  vscode/               config.toml   (resolver-based path -- see below; no content file, mcp-config entry inline)
+  codex/                config.toml
+  gemini-cli/           config.toml
+  zed/                  config.toml   (resolver-based path -- see below)
+  opencode/             config.toml
+  aider/                config.toml
+  kiro/                 config.toml
+  github-copilot-cli/   config.toml
 ```
 
-**Convention:**
+`claude-code/config.toml`:
 
-- **A plain file** deploys verbatim to the destination given by its own path within the integration directory, relative to `$HOME` (or the resolved root). No manifest, no metadata — this is the `overwrite` strategy, and it's the default for anything that's a whole file with no merge concerns: hook scripts, the reindex command, single-purpose rule files.
-- **A `<name>.toml` sidecar** means the *destination* is `<name>` (same path, minus the `.toml` suffix) and this file is a **patch descriptor**, not the full file — it declares a `strategy` and whatever that strategy needs, and either inline content or a `content_file` reference to a sibling file for anything large (markdown fragments, big JSON entries).
+```toml
+label = "Claude Code"
+
+[[artifact]]
+path = ".claude.json"
+strategy = "json_key_path"
+key_path = ["mcpServers", "infigraph"]
+[artifact.entry]
+command = "{{mcp_path}}"
+args = ["--mcp"]
+
+[[artifact]]
+path = ".claude/CLAUDE.md"
+strategy = "marker_delimited"
+start = "<!-- infigraph-primary-search -->"
+end = "<!-- /infigraph-primary-search -->"
+content_file = "claude-md.fragment.md"
+
+[[artifact]]
+path = ".claude/commands/infigraph-reindex.md"
+strategy = "overwrite"
+content_file = "reindex-command.md"
+
+[[artifact]]
+path = ".claude/hooks/infigraph-enforce.sh"
+strategy = "json_array_append"
+array_path = ["hooks", "PreToolUse"]
+idempotency_key = "infigraph-enforce"
+self_heal_field = "matcher"
+matcher = "Grep|Glob|Bash|Read|Write|Edit|Agent"
+timeout = 5
+content_file = "hooks/enforce.sh"
+
+# ... one [[artifact]] per remaining hook
+```
+
+Every artifact states its own `path` and `strategy` explicitly — no "plain file needs zero manifest" shortcut. `content_file` is relative to the integration's own directory (organized by content kind, not mirroring `path` — see the layout above); small content (a JSON `entry`, in the first example above) is inline instead.
 
 ### Merge strategies
 
@@ -104,44 +143,23 @@ enum MergeStrategy {
     },
     TomlSection(String),                             // Codex: splice by [section header], preserve rest via raw text (not a full TOML round-trip, to preserve formatting/comments)
     MarkerDelimited { start: String, end: String },   // CLAUDE.md: replace text between two sentinel comments
-    Overwrite,                                        // whole-file write; used implicitly by plain (non-.toml) files
+    Overwrite,                                        // whole-file write
 }
 ```
 
-Patch-descriptor sidecar shape (JSON strategy example, `.claude.json.toml`):
-
-```toml
-strategy = "json_key_path"
-key_path = ["mcpServers", "infigraph"]
-
-[entry]
-command = "{{mcp_path}}"
-args = ["--mcp"]
-```
-
-Hook wiring sidecar shape (`infigraph-enforce.sh.toml`):
-
-```toml
-strategy = "json_array_append"
-array_path = ["hooks", "PreToolUse"]
-idempotency_key = "infigraph-enforce"     # matched as a substring of existing hooks[].command values
-self_heal_field = "matcher"
-matcher = "Grep|Glob|Bash|Read|Write|Edit|Agent"
-timeout = 5
-```
-
-`array_path` may be a single path (`Vec<String>`, e.g. `["hooks", "PostToolUse"]`) or multiple paths applied identically (`Vec<Vec<String>>`) — `install_session_end_hook`'s existing behavior (one script, registered on both `SessionEnd` and `PreCompact`) becomes one sidecar with `array_path = [["hooks", "SessionEnd"], ["hooks", "PreCompact"]]`, instead of two near-identical Rust code blocks. Both forms are TOML arrays, so the disambiguator isn't "is it an array" — parse as a `toml::Value` and check whether the *first element* is itself a `Value::Array` (multi-path) or a `Value::String` (single path); an empty array is invalid input, reject it explicitly rather than guessing a default. The same rule applies to `path`/`resolver`-adjacent fields elsewhere in this design that accept a bare value or a collection of them — always branch on the parsed `toml::Value` shape, never model as two separate typed fields (Serde's `#[serde(untagged)]` resolution order can silently pick the wrong variant on ambiguous input).
+`array_path` may be a single path (`Vec<String>`, e.g. `["hooks", "PostToolUse"]`) or multiple paths applied identically (`Vec<Vec<String>>`) — `install_session_end_hook`'s existing behavior (one script, registered on both `SessionEnd` and `PreCompact`) becomes one `[[artifact]]` entry with `array_path = [["hooks", "SessionEnd"], ["hooks", "PreCompact"]]`, instead of two near-identical Rust code blocks. Both forms are TOML arrays, so the disambiguator isn't "is it an array" — parse as a `toml::Value` and check whether the *first element* is itself a `Value::Array` (multi-path) or a `Value::String` (single path); an empty array is invalid input, reject it explicitly rather than guessing a default. The same rule applies to any field elsewhere in this design that accepts a bare value or a collection of them — always branch on the parsed `toml::Value` shape, never model as two separate typed fields (Serde's `#[serde(untagged)]` resolution order can silently pick the wrong variant on ambiguous input).
 
 ### Path resolution and the resolver escape hatch
 
-The destination root is `$HOME` by default (a plain file/sidecar at `claude-code/.claude.json.toml` targets `~/.claude.json`). Two cases don't fit "tree position = destination" cleanly, both handled by a `resolver` field instead of a static path:
+The destination root is `$HOME` by default (an artifact's `path` field, e.g. `.claude.json`, is relative to it). Two cases don't fit a static `path` cleanly, both handled by a `resolver` field instead:
 
 - **VS Code** — the real user-level config lives in a profile directory that varies by OS and isn't fully knowable from a fixed dotfile.
 - **Zed** — `context_servers` isn't a separate file at all; it's a section inside Zed's own `settings.json`, whose canonical path also varies by OS.
 
-For these, the sidecar has no fixed tree-relative destination; instead:
+For these, the `[[artifact]]` entry has no `path` field at all; instead:
 
 ```toml
+[[artifact]]
 strategy = "json_key_path"
 key_path = ["context_servers", "infigraph"]
 resolver = ["./resolve-zed-path.sh"]   # any executable; stdin/stdout JSON IPC, same shape pipeline-plugin uses
@@ -162,12 +180,12 @@ Any JSON-strategy artifact (`json_key_path`, `json_array_append`) parses the tar
 
 Two-tier — **not** the full three-tier grammar-plugin pattern, since which agent CLIs/tools are installed is a per-machine fact, not a per-project one:
 
-1. **Bundled defaults** — the `crates/infigraph-cli/resources/integrations/` tree, compiled in. Rather than a hand-maintained list of `include_str!` calls that has to be edited every time an integration or hook is added, a `build.rs` walks the tree at compile time and generates the `&[(&str, &str)]` registry (relative path → contents) automatically — so the bundled tier gets the same "drop a file in, done" ergonomics the user-override tier already has by construction.
-2. **User-level override** — `~/.infigraph/integrations/`, identical structure. A file at the same relative path overrides its bundled counterpart entirely (not merged field-by-field); a new file or whole new integration subdirectory adds to it with zero Rust changes or recompile.
+1. **Bundled defaults** — the `crates/infigraph-cli/resources/integrations/` tree, compiled in. Rather than a hand-maintained list of `include_str!` calls that has to be edited every time an integration is added, a `build.rs` walks the tree at compile time and generates the `&[(&str, &str)]` registry (relative path → contents, covering each integration's `config.toml` and its content files) automatically — so the bundled tier gets the same "drop a directory in, done" ergonomics the user-override tier already has by construction.
+2. **User-level override** — `~/.infigraph/integrations/`, identical structure. `~/.infigraph/integrations/<name>/config.toml` overrides its bundled counterpart's manifest *entirely* (the whole `[[artifact]]` list, not merged field-by-field); a whole new `<name>/` directory adds a new integration with zero Rust changes or recompile.
 
 ### `CLAUDE_CODE_SPECIAL` removal
 
-Claude Code's existing bespoke-path special case (`config_file == "CLAUDE_CODE_SPECIAL"` string match in `cmd_install`) becomes an ordinary artifact at `claude-code/.claude.json.toml` — same mechanism now covers every agent uniformly, no magic string.
+Claude Code's existing bespoke-path special case (`config_file == "CLAUDE_CODE_SPECIAL"` string match in `cmd_install`) becomes an ordinary `[[artifact]]` entry (`path = ".claude.json"`) in `claude-code/config.toml` — same mechanism now covers every agent uniformly, no magic string.
 
 ### Uninstall symmetry
 
