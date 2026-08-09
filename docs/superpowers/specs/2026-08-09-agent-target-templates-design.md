@@ -57,9 +57,9 @@ Both apply purely from a bundled file's *existence*, co-located at its own mirro
 1. **The content lives elsewhere** (`shared/`) — CLAUDE.md's instructional text is `../shared/agents.md`, not a local file in `claude-code/`, so discovery can't find it by mirrored-path convention alone. This happens to also need `marker_delimited` (CLAUDE.md already has other content worth preserving), but the *reason* it's registered at all is the shared path, not the strategy — a plain `overwrite` artifact pulling from `shared/` would need the exact same registration. Cursor's and Windsurf's rules content is the same shared text (no local copy, no per-agent duplication) — so they need a minimal `config.toml` too, purely to say "pull this from `../shared/agents.md`," with `overwrite` as the strategy, not `marker_delimited`.
 2. **There's no fixed local path to mirror at all** (VS Code, Zed) — a resolver computes it.
 
-This has a forward-looking implication worth naming: today every hook script and the reindex command live locally, one per integration, nothing shared at that level — but if a future hook or command ever became genuinely identical across integrations, it would need the same treatment as CLAUDE.md/Cursor/Windsurf: an `[[artifact]]` entry pointing `content_file` at `../shared/hooks/...`, even with a plain `overwrite` strategy and nothing to "transform." The manifest requirement tracks *where the content lives*, never what happens to it once found.
+This has a forward-looking implication worth naming: today every hook script lives locally, one per integration, nothing shared at that level (the reindex skill is the one exception — see "Reindex as a shared skill" below) — but if a future hook ever became genuinely identical across integrations, it would need the same treatment as CLAUDE.md/Cursor/Windsurf/the reindex skill: an `[[artifact]]` entry pointing `content_file` at `../shared/hooks/...`, even with a plain `overwrite` strategy and nothing to "transform." The manifest requirement tracks *where the content lives*, never what happens to it once found.
 
-Codex, Gemini CLI, OpenCode, Aider, Kiro, and GitHub Copilot CLI need **no `config.toml` at all** — just a bundled fragment file, locally, at the mirrored path. Claude Code, Cursor, and Windsurf need one because their content is shared. VS Code and Zed need one because their path is resolver-computed.
+Gemini CLI, OpenCode, Aider, Kiro, and GitHub Copilot CLI need **no `config.toml` at all** — just a bundled fragment file, locally, at the mirrored path. Claude Code, Cursor, and Windsurf need one because their instructional content is shared. VS Code and Zed need one because their path is resolver-computed. Codex needs one for the same shared-content reason as Claude Code — not for its MCP registration (still convention-based, local), but for the shared reindex skill entry (see "Reindex as a shared skill" below).
 
 ### Directory layout
 
@@ -71,15 +71,14 @@ crates/infigraph-cli/resources/integrations/     (bundled, compiled in)
 
   shared/                        # content referenced by more than one integration -- not duplicated per-agent
     agents.md                    # the core instructional text (today's write_claude_md_instructions block)
-    skills/                      # bundled skill content, if/when any integration needs it beyond plain instructions
-      ...
+    skills/
+      infigraph-reindex/
+        SKILL.md                 # the reindex command, as an Agent Skills-format skill -- see "Reindex as a shared skill" below
 
   claude-code/
-    config.toml                 # the one exception this integration needs: CLAUDE.md's marker-delimited entry
+    config.toml                 # CLAUDE.md's marker-delimited entry, plus the shared reindex skill (both pull from shared/)
     .claude.json                # convention: JSON deep-merge, no manifest entry -- {"mcpServers":{"infigraph":{...}}}
     settings.json                # convention: JSON deep-merge -- literally the {"hooks": {...}} structure, in full
-    commands/
-      infigraph-reindex.md       # convention: overwrite (mirrors ~/.claude/commands/)
     hooks/
       enforce.sh                 # convention: overwrite (mirrors ~/.claude/hooks/) -- referenced BY PATH from settings.json
       edit-tracker.sh
@@ -104,7 +103,9 @@ crates/infigraph-cli/resources/integrations/     (bundled, compiled in)
 
   vscode/       config.toml       # resolver-based path -- the one thing that can't be a mirrored file
   zed/          config.toml       # resolver-based path
-  codex/            .codex/config.toml   # convention: TOML section splice, no config.toml manifest needed
+  codex/
+    config.toml                   # NEW: needed now only for the shared reindex skill entry (see naming-collision note below)
+    .codex/config.toml            # convention: TOML section splice, no manifest entry -- unrelated to the manifest above despite the shared filename
   gemini-cli/       .gemini/settings.json
   opencode/         .config/opencode/opencode.json
   aider/            .aider/mcp.json
@@ -112,7 +113,7 @@ crates/infigraph-cli/resources/integrations/     (bundled, compiled in)
   github-copilot-cli/  .copilot/mcp-config.json
 ```
 
-Note the naming collision this makes visible: `codex/.codex/config.toml` is a *content file* (the destination fragment), not to be confused with the *manifest* filename `config.toml` used by `claude-code/`, `vscode/`, `zed/` — Codex simply doesn't need a manifest, so its only file happens to also be named `config.toml`, mirroring its real destination (`~/.codex/config.toml`) rather than serving as this integration's own manifest. Worth flagging explicitly during implementation naming/discovery logic (e.g. by requiring the manifest to live at the integration directory's *own root*, `<name>/config.toml`, never nested under a subdirectory) so the two are never ambiguous.
+Note the naming collision this makes visible: `codex/.codex/config.toml` is a *content file* (the destination fragment, mirroring Codex's real `~/.codex/config.toml`), not to be confused with the *manifest* file `codex/config.toml` at the integration directory's own root (needed now only for the shared reindex skill entry — Codex's MCP registration itself still needs no manifest, since that content stays local and convention-based). Worth flagging explicitly during implementation naming/discovery logic (e.g. by requiring the manifest to live at the integration directory's *own root*, `<name>/config.toml`, never nested under a subdirectory) so the two are never ambiguous.
 
 ### Shared content
 
@@ -143,6 +144,34 @@ content_file = "../shared/agents.md"
 If Cursor's `.mdc` format ends up needing its own frontmatter wrapper around the shared body (rather than the shared text working verbatim), that's a small addition to the artifact's fields at plan time (a `prefix`/`suffix` around `content_file`, or a per-format wrapper template) — not a change to *whether* this needs registration, only to what the registered artifact looks like.
 
 `shared/` is discovered and overridable the same way as everything else — `~/.infigraph/integrations/shared/agents.md` overrides the bundled copy for every integration that references it, in one edit.
+
+### Reindex as a shared skill
+
+`/infigraph-reindex` is not Claude-Code-specific content — it's a generic "run `infigraph index`" instruction that happens to have been written as a Claude Code slash command purely because slash commands were the only cross-tool-adjacent format available when it was first added. Agent Skills (`agentskills.io`) is the right format for it now: a real, Linux Foundation–governed open standard, adopted by 32+ tools as of 2026 (Claude Code, Codex, Cursor, Gemini CLI, Windsurf, Zed, GitHub Copilot, AWS Kiro, and more), with a `SKILL.md` file (YAML frontmatter — only `name` and `description` required — plus the instructional body) as its unit of content. So this PR converts it: `shared/skills/infigraph-reindex/SKILL.md` replaces the old `claude-code/commands/infigraph-reindex.md`, registered the same way `shared/agents.md` is — via a `config.toml` `[[artifact]]` entry, since the content lives in `shared/`, not locally.
+
+The Skills *format* is standardized; each tool's skill *discovery path* is not — every tool follows its own `.{name}/skills/` convention, so each integration needs its own verified path, the same diligence already applied to the MCP-path research table above. Two are verified for this PR:
+
+```toml
+# claude-code/config.toml (in addition to the CLAUDE.md artifact above)
+[[artifact]]
+path = ".claude/skills/infigraph-reindex/SKILL.md"
+strategy = "overwrite"
+content_file = "../shared/skills/infigraph-reindex/SKILL.md"
+```
+
+```toml
+# codex/config.toml (Codex's first config.toml manifest — its MCP registration stays local/convention-based)
+label = "Codex"
+
+[[artifact]]
+path = ".codex/skills/infigraph-reindex/SKILL.md"
+strategy = "overwrite"
+content_file = "../shared/skills/infigraph-reindex/SKILL.md"
+```
+
+The remaining skills-adopting integrations in this design (Cursor, Gemini CLI, Windsurf, Zed, GitHub Copilot CLI, Kiro) each get the equivalent entry, but their exact discovery paths are **not asserted here** — they need the same per-tool doc verification as VS Code/Zed's MCP paths before being written into a real `config.toml`, deferred to implementation time rather than guessed now. OpenCode and Aider are not confirmed skills-adopters as of this design and are left out of the skill rollout (they keep MCP-only `config.toml`-free registration).
+
+This PR intentionally does **not** also move CLAUDE.md's core instructional content (`shared/agents.md`) into a shared skill — that's a larger, separately-scoped change (marker-delimited insertion into an existing user file vs. a skill's own dedicated file, different discovery semantics, different risk profile) deferred to its own follow-up.
 
 ### Path resolution and the resolver escape hatch
 
@@ -228,7 +257,7 @@ pub(crate) fn cmd_install(steps: &[InstallStep]) -> Result<()> {
 }
 ```
 
-`apply_artifacts_for_step` discovers every artifact for that step — both the explicit `[[artifact]]` entries in whatever `config.toml`s exist, and every convention-based file not claimed by one. Since convention-based artifacts have no field to declare a step in, classification falls back to a simple, fixed rule based on where the file sits: anything under an integration's `hooks/` subdirectory is `Hooks`; anything under `commands/`/`rules/`, or a `marker_delimited` entry, is `DocsAndRules`; everything else convention-based (the top-level MCP-config fragment) is `McpRegistration`. This heuristic only needs to be *good enough*, not exact — no `--mode` flag ships in this PR to expose the distinction yet; it's groundwork for #50, not #50 itself.
+`apply_artifacts_for_step` discovers every artifact for that step — both the explicit `[[artifact]]` entries in whatever `config.toml`s exist, and every convention-based file not claimed by one. Since neither kind has a dedicated field to declare a step in, classification falls back to a simple, fixed rule based on the artifact's *destination* path (its `path` field for explicit entries, its mirrored path for convention-based ones): anything under `hooks/` is `Hooks`; anything under `rules/` or `skills/`, or a `marker_delimited` entry, is `DocsAndRules` (this covers CLAUDE.md, Cursor/Windsurf's rules, and every integration's reindex skill entry); everything else (the top-level MCP-config fragment, wherever it's convention-based or resolver-computed) is `McpRegistration`. This heuristic only needs to be *good enough*, not exact — no `--mode` flag ships in this PR to expose the distinction yet; it's groundwork for #50, not #50 itself.
 
 `install_claude_allowlist` stays a plain, untouched function — it writes to `settings.local.json`'s `permissions.allow` list, which is a grant list, not "content deployed to a target path," so it doesn't fit the artifact shape.
 
@@ -246,8 +275,8 @@ pub(crate) fn cmd_install(steps: &[InstallStep]) -> Result<()> {
 - **Settings.json multi-event test**: `claude-code/settings.json`'s fragment declares entries under multiple event keys in one file; applying it produces all of them, and reapplying doesn't duplicate any.
 - **Matcher self-heal test**: apply, hand-edit the resulting matcher in the live `settings.json`, re-apply, assert it's restored to match the bundled fragment.
 - **Resolver tests** (VS Code, Zed): a fake resolver script exercising `ok`/`skip`/`error` responses, confirming the engine handles all three without touching the target file on `skip`/`error`.
-- **Shared-content test**: Claude Code's `content_file = "../shared/agents.md"` picks up the shared file; overriding `~/.infigraph/integrations/shared/agents.md` changes the applied output without `claude-code/config.toml` changing.
-- **Manifest/content naming-collision test**: `codex/.codex/config.toml` (a content file that happens to be named `config.toml`, nested under a subdirectory) is correctly treated as convention-based content, not mistaken for a manifest — confirms discovery only treats `<name>/config.toml` (integration root, not nested) as the manifest.
+- **Shared-content test**: Claude Code's `content_file = "../shared/agents.md"` picks up the shared file; overriding `~/.infigraph/integrations/shared/agents.md` changes the applied output without `claude-code/config.toml` changing. Same test shape for `shared/skills/infigraph-reindex/SKILL.md` against both Claude Code's and Codex's `config.toml` entries — one shared override changes both integrations' applied output.
+- **Manifest/content naming-collision test**: `codex/.codex/config.toml` (a content file that happens to be named `config.toml`, nested under a subdirectory) is correctly treated as convention-based content, not mistaken for a manifest — confirms discovery only treats `<name>/config.toml` (integration root, not nested) as the manifest, distinct from `codex/config.toml` (the real manifest, now present for the reindex-skill entry).
 
 ## Migration
 
@@ -256,6 +285,8 @@ Stale files at old wrong paths (e.g. `~/.opencode/config.json` from before this 
 ## Out of scope
 
 - **Capture/promote-to-default command** (e.g. reading a live or project-reference config and generating a new `~/.infigraph/integrations/...` override from it). This is the natural next step once the artifact primitive exists — the two-tier discovery already means such a generated file becomes the default for all future installs for that user, for free — but the capture/diff tooling itself is real, separately-scoped work, deferred to a follow-up PR.
+- **Category-level shared sourcing for `hooks`/`commands`** (a `[commands]`/`[hooks]` manifest *section* — distinct from individual `[[artifact]]` entries — declaring `source = "../shared/commands"` plus an optional named `adapter` transform, so a whole category of files can come from a shared location and be format-converted per integration, rather than registering each shared file individually). Verified against the current (2026) ecosystem before deferring, not just "nothing needs it yet": **hooks lack an independent per-tool *execution* mechanism outside Claude Code today.** A `hooks:`/`triggers:` SKILL.md frontmatter convention exists as real prior art (e.g. the `skill-triggers` project), and Skills' own spec permits arbitrary optional frontmatter fields beyond the required `name`/`description` — but that convention compiles down into Claude-Code-style hook config rather than being natively executed by another runtime, so there's still no second execution target for a category-level `adapter` to convert toward. Slash commands have no cross-tool standard either. (Cross-tool *instructions* content is a different, already-real case — see the AGENTS.md note below — which is exactly why `shared/agents.md`, a single-file case, ships in this PR while the general category-level mechanism doesn't.) Revisit if a runtime ever ships its own native executor for SKILL.md hooks/triggers frontmatter, or a second agent ships a comparable commands mechanism.
+- **Writing an actual project-root `AGENTS.md`.** AGENTS.md is a genuine, Linux Foundation–stewarded cross-tool standard as of 2026 (28+ tools including Cursor, Windsurf, Codex, Gemini CLI, Aider, Zed, Devin natively read it; 60,000+ repos use it) — real validation for `shared/agents.md`'s naming and concept. But it's explicitly *project-level* (build commands, test procedures, project-specific style rules, placed at a repo's root), while infigraph's actual content here is *user-level* (global "use infigraph MCP tools" instructions, written to `~/.claude/CLAUDE.md`, applying across every project) — a different concern despite the similar name. Whether `infigraph init` (a separate, project-scoped command) should also write a real project AGENTS.md is a legitimately interesting adjacent idea, but belongs in its own issue/design, not folded into this install-time PR.
 - No `--mode` / install-tier flag or UX (that's #50 itself, a separate follow-up PR once this groundwork lands).
 - No JSONC-tolerant parser (Zed's embedded-settings case bails with instructions instead).
 - No project-level (three-tier) discovery for integrations.
