@@ -1666,10 +1666,13 @@ impl GraphBackend for Neo4jBackend {
         // a stem lookup built from this batch, same as the kuzu bulk path (without
         // this, the MATCH below silently matches zero rows: AIF3X-331 #20b applies
         // to Neo4j's bulk writer exactly as it did to kuzu's before that fix).
-        let module_by_stem: HashMap<String, &str> = extractions
-            .iter()
-            .map(|e| (super::store_util::file_stem(&e.file), e.file.as_str()))
-            .collect();
+        let mut module_by_stem: HashMap<String, Vec<&str>> = HashMap::new();
+        for e in extractions {
+            module_by_stem
+                .entry(super::store_util::file_stem(&e.file))
+                .or_default()
+                .push(e.file.as_str());
+        }
 
         let mut calls_pairs: Vec<HashMap<String, String>> = Vec::new();
         let mut inherits_pairs: Vec<HashMap<String, String>> = Vec::new();
@@ -1697,10 +1700,14 @@ impl GraphBackend for Neo4jBackend {
                         let module_name =
                             rel.target_id.rsplit("::").next().unwrap_or(&rel.target_id);
                         let stem = super::store_util::import_stem(module_name);
-                        if let Some(target_file) = module_by_stem.get(stem.as_str()) {
-                            if *target_file != rel.source_id {
-                                m.insert("tgt".into(), target_file.to_string());
-                                imports_pairs.push(m);
+                        if let Some(candidates) = module_by_stem.get(stem.as_str()) {
+                            if let Some(target_file) =
+                                super::store_util::resolve_import_candidate(module_name, candidates)
+                            {
+                                if target_file != rel.source_id {
+                                    m.insert("tgt".into(), target_file.to_string());
+                                    imports_pairs.push(m);
+                                }
                             }
                         }
                     }

@@ -5,7 +5,7 @@ use kuzu::Connection;
 
 use super::schema::ensure_custom_edge_table;
 use super::store::GraphStore;
-use super::store_util::{escape, file_stem, import_stem};
+use super::store_util::{escape, file_stem, import_stem, resolve_import_candidate};
 use crate::model::{FileExtraction, RelationKind};
 
 impl GraphStore {
@@ -122,10 +122,13 @@ impl GraphStore {
         // is every file; incremental single-file re-index can't resolve a
         // cross-file import target here, which is acceptable (get_file_deps is
         // computed against the persisted full graph).
-        let module_by_stem: HashMap<String, &str> = extractions
-            .iter()
-            .map(|e| (file_stem(&e.file), e.file.as_str()))
-            .collect();
+        let mut module_by_stem: HashMap<String, Vec<&str>> = HashMap::new();
+        for e in extractions {
+            module_by_stem
+                .entry(file_stem(&e.file))
+                .or_default()
+                .push(e.file.as_str());
+        }
 
         // 6. All relation edges grouped by type
         let mut calls_pairs: Vec<String> = Vec::new();
@@ -163,13 +166,17 @@ impl GraphStore {
                         let module_name =
                             rel.target_id.rsplit("::").next().unwrap_or(&rel.target_id);
                         let stem = import_stem(module_name);
-                        if let Some(target_file) = module_by_stem.get(stem.as_str()) {
-                            if *target_file != rel.source_id {
-                                imports_pairs.push(format!(
-                                    "{{a: '{}', b: '{}'}}",
-                                    escape(&rel.source_id),
-                                    escape(target_file)
-                                ));
+                        if let Some(candidates) = module_by_stem.get(stem.as_str()) {
+                            if let Some(target_file) =
+                                resolve_import_candidate(module_name, candidates)
+                            {
+                                if target_file != rel.source_id {
+                                    imports_pairs.push(format!(
+                                        "{{a: '{}', b: '{}'}}",
+                                        escape(&rel.source_id),
+                                        escape(target_file)
+                                    ));
+                                }
                             }
                         }
                     }

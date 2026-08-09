@@ -217,10 +217,14 @@ impl GraphStore {
         // targets (captured as bare module NAMES, not file paths) to the imported
         // file's Module node. See AIF3X-331 #20b — without this the Imports guard
         // below never matched and zero Module->Module edges were created.
-        let module_by_stem: std::collections::HashMap<String, String> = extractions
-            .iter()
-            .map(|e| (super::store_util::file_stem(&e.file), e.file.clone()))
-            .collect();
+        let mut module_by_stem: std::collections::HashMap<String, Vec<&str>> =
+            std::collections::HashMap::new();
+        for e in extractions {
+            module_by_stem
+                .entry(super::store_util::file_stem(&e.file))
+                .or_default()
+                .push(e.file.as_str());
+        }
 
         // Collect all data into vecs
         let mut mod_ids = Vec::new();
@@ -333,12 +337,16 @@ impl GraphStore {
                         // modules (e.g. "fastapi") have no Module node → skipped.
                         let module_name = tgt.rsplit("::").next().unwrap_or(&tgt);
                         let stem = super::store_util::import_stem(module_name);
-                        if let Some(target_file) = module_by_stem.get(&stem) {
-                            if known_module_ids.contains(&src)
-                                && *target_file != src
-                                && imp_seen.insert((src.clone(), target_file.clone()))
+                        if let Some(candidates) = module_by_stem.get(&stem) {
+                            if let Some(target_file) =
+                                super::store_util::resolve_import_candidate(module_name, candidates)
                             {
-                                imp_pairs.push((src, target_file.clone()));
+                                if known_module_ids.contains(&src)
+                                    && target_file != src
+                                    && imp_seen.insert((src.clone(), target_file.to_string()))
+                                {
+                                    imp_pairs.push((src, target_file.to_string()));
+                                }
                             }
                         }
                     }

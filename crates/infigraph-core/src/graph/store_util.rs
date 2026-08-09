@@ -82,6 +82,57 @@ pub(crate) fn import_stem(module_name: &str) -> String {
         .to_lowercase()
 }
 
+/// Resolve an import's bare module name to a Module file path when the
+/// basename stem has more than one candidate (e.g. both `app/service/constants.py`
+/// and `app/test/e2e/constants.py` exist). Picks the candidate whose path,
+/// normalized to `/`-separated lowercase segments, ends with `module_name`'s
+/// own dotted/slashed segments -- so `app.service.constants` matches
+/// `app/service/constants.py` but not `app/test/e2e/constants.py`. Returns
+/// `None` (skip the edge) rather than guessing when no candidate matches or
+/// more than one does -- a wrong IMPORTS edge is worse than a missing one.
+pub(crate) fn resolve_import_candidate<'a>(
+    module_name: &str,
+    candidates: &[&'a str],
+) -> Option<&'a str> {
+    if candidates.len() == 1 {
+        return Some(candidates[0]);
+    }
+    let wanted: Vec<String> = module_name
+        .split(['.', '/', '\\'])
+        .filter(|s| !s.is_empty())
+        .map(|s| s.to_lowercase())
+        .collect();
+    if wanted.len() < 2 {
+        // Bare single-segment import name (e.g. "constants") carries no
+        // disambiguating path info -- can't tell candidates apart.
+        return None;
+    }
+    let mut matches = candidates.iter().filter(|file| {
+        // Strip the extension from the basename only (matches `file_stem`),
+        // not the whole path -- a dot in a directory name (e.g. "app/v1.2/x.py")
+        // must not be mistaken for the extension separator.
+        let (dir, base) = file.rsplit_once(['/', '\\']).unwrap_or(("", file));
+        let base_no_ext = base.rsplit_once('.').map(|(b, _)| b).unwrap_or(base);
+        let path_no_ext = if dir.is_empty() {
+            base_no_ext.to_string()
+        } else {
+            format!("{dir}/{base_no_ext}")
+        };
+        let segments: Vec<String> = path_no_ext
+            .split(['/', '\\'])
+            .filter(|s| !s.is_empty())
+            .map(|s| s.to_lowercase())
+            .collect();
+        segments.ends_with(&wanted)
+    });
+    let first = matches.next()?;
+    if matches.next().is_some() {
+        None
+    } else {
+        Some(first)
+    }
+}
+
 /// Batch-insert edges via UNWIND in chunks of 500.
 pub(crate) fn unwind_edges_from_pairs(
     conn: &Connection,
@@ -232,7 +283,9 @@ pub fn classify_file(file: &str) -> &'static str {
 
 #[cfg(test)]
 mod tests {
-    use super::{check_disk_headroom, classify_file, extract_bad_copy_value};
+    use super::{
+        check_disk_headroom, classify_file, extract_bad_copy_value, resolve_import_candidate,
+    };
 
     #[test]
     fn disk_headroom_passes_for_tiny_projected_write_on_real_dir() {
@@ -322,5 +375,41 @@ mod tests {
         assert_eq!(classify_file("README.md"), "docs");
         assert_eq!(classify_file("docs/api.md"), "docs");
         assert_eq!(classify_file("doc/architecture.md"), "docs");
+    }
+
+    #[test]
+    fn resolve_import_candidate_single_candidate_always_resolves() {
+        assert_eq!(
+            resolve_import_candidate("constants", &["app/service/constants.py"]),
+            Some("app/service/constants.py")
+        );
+    }
+
+    #[test]
+    fn resolve_import_candidate_disambiguates_by_dotted_path() {
+        let candidates = ["app/service/constants.py", "app/test/e2e/constants.py"];
+        assert_eq!(
+            resolve_import_candidate("app.service.constants", &candidates),
+            Some("app/service/constants.py")
+        );
+        assert_eq!(
+            resolve_import_candidate("app.test.e2e.constants", &candidates),
+            Some("app/test/e2e/constants.py")
+        );
+    }
+
+    #[test]
+    fn resolve_import_candidate_skips_ambiguous_bare_name() {
+        let candidates = ["app/service/constants.py", "app/test/e2e/constants.py"];
+        assert_eq!(resolve_import_candidate("constants", &candidates), None);
+    }
+
+    #[test]
+    fn resolve_import_candidate_skips_when_no_suffix_matches() {
+        let candidates = ["app/service/constants.py", "app/test/e2e/constants.py"];
+        assert_eq!(
+            resolve_import_candidate("other.pkg.constants", &candidates),
+            None
+        );
     }
 }
