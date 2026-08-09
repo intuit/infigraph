@@ -45,11 +45,23 @@ Issue #29's reporter manually tested GitHub Copilot CLI and OpenCode; VS Code, Z
 
 ## Architecture
 
-### Directory layout — one manifest per integration
+### The core idea: most artifacts need no manifest entry at all
 
-Matches `infigraph-pipeline-plugin`'s own precedent more closely than earlier drafts of this design did: one directory per integration, a well-known manifest filename (`config.toml`, mirroring `plugin.toml`'s role) sitting alongside that integration's content files — not split across a sidecar-per-artifact tree, and not split between a top-level manifest and a same-named sibling content directory.
+A file's **extension** plus its **mirrored path** are enough to know what to do with it — registering it explicitly in a manifest is only needed for the genuine exceptions. This removes the per-hook, per-agent bookkeeping (`key_path`, `idempotency_key`, `self_heal_field`, ...) almost entirely:
 
-Content directories mirror the *real* destination folder structure below the agent's own root (`.claude/`, `.cursor/`, etc.) — not an invented organizational scheme. If the real destination has a `hooks/` or `commands/` subfolder, the content lives under a matching subfolder here; if the destination is a bare file directly in the agent's root (or at `$HOME` with no subdirectory at all, like `.claude.json`), the content stays flat (or inline, needing no content file).
+- **`.json` or `.toml` file at a path mirroring a real config file** → **deep-merge**. Object keys merge recursively (anything the fragment doesn't mention is preserved untouched). Array entries are trickier — a naive value-tree merge would either duplicate entries on every install or nuke a user's unrelated entries — so array merging uses one small, universal rule instead of per-artifact metadata: **any existing array entry whose serialized content already contains the substring `infigraph` is ours; remove it and replace it with the fragment's corresponding entries, leaving every other entry in that array untouched.** Since every infigraph script/command path already contains `infigraph-` by naming convention, this needs no separate declaration, and it makes self-healing automatic for free — whatever's in the fragment right now becomes the truth on every apply, no drift-tracking needed.
+- **Everything else at a mirrored path** (`.sh`, `.md`, `.mdc`) → **overwrite**, byte for byte.
+
+Both apply purely from a bundled file's *existence* at the mirrored location — no `config.toml` entry required. A manifest entry is needed only for the two things that genuinely can't be inferred from extension + path:
+
+1. **Marker-delimited insertion** (`CLAUDE.md`) — a `.md` file could mean "standalone bundled doc" (overwrite) or "insert into existing prose" (marker-delimited); extension alone can't disambiguate, so this needs an explicit declaration.
+2. **Resolver-based path/content** (VS Code, Zed) — the destination isn't a fixed path at all, so there's no mirrored location to infer from.
+
+Most integrations (Cursor, Codex, Gemini CLI, OpenCode, Aider, Windsurf, Kiro, GitHub Copilot CLI) need **no `config.toml` whatsoever** — just a bundled `.json`/`.toml` fragment at the mirrored path. Only Claude Code (needs marker-delimited `CLAUDE.md`) and VS Code/Zed (need a resolver) have one.
+
+### Directory layout
+
+One directory per integration (matching `infigraph-pipeline-plugin`'s own `plugin.toml`-alongside-content precedent), content mirroring the *real* destination folder structure below the agent's own root — not an invented organizational scheme:
 
 ```
 crates/infigraph-cli/resources/integrations/     (bundled, compiled in)
@@ -61,11 +73,13 @@ crates/infigraph-cli/resources/integrations/     (bundled, compiled in)
       ...
 
   claude-code/
-    config.toml                # every artifact for this integration, as an [[artifact]] array
+    config.toml                 # the one exception this integration needs: CLAUDE.md's marker-delimited entry
+    .claude.json                # convention: JSON deep-merge, no manifest entry -- {"mcpServers":{"infigraph":{...}}}
+    settings.json                # convention: JSON deep-merge -- literally the {"hooks": {...}} structure, in full
     commands/
-      infigraph-reindex.md      # mirrors the real ~/.claude/commands/ subfolder
+      infigraph-reindex.md       # convention: overwrite (mirrors ~/.claude/commands/)
     hooks/
-      enforce.sh                # mirrors the real ~/.claude/hooks/ subfolder
+      enforce.sh                 # convention: overwrite (mirrors ~/.claude/hooks/) -- referenced BY PATH from settings.json
       edit-tracker.sh
       session-save.sh
       session-reset.sh
@@ -77,41 +91,34 @@ crates/infigraph-cli/resources/integrations/     (bundled, compiled in)
       search-fallback-sentinel.sh
 
   cursor/
-    config.toml
-    rules/                      # mirrors ~/.cursor/rules/ -- no local content file, references ../shared/agents.md
+    .cursor/mcp.json              # convention: JSON deep-merge -- no config.toml needed
+    rules/
+      infigraph.mdc               # convention: overwrite, mirrors ~/.cursor/rules/
 
   windsurf/
-    config.toml
-    rules/                      # mirrors ~/.windsurf/rules/ -- also references ../shared/agents.md
+    .codeium/windsurf/mcp_config.json
+    rules/
+      infigraph.md
 
-  vscode/               config.toml   (resolver-based path -- see below; no content file, mcp-config entry inline)
-  codex/                config.toml
-  gemini-cli/           config.toml
-  zed/                  config.toml   (resolver-based path -- see below)
-  opencode/             config.toml
-  aider/                config.toml
-  kiro/                 config.toml
-  github-copilot-cli/   config.toml
+  vscode/       config.toml       # resolver-based path -- the one thing that can't be a mirrored file
+  zed/          config.toml       # resolver-based path
+  codex/            .codex/config.toml   # convention: TOML section splice, no config.toml manifest needed
+  gemini-cli/       .gemini/settings.json
+  opencode/         .config/opencode/opencode.json
+  aider/            .aider/mcp.json
+  kiro/             .kiro/settings/mcp.json
+  github-copilot-cli/  .copilot/mcp-config.json
 ```
+
+Note the naming collision this makes visible: `codex/.codex/config.toml` is a *content file* (the destination fragment), not to be confused with the *manifest* filename `config.toml` used by `claude-code/`, `vscode/`, `zed/` — Codex simply doesn't need a manifest, so its only file happens to also be named `config.toml`, mirroring its real destination (`~/.codex/config.toml`) rather than serving as this integration's own manifest. Worth flagging explicitly during implementation naming/discovery logic (e.g. by requiring the manifest to live at the integration directory's *own root*, `<name>/config.toml`, never nested under a subdirectory) so the two are never ambiguous.
 
 ### Shared content
 
-Content that's the same (or near-identical, modulo file-format wrapping) across multiple integrations lives once, under `shared/`, and is referenced from each integration's `config.toml` via a relative `content_file` that escapes its own directory (`../shared/agents.md`) rather than being copied into `claude-code/`, `cursor/`, and `windsurf/` separately. This is the actual instructional text every agent gets told about infigraph — today it's one hardcoded block in `write_claude_md_instructions`, duplicated in spirit (though not verbatim) by `write_editor_rules`'s Cursor/Windsurf output; unifying it into `shared/agents.md` means editing the instructions once updates every integration, instead of needing to remember all the places it's duplicated.
-
-`shared/` is discovered and overridable the same way as everything else (`~/.infigraph/integrations/shared/agents.md` overrides the bundled copy for every integration that references it, in one edit) — it's not a separate mechanism, just a directory `content_file` paths are allowed to reach into.
-
-`claude-code/config.toml`:
+Content that's the same (or near-identical, modulo file-format wrapping) across multiple integrations lives once, under `shared/`, referenced via a relative path that escapes the integration's own directory (`../shared/agents.md`) — for `CLAUDE.md`, which still needs an explicit manifest entry for its marker-delimited strategy:
 
 ```toml
+# claude-code/config.toml
 label = "Claude Code"
-
-[[artifact]]
-path = ".claude.json"
-strategy = "json_key_path"
-key_path = ["mcpServers", "infigraph"]
-[artifact.entry]
-command = "{{mcp_path}}"
-args = ["--mcp"]
 
 [[artifact]]
 path = ".claude/CLAUDE.md"
@@ -119,97 +126,62 @@ strategy = "marker_delimited"
 start = "<!-- infigraph-primary-search -->"
 end = "<!-- /infigraph-primary-search -->"
 content_file = "../shared/agents.md"
-
-[[artifact]]
-path = ".claude/commands/infigraph-reindex.md"
-strategy = "overwrite"
-content_file = "commands/infigraph-reindex.md"
-
-[[artifact]]
-path = ".claude/hooks/infigraph-enforce.sh"
-strategy = "json_array_append"
-array_path = ["hooks", "PreToolUse"]
-idempotency_key = "infigraph-enforce"
-self_heal_field = "matcher"
-matcher = "Grep|Glob|Bash|Read|Write|Edit|Agent"
-timeout = 5
-content_file = "hooks/enforce.sh"
-
-# ... one [[artifact]] per remaining hook
 ```
 
-Every artifact states its own `path` and `strategy` explicitly — no "plain file needs zero manifest" shortcut. `content_file` is relative to the integration's own directory, and mirrors `path`'s subdirectory structure *below* the agent's root (`.claude/hooks/enforce.sh` → `hooks/enforce.sh`; the leading `.claude/` is dropped since it's already implied by being inside `claude-code/`) — except when the content is shared across integrations, in which case `content_file` reaches up into `../shared/` instead (see "Shared content" below). Small content (a JSON `entry`, in the first example above) is inline instead of a `content_file`.
+For integrations whose rules content is convention-based (overwrite, no manifest), the same relative-escape idea would need the convention-based engine to also support "this file's real content lives elsewhere" — worth resolving at plan time whether that's a tiny sidecar (`rules/infigraph.mdc.source = "../shared/agents.md"`) or whether Cursor/Windsurf's rules content is just different enough from Claude Code's (different frontmatter wrapping) that it isn't literally the same bytes and doesn't need this in practice. Not spec-blocking either way.
 
-### Merge strategies
-
-```rust
-enum MergeStrategy {
-    JsonKeyPath(Vec<String>),                      // set an exact value at a nested key, preserve siblings
-    JsonArrayAppend {                                // hooks: find-or-append into an event array
-        array_path: Vec<String>,                     // e.g. ["hooks", "PostToolUse"]
-        idempotency_key: String,                      // substring match against existing hooks[].command
-        self_heal_field: Option<String>,               // e.g. "matcher" -- update in place if drifted
-    },
-    TomlSection(String),                             // Codex: splice by [section header], preserve rest via raw text (not a full TOML round-trip, to preserve formatting/comments)
-    MarkerDelimited { start: String, end: String },   // CLAUDE.md: replace text between two sentinel comments
-    Overwrite,                                        // whole-file write
-}
-```
-
-`array_path` may be a single path (`Vec<String>`, e.g. `["hooks", "PostToolUse"]`) or multiple paths applied identically (`Vec<Vec<String>>`) — `install_session_end_hook`'s existing behavior (one script, registered on both `SessionEnd` and `PreCompact`) becomes one `[[artifact]]` entry with `array_path = [["hooks", "SessionEnd"], ["hooks", "PreCompact"]]`, instead of two near-identical Rust code blocks. Both forms are TOML arrays, so the disambiguator isn't "is it an array" — parse as a `toml::Value` and check whether the *first element* is itself a `Value::Array` (multi-path) or a `Value::String` (single path); an empty array is invalid input, reject it explicitly rather than guessing a default. The same rule applies to any field elsewhere in this design that accepts a bare value or a collection of them — always branch on the parsed `toml::Value` shape, never model as two separate typed fields (Serde's `#[serde(untagged)]` resolution order can silently pick the wrong variant on ambiguous input).
+`shared/` is discovered and overridable the same way as everything else — `~/.infigraph/integrations/shared/agents.md` overrides the bundled copy for every integration that references it, in one edit.
 
 ### Path resolution and the resolver escape hatch
 
-The destination root is `$HOME` by default (an artifact's `path` field, e.g. `.claude.json`, is relative to it). Two cases don't fit a static `path` cleanly, both handled by a `resolver` field instead:
+The destination root is `$HOME` by default. Two cases don't fit a mirrored path at all, and need `config.toml` for a `resolver` field instead:
 
 - **VS Code** — the real user-level config lives in a profile directory that varies by OS and isn't fully knowable from a fixed dotfile.
 - **Zed** — `context_servers` isn't a separate file at all; it's a section inside Zed's own `settings.json`, whose canonical path also varies by OS.
 
-For these, the `[[artifact]]` entry has no `path` field at all; instead:
-
 ```toml
+# zed/config.toml
 [[artifact]]
 strategy = "json_key_path"
 key_path = ["context_servers", "infigraph"]
 resolver = ["./resolve-zed-path.sh"]   # any executable; stdin/stdout JSON IPC, same shape pipeline-plugin uses
 ```
 
-Resolver contract — one shape reused everywhere a resolver is allowed (path resolution here; content generation, described next):
+Resolver contract — one shape reused everywhere a resolver is allowed (path resolution; content generation):
 
 - **stdin:** `{"mcp_path": "...", "os": "macos", "home": "/Users/..."}`
 - **stdout:** `{"status": "ok", "data": {"path": "...", "content": ...}}` (the shape of `content` matches whatever the strategy expects) / `{"status": "skip", "message": "..."}` / `{"status": "error", "message": "..."}`
 
-A resolver may also *generate content* instead of (or in addition to) resolving a path — e.g. a future hook whose script body needs to differ by detected environment. Same contract: the resolver's `data.content` becomes the artifact's content instead of a bundled file. Per the invertibility constraint above, any artifact using a resolver is excluded from future capture/promote tooling — this is the cost of the escape hatch, and it's why it stays opt-in per-artifact rather than the default.
+A resolver may also *generate content* instead of (or in addition to) resolving a path — e.g. a future hook whose script body needs to differ by detected environment. Per the invertibility constraint above, any artifact using a resolver is excluded from future capture/promote tooling — this is the cost of the escape hatch, and it's why it stays opt-in per-artifact rather than the default.
 
 ### JSON parse safety
 
-Any JSON-strategy artifact (`json_key_path`, `json_array_append`) parses the target file with `serde_json::from_str` before patching. **On parse failure** (comments, trailing commas — expected for Zed's general settings file, possible for others a user hand-edited): do not write. Report `Skipped { reason, manual_snippet }` with the exact fragment to add by hand, and move on — never risk corrupting a file that can't be safely round-tripped. No JSONC-tolerant parser is introduced; this is a deliberate scope boundary.
+Any JSON deep-merge target is parsed with `serde_json::from_str` before patching. **On parse failure** (comments, trailing commas — expected for Zed's general settings file, possible for others a user hand-edited): do not write. Report `Skipped { reason, manual_snippet }` with the exact fragment to add by hand, and move on — never risk corrupting a file that can't be safely round-tripped. No JSONC-tolerant parser is introduced; this is a deliberate scope boundary.
 
 ### Discovery
 
 Two-tier — **not** the full three-tier grammar-plugin pattern, since which agent CLIs/tools are installed is a per-machine fact, not a per-project one:
 
-1. **Bundled defaults** — the `crates/infigraph-cli/resources/integrations/` tree, compiled in. Rather than a hand-maintained list of `include_str!` calls that has to be edited every time an integration is added, a `build.rs` walks the tree at compile time and generates the `&[(&str, &str)]` registry (relative path → contents, covering each integration's `config.toml` and its content files) automatically — so the bundled tier gets the same "drop a directory in, done" ergonomics the user-override tier already has by construction.
-2. **User-level override** — `~/.infigraph/integrations/`, identical structure. `~/.infigraph/integrations/<name>/config.toml` overrides its bundled counterpart's manifest *entirely* (the whole `[[artifact]]` list, not merged field-by-field); a whole new `<name>/` directory adds a new integration with zero Rust changes or recompile.
+1. **Bundled defaults** — the `crates/infigraph-cli/resources/integrations/` tree, compiled in. A `build.rs` walks the tree at compile time and generates the `&[(&str, &str)]` registry (relative path → contents) automatically — every bundled file, manifest or not, gets the same "drop a file in, done" ergonomics.
+2. **User-level override** — `~/.infigraph/integrations/`, identical structure. A file at the same relative path overrides its bundled counterpart entirely; a new file adds a new convention-based artifact with zero Rust changes; a whole new `<name>/` directory adds a new integration.
 
 ### `CLAUDE_CODE_SPECIAL` removal
 
-Claude Code's existing bespoke-path special case (`config_file == "CLAUDE_CODE_SPECIAL"` string match in `cmd_install`) becomes an ordinary `[[artifact]]` entry (`path = ".claude.json"`) in `claude-code/config.toml` — same mechanism now covers every agent uniformly, no magic string.
+Claude Code's existing bespoke-path special case (`config_file == "CLAUDE_CODE_SPECIAL"` string match in `cmd_install`) becomes an ordinary convention-based artifact: `claude-code/.claude.json` deep-merges into `~/.claude.json`, no manifest entry, no magic string.
 
 ### Uninstall symmetry
 
-Each strategy defines its own inverse, read from the same descriptor used to install:
+Each mechanism defines its own inverse:
 
-- `json_key_path` / `json_array_append`: remove the value at `key_path`/`array_path` (matched by `idempotency_key` for array entries), leaving everything else in the file untouched.
-- `toml_section`: remove by section header (existing `uninstall_toml_target` logic, unchanged).
-- `marker_delimited`: remove the text between the markers.
-- `overwrite`: delete the file.
+- **Convention-based JSON/TOML deep-merge**: the bundled fragment's own key structure *is* the removal instruction — delete exactly the keys/sections the fragment declares (e.g. `claude-code/.claude.json`'s `{"mcpServers": {"infigraph": {...}}}` tells uninstall to remove `mcpServers.infigraph`; no separate `key_path` field needed for either direction, since the fragment's shape already carries it). Array entries: remove any entry matching the `infigraph` ownership marker.
+- **Convention-based overwrite**: delete the file.
+- **`marker_delimited`**: remove the text between the markers declared in `config.toml`.
 
-This replaces today's hardcoded `mcpServers`/`[mcp_servers.infigraph]` assumptions in `uninstall_json_target`/`uninstall_toml_target` — uninstalling OpenCode now correctly clears `mcp.infigraph`, not a nonexistent `mcpServers.infigraph`.
+This replaces today's hardcoded `mcpServers`/`[mcp_servers.infigraph]` assumptions in `uninstall_json_target`/`uninstall_toml_target` — uninstalling OpenCode now correctly clears `mcp.infigraph`, derived from its own bundled fragment's shape, not a hardcoded key.
 
 ## `cmd_install` refactor (#50 groundwork)
 
-Each artifact is tagged with a coarse `InstallStep` so groups can be applied independently — no new CLI flag in this PR, but the surface exists for #50's future `--mode` flag:
+Every artifact resolves to a coarse `InstallStep` (explicitly for `[[artifact]]` entries, inferred by location for convention-based ones — see below) so groups can be applied independently — no new CLI flag in this PR, but the surface exists for #50's future `--mode` flag:
 
 ```rust
 pub(crate) enum InstallStep {
@@ -244,25 +216,26 @@ pub(crate) fn cmd_install(steps: &[InstallStep]) -> Result<()> {
 }
 ```
 
-`apply_artifacts_for_step` discovers every artifact (bundled ∪ user-override) whose step tag matches, and calls `apply_artifact` on each. Existing call sites: `main.rs`'s `Commands::Install` dispatch passes `InstallStep::ALL`; `reinstall_hooks()` passes `&[InstallStep::Hooks]` (its existing behavior). Behavior is unchanged in this PR; only the internal surface now exists for a future subset.
+`apply_artifacts_for_step` discovers every artifact for that step — both the explicit `[[artifact]]` entries in whatever `config.toml`s exist, and every convention-based file not claimed by one. Since convention-based artifacts have no field to declare a step in, classification falls back to a simple, fixed rule based on where the file sits: anything under an integration's `hooks/` subdirectory is `Hooks`; anything under `commands/`/`rules/`, or a `marker_delimited` entry, is `DocsAndRules`; everything else convention-based (the top-level MCP-config fragment) is `McpRegistration`. This heuristic only needs to be *good enough*, not exact — no `--mode` flag ships in this PR to expose the distinction yet; it's groundwork for #50, not #50 itself.
 
 `install_claude_allowlist` stays a plain, untouched function — it writes to `settings.local.json`'s `permissions.allow` list, which is a grant list, not "content deployed to a target path," so it doesn't fit the artifact shape.
 
 ## Deliberate behavior changes (call out explicitly in the PR description)
 
-- **Matcher self-healing becomes uniform.** Today, only `install_enforcement_hook` updates an existing entry's `matcher` in place if it's drifted from the current hardcoded value; every other hook only checks presence/absence. The generic engine does this for every `json_array_append` artifact with a `self_heal_field` — strictly additive (closes a real gap: if e.g. `session-reset`'s matcher ever needs to change in a future release, existing installs currently would *not* pick that up automatically).
-- **`install_edit_tracker_hook`'s "merge into an existing matcher-containing entry" special case is dropped.** It's the one function that, instead of always creating its own entry, searches for *any* existing `PostToolUse` entry whose matcher contains `"Edit"` and appends into that entry's `hooks` array — which could mutate an entry that isn't infigraph's. The generic engine always creates/owns its own entry, matching every other hook's existing behavior. Net effect on an existing install: one extra `PostToolUse` array entry with the same `Edit|Write|NotebookEdit` matcher string as before — functionally identical (Claude Code doesn't care about duplicate matcher strings across entries), just not deduplicated at the JSON level anymore.
+- **Matcher self-healing becomes universal and automatic.** Today, only `install_enforcement_hook` updates an existing entry's `matcher` in place if it's drifted from the current hardcoded value; every other hook only checks presence/absence. The convention-based engine gets this for free for every hook — since the whole `hooks.<Event>` array's infigraph-owned entries are fully replaced (remove-by-ownership-marker, then re-append from the fragment) on every apply, whatever's in `settings.json` right now is always correct, no separate drift-tracking needed. Strictly additive (closes a real gap: e.g. if `session-reset`'s matcher ever needs to change in a future release, existing installs currently would *not* pick that up automatically).
+- **`install_edit_tracker_hook`'s "merge into an existing matcher-containing entry" special case is dropped.** It's the one function that, instead of always creating its own entry, searches for *any* existing `PostToolUse` entry whose matcher contains `"Edit"` and appends into that entry's `hooks` array — which could mutate an entry that isn't infigraph's. The convention-based engine always owns exactly the entries it recognizes via the `infigraph` marker, never touching a foreign entry regardless of matcher overlap. Net effect on an existing install: one extra `PostToolUse` array entry with the same `Edit|Write|NotebookEdit` matcher string as before — functionally identical (Claude Code doesn't care about duplicate matcher strings across entries), just not deduplicated at the JSON level anymore.
 
 ## Testing
 
-- **Strategy unit tests** (one set per `MergeStrategy` variant): create-from-empty, preserve-existing-unrelated-keys/sections/text, overwrite-existing-infigraph-entry, nested key creation, JSON-parse-failure → `Skipped` (not a write).
-- **Per-artifact fixture tests**: for every bundled artifact (all integrations, all hooks, docs/rules), load it via the same `build.rs`-generated registry production code uses, apply against an empty target and against a target with pre-existing unrelated content, assert exact expected output. This is what actually catches a future template typo, not just the generic engine.
-- **Discovery override test**: a file at the same relative path under `~/.infigraph/integrations/` is used instead of its bundled counterpart; a wholly new integration directory is discovered and applied.
-- **Uninstall test per strategy**: at least one artifact per strategy, confirming uninstall reads the descriptor rather than a hardcoded key/section/marker.
-- **Multi-target test**: the session-end hook's two-event `array_path` produces both entries from one apply call.
-- **Matcher self-heal test**: apply, hand-edit the resulting matcher, re-apply, assert it's restored and reported as "updated".
-- **Resolver tests** (VS Code, Zed): a fake resolver script exercising `ok`/`skip`/`error` responses, confirming the artifact engine handles all three without touching the target file on `skip`/`error`.
-- **Shared-content test**: at least two integrations (Claude Code, Cursor) whose `content_file` points at `../shared/agents.md` both apply the same content; overriding `~/.infigraph/integrations/shared/agents.md` changes the output for both without either integration's own `config.toml` changing.
+- **Convention-engine unit tests**: JSON deep-merge (create-from-empty, preserve unrelated keys at any depth, nested-key creation), array-entry ownership (replace entries containing `infigraph`, leave everything else in the array untouched, handle an array that doesn't exist yet), TOML section splice (preserve unrelated sections/comments via raw text, not full round-trip), overwrite, JSON-parse-failure → `Skipped` (not a write).
+- **Per-artifact fixture tests**: for every bundled fragment/script (all integrations), apply against an empty target and against a target with pre-existing unrelated content (including a target that already has *other tools'* array entries mixed in, for the hooks case), assert exact expected output. This is what actually catches a future fragment typo, not just the generic engine.
+- **Discovery override test**: a file at the same relative path under `~/.infigraph/integrations/` is used instead of its bundled counterpart; a wholly new file (convention-based, no manifest) is discovered and applied; a wholly new integration directory is discovered and applied.
+- **Uninstall test per mechanism**: at least one convention-based JSON artifact, one convention-based array artifact, one TOML artifact, and the `marker_delimited` artifact, confirming uninstall derives what to remove from the fragment's own shape rather than a hardcoded key.
+- **Settings.json multi-event test**: `claude-code/settings.json`'s fragment declares entries under multiple event keys in one file; applying it produces all of them, and reapplying doesn't duplicate any.
+- **Matcher self-heal test**: apply, hand-edit the resulting matcher in the live `settings.json`, re-apply, assert it's restored to match the bundled fragment.
+- **Resolver tests** (VS Code, Zed): a fake resolver script exercising `ok`/`skip`/`error` responses, confirming the engine handles all three without touching the target file on `skip`/`error`.
+- **Shared-content test**: Claude Code's `content_file = "../shared/agents.md"` picks up the shared file; overriding `~/.infigraph/integrations/shared/agents.md` changes the applied output without `claude-code/config.toml` changing.
+- **Manifest/content naming-collision test**: `codex/.codex/config.toml` (a content file that happens to be named `config.toml`, nested under a subdirectory) is correctly treated as convention-based content, not mistaken for a manifest — confirms discovery only treats `<name>/config.toml` (integration root, not nested) as the manifest.
 
 ## Migration
 
