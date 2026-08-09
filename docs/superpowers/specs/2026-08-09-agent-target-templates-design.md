@@ -49,17 +49,20 @@ Issue #29's reporter manually tested GitHub Copilot CLI and OpenCode; VS Code, Z
 
 A file's **extension** plus its **mirrored path** are enough to know what to do with it — registering it explicitly in a manifest is only needed for the genuine exceptions. This removes the per-hook, per-agent bookkeeping (`key_path`, `idempotency_key`, `self_heal_field`, ...) almost entirely:
 
-- **`.json` or `.toml` file at a path mirroring a real config file** → **deep-merge**. Object keys merge recursively (anything the fragment doesn't mention is preserved untouched). Array entries are trickier — a naive value-tree merge would either duplicate entries on every install or nuke a user's unrelated entries — so array merging uses one small, universal rule instead of per-artifact metadata: **any existing array entry whose serialized content already contains the substring `infigraph` is ours; remove it and replace it with the fragment's corresponding entries, leaving every other entry in that array untouched.** Since every infigraph script/command path already contains `infigraph-` by naming convention, this needs no separate declaration, and it makes self-healing automatic for free — whatever's in the fragment right now becomes the truth on every apply, no drift-tracking needed.
+- **`.json` file at a path mirroring a real config file** → **deep-merge**. Object keys merge recursively (anything the fragment doesn't mention is preserved untouched). Array entries are trickier — a naive value-tree merge would either duplicate entries on every install or nuke a user's unrelated entries — so array merging uses one small, universal rule instead of per-artifact metadata: **any existing array entry whose serialized content already contains the substring `infigraph` is ours; remove it and replace it with the fragment's corresponding entries, leaving every other entry in that array untouched.** Since every infigraph script/command path already contains `infigraph-` by naming convention, this needs no separate declaration, and it makes self-healing automatic for free — whatever's in the fragment right now becomes the truth on every apply, no drift-tracking needed.
 - **Everything else at a mirrored path** (`.sh`, `.md`, `.mdc`) → **overwrite**, byte for byte.
 
-Both apply purely from a bundled file's *existence*, co-located at its own mirrored path within the integration's directory. That's the actual dividing line — not "which strategy does this need," but **is the content physically where the destination's mirrored path says it should be.** A manifest entry is needed whenever it isn't, for either of two reasons:
+`.toml` destinations are deliberately **not** in the first bullet, and never get a manifest-free convention path — see below.
+
+Both JSON and overwrite strategies apply purely from a bundled file's *existence*, co-located at its own mirrored path within the integration's directory — no manifest needed. A manifest entry is needed whenever that's not true, for any of three reasons:
 
 1. **The content lives elsewhere** (`shared/`) — CLAUDE.md's instructional text is `../shared/agents.md`, not a local file in `claude-code/`, so discovery can't find it by mirrored-path convention alone. This happens to also need `marker_delimited` (CLAUDE.md already has other content worth preserving), but the *reason* it's registered at all is the shared path, not the strategy — a plain `overwrite` artifact pulling from `shared/` would need the exact same registration. Cursor's and Windsurf's rules content is the same shared text (no local copy, no per-agent duplication) — so they need a minimal `config.toml` too, purely to say "pull this from `../shared/agents.md`," with `overwrite` as the strategy, not `marker_delimited`.
 2. **There's no fixed local path to mirror at all** (VS Code, Zed) — a resolver computes it.
+3. **The destination is a `.toml` file** (Codex) — never convention-based, regardless of whether the content is local or shared. A generic "parse the whole document into a value tree, merge, reserialize" is safe for the JSON targets here (they're pure machine-written config, no comments to lose), but risky for a real hand-maintained TOML file: `~/.codex/config.toml` carries model settings, profiles, and comments well beyond infigraph's own section, and reserializing the whole document would silently reformat or strip all of it. So TOML destinations always use `toml_section` — a surgical raw-text splice of just the declared section, leaving every other byte of the file untouched — and a surgical splice needs an explicit section key path to know what to find and replace. Unlike JSON's structural merge (which infers the touched keys from the fragment's own shape), that key path can't be inferred from "it's a `.toml` file at this path" alone, so it's always a manifest field, never a convention.
 
 This has a forward-looking implication worth naming: today every hook script lives locally, one per integration, nothing shared at that level (the reindex skill is the one exception — see "Reindex as a shared skill" below) — but if a future hook ever became genuinely identical across integrations, it would need the same treatment as CLAUDE.md/Cursor/Windsurf/the reindex skill: an `[[artifact]]` entry pointing `content_file` at `../shared/hooks/...`, even with a plain `overwrite` strategy and nothing to "transform." The manifest requirement tracks *where the content lives*, never what happens to it once found.
 
-Gemini CLI, OpenCode, Aider, Kiro, and GitHub Copilot CLI need **no `config.toml` at all** — just a bundled fragment file, locally, at the mirrored path. Claude Code, Cursor, and Windsurf need one because their instructional content is shared. VS Code and Zed need one because their path is resolver-computed. Codex needs one for the same shared-content reason as Claude Code — not for its MCP registration (still convention-based, local), but for the shared reindex skill entry (see "Reindex as a shared skill" below).
+Gemini CLI, OpenCode, Aider, Kiro, and GitHub Copilot CLI need **no `config.toml` at all** — just a bundled fragment file, locally, at the mirrored path. Claude Code, Cursor, and Windsurf need one because their instructional content is shared. VS Code and Zed need one because their path is resolver-computed. Codex needs one for two reasons at once: its MCP registration is a `.toml` destination, so `toml_section` and an explicit key path are required regardless of sharing; and it also carries the shared reindex skill entry (see "Reindex as a shared skill" below).
 
 ### Directory layout
 
@@ -104,8 +107,8 @@ crates/infigraph-cli/resources/integrations/     (bundled, compiled in)
   vscode/       config.toml       # resolver-based path -- the one thing that can't be a mirrored file
   zed/          config.toml       # resolver-based path
   codex/
-    config.toml                   # NEW: needed now only for the shared reindex skill entry (see naming-collision note below)
-    .codex/config.toml            # convention: TOML section splice, no manifest entry -- unrelated to the manifest above despite the shared filename
+    config.toml                   # manifest: the toml_section MCP artifact (below) + the shared reindex skill entry
+    mcp-section.toml              # local content: the [mcp_servers.infigraph] fragment, referenced from config.toml
   gemini-cli/       .gemini/settings.json
   opencode/         .config/opencode/opencode.json
   aider/            .aider/mcp.json
@@ -113,7 +116,7 @@ crates/infigraph-cli/resources/integrations/     (bundled, compiled in)
   github-copilot-cli/  .copilot/mcp-config.json
 ```
 
-Note the naming collision this makes visible: `codex/.codex/config.toml` is a *content file* (the destination fragment, mirroring Codex's real `~/.codex/config.toml`), not to be confused with the *manifest* file `codex/config.toml` at the integration directory's own root (needed now only for the shared reindex skill entry — Codex's MCP registration itself still needs no manifest, since that content stays local and convention-based). Worth flagging explicitly during implementation naming/discovery logic (e.g. by requiring the manifest to live at the integration directory's *own root*, `<name>/config.toml`, never nested under a subdirectory) so the two are never ambiguous.
+Since `toml_section` content is always manifest-declared (reason 3 above), Codex's local fragment doesn't need to sit at a mirrored `.codex/config.toml` path the way convention-based content does — it lives flat, at `codex/mcp-section.toml`, referenced by `content_file` the same way shared content is, just locally instead of from `../shared/`. This sidesteps a naming collision an earlier draft of this layout would have had (a mirrored `codex/.codex/config.toml` sitting right next to the manifest `codex/config.toml`, both nested one level differently but easy to confuse). The general safeguard is still worth keeping at implementation time regardless: require the manifest to live at the integration directory's *own root* (`<name>/config.toml`), never nested under a subdirectory, so a future integration whose real destination path happens to also be named `config.toml` can't be mistaken for the manifest.
 
 ### Shared content
 
@@ -160,8 +163,14 @@ content_file = "../shared/skills/infigraph-reindex/SKILL.md"
 ```
 
 ```toml
-# codex/config.toml (Codex's first config.toml manifest — its MCP registration stays local/convention-based)
+# codex/config.toml (carries both of Codex's artifacts: MCP registration and the shared skill)
 label = "Codex"
+
+[[artifact]]
+path = ".codex/config.toml"
+strategy = "toml_section"
+key_path = ["mcp_servers", "infigraph"]
+content_file = "mcp-section.toml"   # local, not shared -- every integration's MCP entry is its own
 
 [[artifact]]
 path = ".codex/skills/infigraph-reindex/SKILL.md"
@@ -214,9 +223,10 @@ Claude Code's existing bespoke-path special case (`config_file == "CLAUDE_CODE_S
 
 Each mechanism defines its own inverse:
 
-- **Convention-based JSON/TOML deep-merge**: the bundled fragment's own key structure *is* the removal instruction — delete exactly the keys/sections the fragment declares (e.g. `claude-code/.claude.json`'s `{"mcpServers": {"infigraph": {...}}}` tells uninstall to remove `mcpServers.infigraph`; no separate `key_path` field needed for either direction, since the fragment's shape already carries it). Array entries: remove any entry matching the `infigraph` ownership marker.
+- **Convention-based JSON deep-merge**: the bundled fragment's own key structure *is* the removal instruction — delete exactly the keys the fragment declares (e.g. `claude-code/.claude.json`'s `{"mcpServers": {"infigraph": {...}}}` tells uninstall to remove `mcpServers.infigraph`; no separate `key_path` field needed for either direction, since the fragment's shape already carries it). Array entries: remove any entry matching the `infigraph` ownership marker.
 - **Convention-based overwrite**: delete the file.
 - **`marker_delimited`**: remove the text between the markers declared in `config.toml`.
+- **`toml_section`**: remove exactly the section named by the manifest's `key_path` (e.g. Codex's `[[artifact]]` with `key_path = ["mcp_servers", "infigraph"]` tells uninstall which section to splice out) — unlike the JSON case, this key path always comes from the manifest, since `toml_section` is never convention-based.
 
 This replaces today's hardcoded `mcpServers`/`[mcp_servers.infigraph]` assumptions in `uninstall_json_target`/`uninstall_toml_target` — uninstalling OpenCode now correctly clears `mcp.infigraph`, derived from its own bundled fragment's shape, not a hardcoded key.
 
@@ -268,15 +278,15 @@ pub(crate) fn cmd_install(steps: &[InstallStep]) -> Result<()> {
 
 ## Testing
 
-- **Convention-engine unit tests**: JSON deep-merge (create-from-empty, preserve unrelated keys at any depth, nested-key creation), array-entry ownership (replace entries containing `infigraph`, leave everything else in the array untouched, handle an array that doesn't exist yet), TOML section splice (preserve unrelated sections/comments via raw text, not full round-trip), overwrite, JSON-parse-failure → `Skipped` (not a write).
+- **Strategy engine unit tests**: JSON deep-merge (create-from-empty, preserve unrelated keys at any depth, nested-key creation), array-entry ownership (replace entries containing `infigraph`, leave everything else in the array untouched, handle an array that doesn't exist yet), `toml_section` splice (preserve unrelated sections/comments via raw text, not full round-trip, using the manifest's `key_path`), overwrite, JSON-parse-failure → `Skipped` (not a write).
 - **Per-artifact fixture tests**: for every bundled fragment/script (all integrations), apply against an empty target and against a target with pre-existing unrelated content (including a target that already has *other tools'* array entries mixed in, for the hooks case), assert exact expected output. This is what actually catches a future fragment typo, not just the generic engine.
 - **Discovery override test**: a file at the same relative path under `~/.infigraph/integrations/` is used instead of its bundled counterpart; a wholly new file (convention-based, no manifest) is discovered and applied; a wholly new integration directory is discovered and applied.
-- **Uninstall test per mechanism**: at least one convention-based JSON artifact, one convention-based array artifact, one TOML artifact, and the `marker_delimited` artifact, confirming uninstall derives what to remove from the fragment's own shape rather than a hardcoded key.
+- **Uninstall test per mechanism**: at least one convention-based JSON artifact, one convention-based array artifact, one `toml_section` artifact (deriving what to remove from its manifest `key_path`, not the fragment's own shape), and the `marker_delimited` artifact.
 - **Settings.json multi-event test**: `claude-code/settings.json`'s fragment declares entries under multiple event keys in one file; applying it produces all of them, and reapplying doesn't duplicate any.
 - **Matcher self-heal test**: apply, hand-edit the resulting matcher in the live `settings.json`, re-apply, assert it's restored to match the bundled fragment.
 - **Resolver tests** (VS Code, Zed): a fake resolver script exercising `ok`/`skip`/`error` responses, confirming the engine handles all three without touching the target file on `skip`/`error`.
 - **Shared-content test**: Claude Code's `content_file = "../shared/agents.md"` picks up the shared file; overriding `~/.infigraph/integrations/shared/agents.md` changes the applied output without `claude-code/config.toml` changing. Same test shape for `shared/skills/infigraph-reindex/SKILL.md` against both Claude Code's and Codex's `config.toml` entries — one shared override changes both integrations' applied output.
-- **Manifest/content naming-collision test**: `codex/.codex/config.toml` (a content file that happens to be named `config.toml`, nested under a subdirectory) is correctly treated as convention-based content, not mistaken for a manifest — confirms discovery only treats `<name>/config.toml` (integration root, not nested) as the manifest, distinct from `codex/config.toml` (the real manifest, now present for the reindex-skill entry).
+- **Manifest/content naming-collision test**: a synthetic fixture with a nested `<name>/some-subdir/config.toml` content file (not currently exercised by any bundled integration, since `toml_section` content is always registered flat rather than at a mirrored path — see "The core idea") confirms discovery only ever treats `<name>/config.toml` at the integration directory's *own root* as the manifest, never a same-named file nested under a subdirectory.
 
 ## Migration
 
