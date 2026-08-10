@@ -575,14 +575,26 @@ impl GraphBackend for Neo4jBackend {
                 files: self.count_query(&format!(
                     "MATCH (f:File {{repo: '{r}'}}) RETURN count(f) AS c"
                 ), "c")?,
-                folders: self.count_query("MATCH (d:Folder) RETURN count(d) AS c", "c")?,
+                // Folder ids are path strings (see upsert_folders), same "{repo}/..."
+                // namespace as File.id -- not every Folder has a CONTAINS edge (only
+                // leaf folders holding a file do; intermediate folders holding only
+                // subfolders don't), so scope by id prefix rather than via CONTAINS.
+                folders: self.count_query(&format!(
+                    "MATCH (d:Folder) WHERE d.id STARTS WITH '{r}/' RETURN count(d) AS c"
+                ), "c")?,
                 calls: self.count_query(&format!(
                     "MATCH (f:File {{repo: '{r}'}})-[:DEFINES]->(a:Symbol)-[r2:CALLS]->(b:Symbol) RETURN count(r2) AS c"
                 ), "c")?,
                 inherits: self.count_query(&format!(
                     "MATCH (f:File {{repo: '{r}'}})-[:DEFINES]->(a:Symbol)-[r2:INHERITS]->(b:Symbol) RETURN count(r2) AS c"
                 ), "c")?,
-                contains: self.count_query("MATCH ()-[r:CONTAINS]->() RETURN count(r) AS c", "c")?,
+                // CONTAINS here means Module->Symbol (see upsert_extraction/upsert_files_bulk),
+                // not Folder->File -- mirror the `modules` query's EXISTS-via-File pattern.
+                contains: self.count_query(&format!(
+                    "MATCH (m:Module)-[:CONTAINS]->(s:Symbol) \
+                     WHERE EXISTS {{ MATCH (f:File {{repo: '{r}'}}) WHERE f.id = m.file }} \
+                     RETURN count(*) AS c"
+                ), "c")?,
             });
         }
         Ok(GraphStats {
@@ -966,17 +978,21 @@ impl GraphBackend for Neo4jBackend {
     }
 
     fn get_test_coverage(&self) -> Result<TestCoverage> {
+        // TESTED_BY edges are populated by `derive_tested_by_edges` (run
+        // during indexing), not by extraction directly.
         let (covered_q, uncovered_q) = if let Some(repo) = self.repo_filter() {
             let r = escape(repo);
             (
                 query(&format!(
                     "MATCH (fi:File {{repo: '{r}'}})-[:DEFINES]->(s:Symbol)<-[:TESTED_BY]-(t:Symbol) \
+                     WHERE s.kind IN ['Function', 'Method', 'Class', 'Struct', 'Trait', 'Interface'] \
                      RETURN s.id AS symbol_id, s.name AS symbol_name, s.kind AS kind, \
                             s.file AS file, t.id AS test_id"
                 )),
                 query(&format!(
                     "MATCH (fi:File {{repo: '{r}'}})-[:DEFINES]->(s:Symbol) \
-                     WHERE s.kind IN ['Function', 'Method'] AND NOT (s)<-[:TESTED_BY]-() \
+                     WHERE s.kind IN ['Function', 'Method', 'Class', 'Struct', 'Trait', 'Interface'] \
+                     AND NOT (s)<-[:TESTED_BY]-(:Symbol) \
                      RETURN s.id AS symbol_id, s.name AS symbol_name, s.kind AS kind, s.file AS file"
                 )),
             )
@@ -984,12 +1000,13 @@ impl GraphBackend for Neo4jBackend {
             (
                 query(
                     "MATCH (s:Symbol)<-[:TESTED_BY]-(t:Symbol) \
+                     WHERE s.kind IN ['Function', 'Method', 'Class', 'Struct', 'Trait', 'Interface'] \
                      RETURN s.id AS symbol_id, s.name AS symbol_name, s.kind AS kind, \
                             s.file AS file, t.id AS test_id",
                 ),
                 query(
-                    "MATCH (s:Symbol) WHERE s.kind IN ['Function', 'Method'] \
-                     AND NOT (s)<-[:TESTED_BY]-() \
+                    "MATCH (s:Symbol) WHERE s.kind IN ['Function', 'Method', 'Class', 'Struct', 'Trait', 'Interface'] \
+                     AND NOT (s)<-[:TESTED_BY]-(:Symbol) \
                      RETURN s.id AS symbol_id, s.name AS symbol_name, s.kind AS kind, s.file AS file",
                 ),
             )
@@ -1789,8 +1806,8 @@ impl GraphBackend for Neo4jBackend {
                         query(
                             "MATCH (test:Symbol)-[:CALLS]->(target:Symbol) \
                          WHERE (test.file IN $files OR target.file IN $files) \
-                           AND test.file CONTAINS 'test' \
-                           AND NOT target.file CONTAINS 'test' \
+                           AND test.kind = 'Test' \
+                           AND target.kind <> 'Test' \
                          MERGE (target)<-[:TESTED_BY]-(test)",
                         )
                         .param("files", file_list),
@@ -1801,7 +1818,7 @@ impl GraphBackend for Neo4jBackend {
             _ => {
                 self.run_void(
                     "MATCH (test:Symbol)-[:CALLS]->(target:Symbol) \
-                     WHERE test.file CONTAINS 'test' AND NOT target.file CONTAINS 'test' \
+                     WHERE test.kind = 'Test' AND target.kind <> 'Test' \
                      MERGE (target)<-[:TESTED_BY]-(test)",
                 )?;
             }

@@ -337,6 +337,8 @@ impl<'a, 'db> GraphQuery<'a, 'db> {
     }
 
     /// Get test coverage: which symbols have TESTED_BY edges, which don't.
+    /// TESTED_BY edges are populated by `derive_tested_by_edges` (run during
+    /// indexing), not by extraction directly.
     pub fn get_test_coverage(&self) -> Result<TestCoverage> {
         // Testable kinds
         let q_covered = "MATCH (s:Symbol)-[:TESTED_BY]->(t:Symbol) \

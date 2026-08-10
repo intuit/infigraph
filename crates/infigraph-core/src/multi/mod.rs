@@ -763,36 +763,54 @@ pub fn index_group(
     // can't be cheaply cloned (tree_sitter::Query isn't Clone), so a fresh
     // build per repo is pure wasted time on `--full`/large-group runs.
     let shared_registry = std::sync::Arc::new(build_registry()?);
-    let index_one =
-        |repo_name: &str, entry: &RepoEntry| -> Result<(String, usize, usize, Infigraph)> {
-            let mut prism = Infigraph::open_shared(&entry.path, shared_registry.clone())?;
-            prism.init()?;
-            // Only namespace in remote/shared-graph mode. In local mode each repo has its
-            // own embedded DB, so prefixing file keys with the repo name just changes them
-            // between a standalone `index` and a `group index` run — the stale-file prune
-            // in index_via_backend then sees the old unprefixed key as gone and deletes it.
-            if use_parallel && prism.backend().is_some() {
-                let ns = if org.is_empty() {
-                    repo_name.to_string()
-                } else {
-                    format!("{org}/{repo_name}")
-                };
-                prism.set_namespace(&ns);
-                // Scope reads (get_file_hashes / stale-prune) to THIS repo. Without this,
-                // incremental indexing fetches every repo's file hashes from the shared graph
-                // and the stale-file prune deletes all OTHER repos' data. Must match the
-                // write namespace exactly.
-                #[cfg(feature = "neo4j")]
-                prism.set_repo_filter(&ns);
+    let index_one = |repo_name: &str,
+                     entry: &RepoEntry|
+     -> Result<(String, usize, usize, Infigraph)> {
+        let mut prism = Infigraph::open_shared(&entry.path, shared_registry.clone())?;
+        prism.init()?;
+        // Only namespace in remote/shared-graph mode. In local mode each repo has its
+        // own embedded DB, so prefixing file keys with the repo name just changes them
+        // between a standalone `index` and a `group index` run — the stale-file prune
+        // in index_via_backend then sees the old unprefixed key as gone and deletes it.
+        if use_parallel && prism.backend().is_some() {
+            let ns = if org.is_empty() {
+                repo_name.to_string()
+            } else {
+                format!("{org}/{repo_name}")
+            };
+            prism.set_namespace(&ns);
+            // Scope reads (get_file_hashes / stale-prune) to THIS repo. Without this,
+            // incremental indexing fetches every repo's file hashes from the shared graph
+            // and the stale-file prune deletes all OTHER repos' data. Must match the
+            // write namespace exactly.
+            #[cfg(feature = "neo4j")]
+            prism.set_repo_filter(&ns);
+        }
+        let result = prism.index()?;
+        // `group build` bypasses the CLI's single-repo `index` command (see
+        // infigraph-cli/src/index.rs), which is the only other place this
+        // gets called -- without this, TESTED_BY edges are never derived
+        // for anything indexed via a group, and get_test_coverage silently
+        // reports 0% on every repo indexed this way (confirmed via AIF3X-331
+        // eval: the live e2e pod runs group build exclusively). Scope to
+        // this repo's own files so it doesn't touch other repos sharing the
+        // same Neo4j instance.
+        if let Some(backend) = prism.backend() {
+            let changed: Vec<&str> = result.extractions.iter().map(|e| e.file.as_str()).collect();
+            if let Err(e) = backend.derive_tested_by_edges(Some(&changed)) {
+                eprintln!(
+                    "[group] TESTED_BY derivation failed for '{}': {e}",
+                    repo_name
+                );
             }
-            let result = prism.index()?;
-            Ok((
-                repo_name.to_string(),
-                result.indexed_files,
-                result.total_files,
-                prism,
-            ))
-        };
+        }
+        Ok((
+            repo_name.to_string(),
+            result.indexed_files,
+            result.total_files,
+            prism,
+        ))
+    };
 
     let indexed: Vec<Result<(String, usize, usize, Infigraph)>> = if use_parallel {
         use rayon::prelude::*;

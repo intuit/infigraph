@@ -261,7 +261,18 @@ pub fn detect_cross_cutting(backend: &dyn GraphBackend) -> Result<Vec<ConcernMat
         ("REGISTERS_MIDDLEWARE", "Middleware"),
         ("INJECTS_DEPENDENCY", "DependencyInjection"),
     ] {
-        let query = format!("MATCH (a:Symbol)-[:{edge_kind}]->(b:Symbol) RETURN a.id, b.id");
+        // Scope to the current repo the same way `symbols_with_docstring` /
+        // `stats()` do -- an unscoped MATCH leaks every repo's middleware/DI
+        // edges in shared-Neo4j mode, since Symbol nodes carry no `repo`
+        // property directly (only File nodes do).
+        let query = if let Some(repo) = backend.repo_filter() {
+            let r = repo.replace('\'', "\\'");
+            format!(
+                "MATCH (f:File {{repo: '{r}'}})-[:DEFINES]->(a:Symbol)-[:{edge_kind}]->(b:Symbol) RETURN a.id, b.id"
+            )
+        } else {
+            format!("MATCH (a:Symbol)-[:{edge_kind}]->(b:Symbol) RETURN a.id, b.id")
+        };
         if let Ok(rows) = backend.raw_query(&query) {
             for row in rows {
                 if row.len() < 2 {

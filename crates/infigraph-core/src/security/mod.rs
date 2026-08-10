@@ -126,6 +126,28 @@ mod tests {
     }
 
     #[test]
+    fn no_false_positive_fstring_select_prefix() {
+        // SEC004/SEC005 patterns ("f\"select", "f'select") used to be a bare
+        // substring match, so any f-string starting with a word beginning
+        // "select" (selected, selection, ...) false-positived as SQL
+        // injection -- e.g. logger.debug(f"selected_model_region={x}").
+        let code = "logger.debug(f\"selected_model_region={selected_model_region}\")";
+        let findings = scan_str(code, "py");
+        assert!(
+            !findings
+                .iter()
+                .any(|f| f.category == Category::SqlInjection),
+            "f-string starting with 'selected_' is not a SQL SELECT"
+        );
+    }
+
+    #[test]
+    fn detects_fstring_sql_select() {
+        let findings = scan_str("query = f\"select * from users where id={uid}\"", "py");
+        assert!(findings.iter().any(|f| f.rule_id == "SEC004"));
+    }
+
+    #[test]
     fn sanitizer_suppresses_path_traversal() {
         let code = "safe = os.path.realpath(user_path)\nopen(safe)";
         let findings = scan_str(code, "py");

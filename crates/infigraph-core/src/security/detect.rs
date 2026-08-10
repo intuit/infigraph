@@ -91,7 +91,12 @@ pub(crate) fn scan_file(
                 }
             }
 
-            if !line_lower.contains(rule.pattern) {
+            let matched = if rule.word_boundary {
+                super::rules::contains_word(&line_lower, rule.pattern)
+            } else {
+                line_lower.contains(rule.pattern)
+            };
+            if !matched {
                 continue;
             }
 
