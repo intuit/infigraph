@@ -237,9 +237,7 @@ fn run() -> Result<()> {
     }
 
     let args: Vec<String> = std::env::args().collect();
-    let ui_enabled = args
-        .iter()
-        .any(|a| a == "--ui" || a.starts_with("--ui=") || a == "--mcp");
+    let ui_enabled = args.iter().any(|a| a == "--ui" || a.starts_with("--ui="));
     let port: u16 = args
         .iter()
         .find(|a| a.starts_with("--port="))
