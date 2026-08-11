@@ -679,3 +679,253 @@ fn test_neo4j_move_rename_file() {
         .expect("main untouched");
     assert_eq!(main_syms.len(), 2, "unrelated file untouched after move");
 }
+
+// ── Repo-scoping regression tests (AIF3X-331 e2e eval) ───────────────
+
+#[test]
+#[ignore]
+fn test_neo4j_stats_repo_scoped_folders_and_contains() {
+    let mut backend = connect();
+    clear_graph(&backend);
+
+    // Two repos sharing this Neo4j instance -- stats() with a repo_filter set
+    // must not leak the other repo's Folders/Contains counts (AIF3X-331 e2e
+    // eval: live pod reported Folders/Contains as global totals across all
+    // 176 repos on the shared instance while every other stats() field was
+    // correctly scoped).
+    backend.set_write_namespace("repo-a");
+    backend
+        .upsert_files_bulk(&fixture_namespaced("repo-a"), true)
+        .expect("upsert repo-a");
+    backend.upsert_repo("repo-a").expect("upsert Repo repo-a");
+
+    backend.set_write_namespace("repo-b");
+    backend
+        .upsert_files_bulk(&fixture_namespaced("repo-b"), false)
+        .expect("upsert repo-b");
+    backend.upsert_repo("repo-b").expect("upsert Repo repo-b");
+
+    backend.set_repo_filter("repo-a");
+    let stats = backend.stats().expect("scoped stats");
+    assert_eq!(stats.symbols, 2, "repo-a has 2 symbols");
+    assert_eq!(stats.files, 1, "repo-a has 1 file");
+    assert_eq!(
+        stats.folders, 1,
+        "repo-a's own folder (repo-a/src) only -- not repo-b's"
+    );
+    assert_eq!(
+        stats.contains, 2,
+        "repo-a's own Module->Symbol CONTAINS edges only -- not repo-b's"
+    );
+}
+
+#[test]
+#[ignore]
+fn test_neo4j_derive_tested_by_uses_symbol_kind_not_filename() {
+    let backend = connect();
+    clear_graph(&backend);
+
+    // A Test-kind symbol living in a file whose path does NOT contain "test"
+    // must still be recognized (derive_tested_by_edges used to match on
+    // `test.file CONTAINS 'test'`, a filename guess weaker than the
+    // already-correct SymbolKind::Test classification set during extraction).
+    let extraction = FileExtraction {
+        file: "src/checks.py".to_string(),
+        language: "python".to_string(),
+        content_hash: "ccc".to_string(),
+        symbols: vec![
+            sym(
+                "src/checks.py::verify_thing",
+                "verify_thing",
+                SymbolKind::Test,
+                "src/checks.py",
+                1,
+                5,
+            ),
+            sym(
+                "src/main.py::helper",
+                "helper",
+                SymbolKind::Function,
+                "src/main.py",
+                1,
+                5,
+            ),
+        ],
+        relations: vec![rel(
+            "src/checks.py::verify_thing",
+            "src/main.py::helper",
+            RelationKind::Calls,
+        )],
+        statements: vec![],
+    };
+    backend
+        .upsert_files_bulk(&[extraction], true)
+        .expect("upsert");
+
+    let count = backend
+        .derive_tested_by_edges(None)
+        .expect("derive TESTED_BY");
+    assert!(
+        count >= 1,
+        "expected at least 1 TESTED_BY edge, got {count}"
+    );
+
+    let coverage = backend.get_test_coverage().expect("coverage");
+    assert!(
+        coverage
+            .covered
+            .iter()
+            .any(|c| c.symbol_id == "src/main.py::helper"),
+        "helper should be covered by verify_thing despite checks.py not containing 'test'"
+    );
+}
+
+#[test]
+#[ignore]
+fn test_neo4j_derive_tested_by_does_not_link_test_to_test() {
+    let backend = connect();
+    clear_graph(&backend);
+
+    // A Test-kind symbol calling ANOTHER Test-kind symbol (e.g. a shared
+    // assertion helper) must not produce a TESTED_BY edge -- the derivation
+    // requires `target.kind <> 'Test'`, and this is the one case that
+    // regresses silently if that exclusion is ever dropped.
+    let extraction = FileExtraction {
+        file: "src/checks.py".to_string(),
+        language: "python".to_string(),
+        content_hash: "ddd".to_string(),
+        symbols: vec![
+            sym(
+                "src/checks.py::test_outer",
+                "test_outer",
+                SymbolKind::Test,
+                "src/checks.py",
+                1,
+                5,
+            ),
+            sym(
+                "src/checks.py::assert_helper",
+                "assert_helper",
+                SymbolKind::Test,
+                "src/checks.py",
+                7,
+                10,
+            ),
+        ],
+        relations: vec![rel(
+            "src/checks.py::test_outer",
+            "src/checks.py::assert_helper",
+            RelationKind::Calls,
+        )],
+        statements: vec![],
+    };
+    backend
+        .upsert_files_bulk(&[extraction], true)
+        .expect("upsert");
+
+    backend
+        .derive_tested_by_edges(None)
+        .expect("derive TESTED_BY");
+
+    let rows = backend
+        .raw_query(
+            "MATCH (:Symbol {id: 'src/checks.py::assert_helper'})<-[:TESTED_BY]-(:Symbol) \
+             RETURN count(*) AS c",
+        )
+        .expect("query TESTED_BY");
+    assert_eq!(
+        rows.first().and_then(|r| r.first()).map(|s| s.as_str()),
+        Some("0"),
+        "a Test-kind symbol calling another Test-kind symbol must not create TESTED_BY"
+    );
+}
+
+#[test]
+#[ignore]
+fn test_neo4j_derive_tested_by_is_idempotent() {
+    let backend = connect();
+    clear_graph(&backend);
+
+    let extraction = FileExtraction {
+        file: "src/checks.py".to_string(),
+        language: "python".to_string(),
+        content_hash: "eee".to_string(),
+        symbols: vec![
+            sym(
+                "src/checks.py::verify_thing",
+                "verify_thing",
+                SymbolKind::Test,
+                "src/checks.py",
+                1,
+                5,
+            ),
+            sym(
+                "src/main.py::helper",
+                "helper",
+                SymbolKind::Function,
+                "src/main.py",
+                1,
+                5,
+            ),
+        ],
+        relations: vec![rel(
+            "src/checks.py::verify_thing",
+            "src/main.py::helper",
+            RelationKind::Calls,
+        )],
+        statements: vec![],
+    };
+    backend
+        .upsert_files_bulk(&[extraction], true)
+        .expect("upsert");
+
+    let count1 = backend
+        .derive_tested_by_edges(None)
+        .expect("derive TESTED_BY first pass");
+    let count2 = backend
+        .derive_tested_by_edges(None)
+        .expect("derive TESTED_BY second pass");
+    assert_eq!(
+        count1, count2,
+        "re-deriving TESTED_BY should not duplicate edges"
+    );
+}
+
+#[test]
+#[ignore]
+fn test_neo4j_stats_repo_scoped_folders_counts_nested_paths_once() {
+    let mut backend = connect();
+    clear_graph(&backend);
+
+    // repo-a has a two-level-deep file (repo-a/src/deep/nested.py) alongside
+    // its existing repo-a/src/main.py -- both "repo-a/src" and
+    // "repo-a/src/deep" must be counted, each exactly once, not per-file.
+    backend.set_write_namespace("repo-a");
+    let mut extractions = fixture_namespaced("repo-a");
+    extractions.push(FileExtraction {
+        file: "repo-a/src/deep/nested.py".to_string(),
+        language: "python".to_string(),
+        content_hash: "fff".to_string(),
+        symbols: vec![sym(
+            "repo-a/src/deep/nested.py::deep_fn",
+            "deep_fn",
+            SymbolKind::Function,
+            "repo-a/src/deep/nested.py",
+            1,
+            5,
+        )],
+        relations: vec![],
+        statements: vec![],
+    });
+    backend
+        .upsert_files_bulk(&extractions, true)
+        .expect("upsert repo-a");
+    backend.upsert_repo("repo-a").expect("upsert Repo repo-a");
+
+    backend.set_repo_filter("repo-a");
+    let stats = backend.stats().expect("scoped stats");
+    assert_eq!(
+        stats.folders, 2,
+        "repo-a/src and repo-a/src/deep, each counted once"
+    );
+}

@@ -969,6 +969,135 @@ mod remote {
         // DBs on disk) gets caught by someone reading this comment before it ships.
     }
 
+    /// index_group must derive TESTED_BY edges per repo (AIF3X-331 e2e eval: the
+    /// live pod always reported 0% test coverage because `group build` — the
+    /// pod's only indexing path — called `prism.index()` directly and never
+    /// invoked `derive_tested_by_edges` at all; only the CLI's separate
+    /// single-repo `index` command did). Regression guard: fails if that call
+    /// is ever removed from `index_one` again.
+    #[test]
+    #[ignore]
+    fn test_remote_index_group_derives_tested_by_edges() {
+        let svc_dir = make_repo(&[(
+            "app/thing.py",
+            "def do_work():\n    return 1\n\n\ndef test_do_work():\n    assert do_work() == 1\n",
+        )]);
+        std::env::set_var("INFIGRAPH_BACKEND", "neo4j");
+        let pg = connect_pg();
+        clean_pg(&pg);
+        let neo = connect_neo4j();
+        neo.raw_query("MATCH (n) DETACH DELETE n")
+            .expect("clear neo4j graph before test");
+
+        pg.upsert_repo(
+            "tested-by-svc",
+            &repo_entry("tested-by-svc", svc_dir.path()),
+        )
+        .expect("seed tested-by-svc repo");
+        pg.create_group("remote-tested-by-group")
+            .expect("create group");
+        pg.group_add("remote-tested-by-group", "tested-by-svc")
+            .expect("add tested-by-svc");
+
+        let mut registry =
+            Registry::load().expect("load registry via Postgres (INFIGRAPH_BACKEND=neo4j)");
+        multi::index_group(
+            &mut registry,
+            "remote-tested-by-group",
+            true,
+            infigraph_languages::bundled_registry,
+        )
+        .expect("index_group should succeed against live Neo4j");
+
+        let rows = neo
+            .raw_query(
+                "MATCH (target:Symbol)<-[:TESTED_BY]-(test:Symbol) \
+                 WHERE target.id CONTAINS 'do_work' AND NOT target.id CONTAINS 'test_do_work' \
+                 RETURN target.id, test.id",
+            )
+            .expect("query for TESTED_BY edge");
+        assert!(
+            !rows.is_empty(),
+            "expected a TESTED_BY edge from test_do_work onto do_work after `group build` \
+             (index_group) -- got none. Found rows: {rows:?}"
+        );
+
+        teardown_remote();
+    }
+
+    /// Same as `test_remote_index_group_derives_tested_by_edges` but through an
+    /// incremental (`full=false`) second build after a real code change, to
+    /// exercise `derive_tested_by_edges`'s `Some(changed_files)` branch
+    /// specifically -- the first test only ever exercises the unconditional
+    /// `_` branch via `full=true`, and the two are different Cypher queries
+    /// on the Neo4j backend.
+    #[test]
+    #[ignore]
+    fn test_remote_index_group_derives_tested_by_edges_incrementally() {
+        let svc_dir = make_repo(&[("app/thing.py", "def do_work():\n    return 1\n")]);
+        git_commit_all(svc_dir.path(), "init tested-by-svc");
+        std::env::set_var("INFIGRAPH_BACKEND", "neo4j");
+        let pg = connect_pg();
+        clean_pg(&pg);
+        let neo = connect_neo4j();
+        neo.raw_query("MATCH (n) DETACH DELETE n")
+            .expect("clear neo4j graph before test");
+
+        pg.upsert_repo(
+            "tested-by-svc-incr",
+            &repo_entry("tested-by-svc-incr", svc_dir.path()),
+        )
+        .expect("seed tested-by-svc-incr repo");
+        pg.create_group("remote-tested-by-incr-group")
+            .expect("create group");
+        pg.group_add("remote-tested-by-incr-group", "tested-by-svc-incr")
+            .expect("add tested-by-svc-incr");
+
+        let mut registry =
+            Registry::load().expect("load registry via Postgres (INFIGRAPH_BACKEND=neo4j)");
+        multi::index_group(
+            &mut registry,
+            "remote-tested-by-incr-group",
+            false,
+            infigraph_languages::bundled_registry,
+        )
+        .expect("first (full) build should succeed");
+
+        // Add a test for the already-indexed function, then rebuild
+        // incrementally -- only this changed file should be re-scanned, and
+        // derive_tested_by_edges must still pick up the new TESTED_BY edge
+        // via its scoped `changed_files` branch, not just a full rebuild.
+        std::fs::write(
+            svc_dir.path().join("app/test_thing.py"),
+            "from app.thing import do_work\n\n\ndef test_do_work():\n    assert do_work() == 1\n",
+        )
+        .expect("write new test file");
+        git_commit_all(svc_dir.path(), "add test for do_work");
+
+        multi::index_group(
+            &mut registry,
+            "remote-tested-by-incr-group",
+            false,
+            infigraph_languages::bundled_registry,
+        )
+        .expect("incremental build should succeed");
+
+        let rows = neo
+            .raw_query(
+                "MATCH (target:Symbol)<-[:TESTED_BY]-(test:Symbol) \
+                 WHERE target.id CONTAINS 'do_work' AND NOT target.id CONTAINS 'test_do_work' \
+                 RETURN target.id, test.id",
+            )
+            .expect("query for TESTED_BY edge");
+        assert!(
+            !rows.is_empty(),
+            "expected a TESTED_BY edge from test_do_work onto do_work after an INCREMENTAL \
+             `group build` -- got none. Found rows: {rows:?}"
+        );
+
+        teardown_remote();
+    }
+
     // Step 5 (remote) — per-repo DocIndex.index() loop gated by Step 1's `results`
     // (592b03d) — is covered in infigraph-docs/tests/group_build_docs.rs since
     // infigraph-core has no dependency on infigraph-docs/DocIndex.
