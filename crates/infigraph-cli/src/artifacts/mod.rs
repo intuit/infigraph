@@ -387,4 +387,121 @@ resolver = ["./resolve-zed-path.sh"]
         .unwrap();
         assert!(after["context_servers"]["infigraph"].is_null());
     }
+
+    #[test]
+    fn bundled_gemini_cli_mcp_fragment_applies_correctly() {
+        let user_dir = tempfile::tempdir().unwrap();
+        let home_dir = tempfile::tempdir().unwrap();
+        let mcp_path = "/opt/infigraph/bin/infigraph-mcp";
+
+        let artifacts =
+            discover_artifacts(BUNDLED_INTEGRATIONS, user_dir.path(), mcp_path).unwrap();
+        let gemini = artifacts
+            .iter()
+            .find(|a| a.target_relative_path.as_deref() == Some(".gemini/settings.json"))
+            .expect("gemini-cli fragment should be discovered from the bundled registry");
+        assert_eq!(gemini.strategy, Strategy::JsonDeepMerge);
+
+        apply_resolved_artifact(gemini, home_dir.path(), mcp_path).unwrap();
+        let written: serde_json::Value = serde_json::from_str(
+            &std::fs::read_to_string(home_dir.path().join(".gemini/settings.json")).unwrap(),
+        )
+        .unwrap();
+        assert_eq!(written["mcpServers"]["infigraph"]["command"], mcp_path);
+        assert_eq!(written["mcpServers"]["infigraph"]["args"][0], "--mcp");
+    }
+
+    #[test]
+    fn bundled_opencode_mcp_fragment_applies_correctly() {
+        let user_dir = tempfile::tempdir().unwrap();
+        let home_dir = tempfile::tempdir().unwrap();
+        let mcp_path = "/opt/infigraph/bin/infigraph-mcp";
+
+        let artifacts =
+            discover_artifacts(BUNDLED_INTEGRATIONS, user_dir.path(), mcp_path).unwrap();
+        let opencode = artifacts
+            .iter()
+            .find(|a| a.target_relative_path.as_deref() == Some(".config/opencode/opencode.json"))
+            .expect("opencode fragment should be discovered from the bundled registry");
+        assert_eq!(opencode.strategy, Strategy::JsonDeepMerge);
+
+        apply_resolved_artifact(opencode, home_dir.path(), mcp_path).unwrap();
+        let written: serde_json::Value = serde_json::from_str(
+            &std::fs::read_to_string(home_dir.path().join(".config/opencode/opencode.json"))
+                .unwrap(),
+        )
+        .unwrap();
+        assert_eq!(written["mcp"]["infigraph"]["type"], "local");
+        assert_eq!(written["mcp"]["infigraph"]["command"][0], mcp_path);
+        assert_eq!(written["mcp"]["infigraph"]["command"][1], "--mcp");
+    }
+
+    #[test]
+    fn bundled_aider_mcp_fragment_applies_correctly() {
+        let user_dir = tempfile::tempdir().unwrap();
+        let home_dir = tempfile::tempdir().unwrap();
+        let mcp_path = "/opt/infigraph/bin/infigraph-mcp";
+
+        let artifacts =
+            discover_artifacts(BUNDLED_INTEGRATIONS, user_dir.path(), mcp_path).unwrap();
+        let aider = artifacts
+            .iter()
+            .find(|a| a.target_relative_path.as_deref() == Some(".aider/mcp.json"))
+            .expect("aider fragment should be discovered from the bundled registry");
+        assert_eq!(aider.strategy, Strategy::JsonDeepMerge);
+
+        apply_resolved_artifact(aider, home_dir.path(), mcp_path).unwrap();
+        let written: serde_json::Value = serde_json::from_str(
+            &std::fs::read_to_string(home_dir.path().join(".aider/mcp.json")).unwrap(),
+        )
+        .unwrap();
+        assert_eq!(written["mcpServers"]["infigraph"]["command"], mcp_path);
+        assert_eq!(written["mcpServers"]["infigraph"]["args"][0], "--mcp");
+    }
+
+    #[test]
+    fn bundled_kiro_mcp_fragment_applies_correctly() {
+        let user_dir = tempfile::tempdir().unwrap();
+        let home_dir = tempfile::tempdir().unwrap();
+        let mcp_path = "/opt/infigraph/bin/infigraph-mcp";
+
+        let artifacts =
+            discover_artifacts(BUNDLED_INTEGRATIONS, user_dir.path(), mcp_path).unwrap();
+        let kiro = artifacts
+            .iter()
+            .find(|a| a.target_relative_path.as_deref() == Some(".kiro/settings/mcp.json"))
+            .expect("kiro fragment should be discovered from the bundled registry");
+        assert_eq!(kiro.strategy, Strategy::JsonDeepMerge);
+
+        apply_resolved_artifact(kiro, home_dir.path(), mcp_path).unwrap();
+        let written: serde_json::Value = serde_json::from_str(
+            &std::fs::read_to_string(home_dir.path().join(".kiro/settings/mcp.json")).unwrap(),
+        )
+        .unwrap();
+        assert_eq!(written["mcpServers"]["infigraph"]["command"], mcp_path);
+        assert_eq!(written["mcpServers"]["infigraph"]["args"][0], "--mcp");
+    }
+
+    #[test]
+    fn bundled_github_copilot_cli_mcp_fragment_applies_correctly() {
+        let user_dir = tempfile::tempdir().unwrap();
+        let home_dir = tempfile::tempdir().unwrap();
+        let mcp_path = "/opt/infigraph/bin/infigraph-mcp";
+
+        let artifacts =
+            discover_artifacts(BUNDLED_INTEGRATIONS, user_dir.path(), mcp_path).unwrap();
+        let copilot = artifacts
+            .iter()
+            .find(|a| a.target_relative_path.as_deref() == Some(".copilot/mcp-config.json"))
+            .expect("github-copilot-cli fragment should be discovered from the bundled registry");
+        assert_eq!(copilot.strategy, Strategy::JsonDeepMerge);
+
+        apply_resolved_artifact(copilot, home_dir.path(), mcp_path).unwrap();
+        let written: serde_json::Value = serde_json::from_str(
+            &std::fs::read_to_string(home_dir.path().join(".copilot/mcp-config.json")).unwrap(),
+        )
+        .unwrap();
+        assert_eq!(written["mcpServers"]["infigraph"]["command"], mcp_path);
+        assert_eq!(written["mcpServers"]["infigraph"]["args"][0], "--mcp");
+    }
 }
