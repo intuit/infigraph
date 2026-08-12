@@ -284,6 +284,107 @@ pub(crate) fn remove_marker_delimited(target_path: &Path, start: &str, end: &str
     Ok(true)
 }
 
+fn toml_section_header(key_path: &[String]) -> String {
+    format!("[{}]", key_path.join("."))
+}
+
+/// Locates a TOML table-header line matching `header` exactly (ignoring
+/// surrounding whitespace and a trailing `#` comment), returning the byte
+/// range from that line's own start through (but not including) the next
+/// line that looks like a table header, or through EOF if there is none.
+/// Returns `None` if no line matches.
+///
+/// Deliberately line-based rather than a raw substring search: a substring
+/// search would also match `header` appearing inside a comment (e.g. `# see
+/// [mcp_servers.infigraph] above`), inside a quoted string value, or as a
+/// prefix of an unrelated longer header -- any of which would corrupt or
+/// delete content that isn't actually infigraph's own section. This still
+/// isn't a full TOML parser (a header-like line inside a multi-line `"""`
+/// string would still confuse it) -- that's a deliberate, documented scope
+/// boundary, same as the JSON-parse-safety bail path's.
+fn find_toml_section_bounds(content: &str, header: &str) -> Option<(usize, usize)> {
+    let mut offsets = Vec::new();
+    let mut pos = 0usize;
+    for line in content.split_inclusive('\n') {
+        offsets.push((pos, line));
+        pos += line.len();
+    }
+
+    let header_line_index = offsets.iter().position(|(_, line)| {
+        let trimmed = line.trim_end_matches('\n').trim();
+        let header_only = trimmed.split('#').next().unwrap_or(trimmed).trim();
+        header_only == header
+    })?;
+
+    let start = offsets[header_line_index].0;
+    let end = offsets[header_line_index + 1..]
+        .iter()
+        .find(|(_, line)| line.trim_start().starts_with('['))
+        .map(|(offset, _)| *offset)
+        .unwrap_or(content.len());
+
+    Some((start, end))
+}
+
+pub(crate) fn apply_toml_section(
+    target_path: &Path,
+    key_path: &[String],
+    body: &str,
+) -> Result<ApplyOutcome> {
+    anyhow::ensure!(
+        !key_path.is_empty(),
+        "toml_section requires a non-empty key_path"
+    );
+    let header = toml_section_header(key_path);
+
+    let existing = if target_path.is_file() {
+        std::fs::read_to_string(target_path)
+            .with_context(|| format!("failed to read {}", target_path.display()))?
+    } else {
+        String::new()
+    };
+
+    let section = format!("{header}\n{}\n", body.trim_end());
+
+    let new_content = match find_toml_section_bounds(&existing, &header) {
+        Some((start, end)) => format!("{}{}{}", &existing[..start], section, &existing[end..]),
+        None if existing.is_empty() => section,
+        None => {
+            let sep = if existing.ends_with('\n') { "" } else { "\n" };
+            format!("{existing}{sep}\n{section}")
+        }
+    };
+
+    ensure_parent_dir(target_path)?;
+    std::fs::write(target_path, new_content)
+        .with_context(|| format!("failed to write {}", target_path.display()))?;
+    Ok(ApplyOutcome::Written)
+}
+
+pub(crate) fn remove_toml_section(target_path: &Path, key_path: &[String]) -> Result<bool> {
+    if !target_path.is_file() {
+        return Ok(false);
+    }
+    let header = toml_section_header(key_path);
+    let content = std::fs::read_to_string(target_path)
+        .with_context(|| format!("failed to read {}", target_path.display()))?;
+
+    let Some((start, end)) = find_toml_section_bounds(&content, &header) else {
+        return Ok(false);
+    };
+
+    let new_content = format!("{}{}", &content[..start], &content[end..]);
+    let trimmed = new_content.trim_end();
+    let final_content = if trimmed.is_empty() {
+        String::new()
+    } else {
+        format!("{trimmed}\n")
+    };
+    std::fs::write(target_path, final_content)
+        .with_context(|| format!("failed to write {}", target_path.display()))?;
+    Ok(true)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -677,6 +778,170 @@ mod tests {
         assert_eq!(
             after, original,
             "file must be completely untouched on refusal"
+        );
+    }
+
+    #[test]
+    fn toml_section_writes_into_empty_file() {
+        let dir = tempfile::tempdir().unwrap();
+        let target = dir.path().join("config.toml");
+        apply_toml_section(
+            &target,
+            &["mcp_servers".to_string(), "infigraph".to_string()],
+            "command = \"/bin/infigraph-mcp\"\nargs = [\"--mcp\"]",
+        )
+        .unwrap();
+
+        let content = std::fs::read_to_string(&target).unwrap();
+        assert!(content.contains("[mcp_servers.infigraph]"));
+        assert!(content.contains("command = \"/bin/infigraph-mcp\""));
+        let parsed: toml::Value = toml::from_str(&content).unwrap();
+        assert_eq!(
+            parsed["mcp_servers"]["infigraph"]["command"].as_str(),
+            Some("/bin/infigraph-mcp")
+        );
+    }
+
+    #[test]
+    fn toml_section_preserves_unrelated_sections_and_comments() {
+        let dir = tempfile::tempdir().unwrap();
+        let target = dir.path().join("config.toml");
+        std::fs::write(
+            &target,
+            "# a user comment\n[mcp_servers.other]\ncommand = \"other\"\n",
+        )
+        .unwrap();
+
+        apply_toml_section(
+            &target,
+            &["mcp_servers".to_string(), "infigraph".to_string()],
+            "command = \"/bin/infigraph-mcp\"\nargs = [\"--mcp\"]",
+        )
+        .unwrap();
+
+        let content = std::fs::read_to_string(&target).unwrap();
+        assert!(content.contains("# a user comment"));
+        assert!(content.contains("[mcp_servers.other]"));
+        assert!(content.contains("command = \"other\""));
+        assert!(content.contains("[mcp_servers.infigraph]"));
+    }
+
+    #[test]
+    fn toml_section_reapply_replaces_not_duplicates() {
+        let dir = tempfile::tempdir().unwrap();
+        let target = dir.path().join("config.toml");
+        let key_path = vec!["mcp_servers".to_string(), "infigraph".to_string()];
+
+        apply_toml_section(&target, &key_path, "command = \"/old/path\"").unwrap();
+        apply_toml_section(&target, &key_path, "command = \"/new/path\"").unwrap();
+
+        let content = std::fs::read_to_string(&target).unwrap();
+        assert_eq!(
+            content.matches("[mcp_servers.infigraph]").count(),
+            1,
+            "section header must appear exactly once, got: {content}"
+        );
+        assert!(!content.contains("/old/path"));
+        assert!(content.contains("/new/path"));
+    }
+
+    #[test]
+    fn remove_toml_section_strips_only_named_section() {
+        let dir = tempfile::tempdir().unwrap();
+        let target = dir.path().join("config.toml");
+        std::fs::write(&target, "[mcp_servers.other]\ncommand = \"other\"\n").unwrap();
+        let key_path = vec!["mcp_servers".to_string(), "infigraph".to_string()];
+        apply_toml_section(&target, &key_path, "command = \"/bin/infigraph-mcp\"").unwrap();
+
+        let removed = remove_toml_section(&target, &key_path).unwrap();
+        assert!(removed);
+
+        let content = std::fs::read_to_string(&target).unwrap();
+        assert!(content.contains("[mcp_servers.other]"));
+        assert!(!content.contains("[mcp_servers.infigraph]"));
+        assert!(!content.contains("infigraph-mcp"));
+    }
+
+    #[test]
+    fn remove_toml_section_returns_false_when_section_absent() {
+        let dir = tempfile::tempdir().unwrap();
+        let target = dir.path().join("config.toml");
+        std::fs::write(&target, "[mcp_servers.other]\ncommand = \"other\"\n").unwrap();
+        let removed = remove_toml_section(
+            &target,
+            &["mcp_servers".to_string(), "infigraph".to_string()],
+        )
+        .unwrap();
+        assert!(!removed);
+    }
+
+    #[test]
+    fn toml_section_does_not_match_a_longer_header_with_our_header_as_a_prefix() {
+        // Regression test: a raw substring search for "[mcp_servers.infigraph]"
+        // must not treat "[mcp_servers.infigraph_extra]" as a match just
+        // because it shares a prefix -- that would corrupt or delete an
+        // unrelated, differently-named section.
+        let dir = tempfile::tempdir().unwrap();
+        let target = dir.path().join("config.toml");
+        std::fs::write(
+            &target,
+            "[mcp_servers.infigraph_extra]\ncommand = \"unrelated-tool\"\n",
+        )
+        .unwrap();
+        let key_path = vec!["mcp_servers".to_string(), "infigraph".to_string()];
+
+        apply_toml_section(&target, &key_path, "command = \"/bin/infigraph-mcp\"").unwrap();
+
+        let content = std::fs::read_to_string(&target).unwrap();
+        assert!(
+            content.contains("[mcp_servers.infigraph_extra]"),
+            "unrelated prefix-colliding section must survive untouched: {content}"
+        );
+        assert!(content.contains("unrelated-tool"));
+        assert!(content.contains("[mcp_servers.infigraph]"));
+
+        let removed = remove_toml_section(&target, &key_path).unwrap();
+        assert!(removed);
+        let after = std::fs::read_to_string(&target).unwrap();
+        assert!(
+            after.contains("[mcp_servers.infigraph_extra]") && after.contains("unrelated-tool"),
+            "removing our section must not touch the prefix-colliding one: {after}"
+        );
+    }
+
+    #[test]
+    fn toml_section_does_not_match_header_text_inside_a_comment() {
+        // Regression test: a comment merely mentioning the header text must
+        // not be mistaken for the real table header.
+        let dir = tempfile::tempdir().unwrap();
+        let target = dir.path().join("config.toml");
+        std::fs::write(
+            &target,
+            "# see [mcp_servers.infigraph] in the docs for an example\n[mcp_servers.other]\ncommand = \"other\"\n",
+        )
+        .unwrap();
+        let key_path = vec!["mcp_servers".to_string(), "infigraph".to_string()];
+
+        apply_toml_section(&target, &key_path, "command = \"/bin/infigraph-mcp\"").unwrap();
+
+        let content = std::fs::read_to_string(&target).unwrap();
+        assert!(
+            content.contains("# see [mcp_servers.infigraph] in the docs for an example"),
+            "the comment must survive untouched: {content}"
+        );
+        assert!(content.contains("[mcp_servers.other]"));
+        assert!(content.contains("command = \"other\""));
+        // Our real section should have been appended as a genuine header
+        // line, not spliced into the comment. The comment's own mention of
+        // "[mcp_servers.infigraph]" is expected to remain -- only a real
+        // header *line* (not any substring occurrence) must be unique.
+        let real_header_lines = content
+            .lines()
+            .filter(|line| line.trim() == "[mcp_servers.infigraph]")
+            .count();
+        assert_eq!(
+            real_header_lines, 1,
+            "exactly one real header line expected, got: {content}"
         );
     }
 }
