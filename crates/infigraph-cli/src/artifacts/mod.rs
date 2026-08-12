@@ -504,4 +504,212 @@ resolver = ["./resolve-zed-path.sh"]
         assert_eq!(written["mcpServers"]["infigraph"]["command"], mcp_path);
         assert_eq!(written["mcpServers"]["infigraph"]["args"][0], "--mcp");
     }
+
+    #[test]
+    fn bundled_claude_json_applies_correctly() {
+        let user_dir = tempfile::tempdir().unwrap();
+        let home_dir = tempfile::tempdir().unwrap();
+        let mcp_path = "/opt/infigraph/bin/infigraph-mcp";
+
+        let artifacts =
+            discover_artifacts(BUNDLED_INTEGRATIONS, user_dir.path(), mcp_path).unwrap();
+        let claude_json = artifacts
+            .iter()
+            .find(|a| a.target_relative_path.as_deref() == Some(".claude.json"))
+            .expect("claude-code's .claude.json fragment should be discovered");
+        assert_eq!(claude_json.strategy, Strategy::JsonDeepMerge);
+
+        apply_resolved_artifact(claude_json, home_dir.path(), mcp_path).unwrap();
+        let written: serde_json::Value = serde_json::from_str(
+            &std::fs::read_to_string(home_dir.path().join(".claude.json")).unwrap(),
+        )
+        .unwrap();
+        assert_eq!(written["mcpServers"]["infigraph"]["command"], mcp_path);
+    }
+
+    #[test]
+    fn bundled_claude_md_and_reindex_skill_apply_via_manifest() {
+        let user_dir = tempfile::tempdir().unwrap();
+        let home_dir = tempfile::tempdir().unwrap();
+        let mcp_path = "/opt/infigraph/bin/infigraph-mcp";
+
+        let artifacts =
+            discover_artifacts(BUNDLED_INTEGRATIONS, user_dir.path(), mcp_path).unwrap();
+
+        let claude_md = artifacts
+            .iter()
+            .find(|a| a.target_relative_path.as_deref() == Some(".claude/CLAUDE.md"))
+            .expect(
+                "CLAUDE.md marker_delimited artifact should be discovered from claude-code/config.toml",
+            );
+        assert_eq!(claude_md.strategy, Strategy::MarkerDelimited);
+        apply_resolved_artifact(claude_md, home_dir.path(), mcp_path).unwrap();
+        let claude_md_content =
+            std::fs::read_to_string(home_dir.path().join(".claude/CLAUDE.md")).unwrap();
+        assert!(claude_md_content.contains("## Infigraph — Primary Code Intelligence"));
+        assert!(claude_md_content.contains("<!-- infigraph-primary-search -->"));
+
+        let skill = artifacts
+            .iter()
+            .find(|a| {
+                a.target_relative_path.as_deref()
+                    == Some(".claude/skills/infigraph-reindex/SKILL.md")
+            })
+            .expect("reindex skill artifact should be discovered from claude-code/config.toml");
+        assert_eq!(skill.strategy, Strategy::Overwrite);
+        apply_resolved_artifact(skill, home_dir.path(), mcp_path).unwrap();
+        let skill_content = std::fs::read_to_string(
+            home_dir
+                .path()
+                .join(".claude/skills/infigraph-reindex/SKILL.md"),
+        )
+        .unwrap();
+        assert!(skill_content.starts_with("---\nname: infigraph-reindex"));
+        assert!(skill_content.contains("mcp__infigraph__index_project"));
+    }
+
+    #[test]
+    fn bundled_settings_json_multi_event_test() {
+        let user_dir = tempfile::tempdir().unwrap();
+        let home_dir = tempfile::tempdir().unwrap();
+        let mcp_path = "/opt/infigraph/bin/infigraph-mcp";
+
+        let artifacts =
+            discover_artifacts(BUNDLED_INTEGRATIONS, user_dir.path(), mcp_path).unwrap();
+        let settings = artifacts
+            .iter()
+            .find(|a| a.target_relative_path.as_deref() == Some(".claude/settings.json"))
+            .expect("settings.json fragment should be discovered");
+        assert_eq!(settings.strategy, Strategy::JsonDeepMerge);
+
+        apply_resolved_artifact(settings, home_dir.path(), mcp_path).unwrap();
+        apply_resolved_artifact(settings, home_dir.path(), mcp_path).unwrap(); // reapply: must not duplicate
+
+        let written: serde_json::Value = serde_json::from_str(
+            &std::fs::read_to_string(home_dir.path().join(".claude/settings.json")).unwrap(),
+        )
+        .unwrap();
+
+        for (event, expected_count) in [
+            ("PreToolUse", 1),
+            ("PostToolUse", 4),
+            ("UserPromptSubmit", 3),
+            ("SessionStart", 1),
+            ("SessionEnd", 1),
+            ("PreCompact", 1),
+        ] {
+            let arr = written["hooks"][event]
+                .as_array()
+                .unwrap_or_else(|| panic!("{event} should be an array"));
+            assert_eq!(
+                arr.len(),
+                expected_count,
+                "{event} should have exactly {expected_count} entries after reapply, got {arr:?}"
+            );
+        }
+
+        let enforce_command = written["hooks"]["PreToolUse"][0]["hooks"][0]["command"]
+            .as_str()
+            .unwrap();
+        assert!(enforce_command.contains("infigraph-enforce.sh"));
+    }
+
+    #[test]
+    fn bundled_enforce_hook_allows_piped_grep_but_still_blocks_bare_grep() {
+        // Regression test for the grep-piping detection bug caught live this
+        // session: a real Bash command filtering another command's output
+        // (`cmd 2>&1 | grep -iE "error"`, explicitly allowed by this repo's
+        // own CLAUDE.md guidance) must NOT be blocked, while a bare/leading
+        // grep call (a real code search) must still be blocked. This checks
+        // the bundled content carries the fix's `cmd_without_piped_grep`
+        // logic rather than the old blanket substring check.
+        let user_dir = tempfile::tempdir().unwrap();
+        let home_dir = tempfile::tempdir().unwrap();
+        let mcp_path = "/opt/infigraph/bin/infigraph-mcp";
+
+        let artifacts =
+            discover_artifacts(BUNDLED_INTEGRATIONS, user_dir.path(), mcp_path).unwrap();
+        let enforce = artifacts
+            .iter()
+            .find(|a| {
+                a.target_relative_path.as_deref() == Some(".claude/hooks/infigraph-enforce.sh")
+            })
+            .unwrap();
+        apply_resolved_artifact(enforce, home_dir.path(), mcp_path).unwrap();
+        let content =
+            std::fs::read_to_string(home_dir.path().join(".claude/hooks/infigraph-enforce.sh"))
+                .unwrap();
+        assert!(
+            content.contains("cmd_without_piped_grep"),
+            "enforce.sh must carry the piped-grep exemption, not the old blanket check"
+        );
+        // Check the actual sed command line, not the whole file -- the fix's
+        // own explanatory comment legitimately mentions "\b" as prose (why it
+        // was avoided), so a whole-file substring check would false-positive
+        // on that comment instead of testing the real regex.
+        let sed_line = content
+            .lines()
+            .find(|line| line.contains("sed -E"))
+            .expect("enforce.sh should contain the piped-grep sed substitution");
+        assert!(
+            !sed_line.contains("\\b"),
+            "the sed substitution must not use \\b -- unsupported by macOS's BSD sed, \
+             verified live during this fix (silently no-ops instead of erroring)"
+        );
+    }
+
+    #[test]
+    fn bundled_hook_scripts_have_expected_content() {
+        let user_dir = tempfile::tempdir().unwrap();
+        let home_dir = tempfile::tempdir().unwrap();
+        let mcp_path = "/opt/infigraph/bin/infigraph-mcp";
+
+        let artifacts =
+            discover_artifacts(BUNDLED_INTEGRATIONS, user_dir.path(), mcp_path).unwrap();
+        for (relative, expected_substring) in [
+            (".claude/hooks/infigraph-enforce.sh", "deny-by-default"),
+            (
+                ".claude/hooks/infigraph-edit-tracker.sh",
+                "recent_edits.log",
+            ),
+            (".claude/hooks/infigraph-session-save.sh", "save_session"),
+            (".claude/hooks/infigraph-session-reset.sh", "save_session"),
+            (
+                ".claude/hooks/infigraph-session-start.sh",
+                "inject_session_summary",
+            ),
+            (
+                ".claude/hooks/infigraph-session-end-save.sh",
+                "unsaved-transcript",
+            ),
+            (
+                ".claude/hooks/infigraph-clear-suggest.sh",
+                "save session and type",
+            ),
+            (
+                ".claude/hooks/infigraph-clear-guard.sh",
+                "Session not saved",
+            ),
+            (
+                ".claude/hooks/infigraph-test-context-sentinel.sh",
+                "generate_test_context",
+            ),
+            (
+                ".claude/hooks/infigraph-search-fallback-sentinel.sh",
+                "search-fallback-allowed",
+            ),
+        ] {
+            let artifact = artifacts
+                .iter()
+                .find(|a| a.target_relative_path.as_deref() == Some(relative))
+                .unwrap_or_else(|| panic!("{relative} should be discovered"));
+            assert_eq!(artifact.strategy, Strategy::Overwrite);
+            apply_resolved_artifact(artifact, home_dir.path(), mcp_path).unwrap();
+            let content = std::fs::read_to_string(home_dir.path().join(relative)).unwrap();
+            assert!(
+                content.contains(expected_substring),
+                "{relative} should contain {expected_substring:?}"
+            );
+        }
+    }
 }
