@@ -11,7 +11,8 @@ pub(crate) struct IntegrationManifest {
 
 #[derive(Debug, Clone, Deserialize)]
 pub(crate) struct ArtifactEntry {
-    pub path: String,
+    #[serde(default)]
+    pub path: Option<String>,
     pub strategy: String,
     #[serde(default)]
     pub start: Option<String>,
@@ -49,7 +50,7 @@ content_file = "../shared/agents.md"
         assert_eq!(manifest.label.as_deref(), Some("Claude Code"));
         assert_eq!(manifest.artifacts.len(), 1);
         let a = &manifest.artifacts[0];
-        assert_eq!(a.path, ".claude/CLAUDE.md");
+        assert_eq!(a.path.as_deref(), Some(".claude/CLAUDE.md"));
         assert_eq!(a.strategy, "marker_delimited");
         assert_eq!(
             a.start.as_deref(),
@@ -89,7 +90,6 @@ content_file = "../shared/skills/infigraph-reindex/SKILL.md"
     fn parses_resolver_field() {
         let toml = r#"
 [[artifact]]
-path = "unused-for-resolver-based-artifacts"
 strategy = "json_key_path"
 key_path = ["context_servers", "infigraph"]
 resolver = ["./resolve-zed-path.sh"]
@@ -99,6 +99,7 @@ resolver = ["./resolve-zed-path.sh"]
             manifest.artifacts[0].resolver,
             Some(vec!["./resolve-zed-path.sh".to_string()])
         );
+        assert!(manifest.artifacts[0].path.is_none());
     }
 
     #[test]
@@ -108,12 +109,18 @@ resolver = ["./resolve-zed-path.sh"]
     }
 
     #[test]
-    fn rejects_artifact_missing_required_path() {
+    fn resolver_only_entry_with_no_path_parses_successfully() {
         let toml = r#"
 [[artifact]]
-strategy = "overwrite"
+strategy = "json_key_path"
+key_path = ["context_servers", "infigraph"]
+resolver = ["./resolve-zed-path.sh"]
 "#;
-        let result = parse_manifest(toml);
-        assert!(result.is_err(), "path is required, should fail to parse");
+        let manifest = parse_manifest(toml).expect("resolver-only entries have no static path");
+        assert!(manifest.artifacts[0].path.is_none());
+        assert_eq!(
+            manifest.artifacts[0].resolver,
+            Some(vec!["./resolve-zed-path.sh".to_string()])
+        );
     }
 }

@@ -87,6 +87,64 @@ pub(crate) fn run_resolver(
     })
 }
 
+/// Builds the actual command to invoke a resolver script, interpreter-aware
+/// by extension rather than relying on shebang-based direct execution (which
+/// only works on Unix). `.py` scripts are launched via an explicit Python
+/// interpreter on every platform; anything else falls back to direct
+/// execution, which remains correct on Unix (and is a clear, immediate
+/// spawn failure on Windows rather than a silent wrong-path resolver run --
+/// this design bundles only `.py` resolvers, so that fallback path isn't
+/// expected to be exercised today).
+fn resolver_invocation(script_path: &Path, script_filename: &str) -> Vec<String> {
+    if Path::new(script_filename)
+        .extension()
+        .and_then(|e| e.to_str())
+        == Some("py")
+    {
+        let python = if cfg!(windows) { "python" } else { "python3" };
+        vec![
+            python.to_string(),
+            script_path.to_string_lossy().to_string(),
+        ]
+    } else {
+        vec![format!("./{script_filename}")]
+    }
+}
+
+/// Writes a bundled/user-override resolver script's bytes to a temp file,
+/// makes it executable (Unix only -- irrelevant for an explicitly
+/// interpreter-invoked script, but harmless), spawns it via `run_resolver`,
+/// and cleans up afterward. Needed because bundled content is embedded bytes
+/// in the binary, not a real file on disk -- `run_resolver` alone can only
+/// spawn a command that already exists at some real `cwd`.
+pub(crate) fn run_resolver_from_script(
+    script_bytes: &[u8],
+    script_filename: &str,
+    extra_args: &[String],
+    mcp_path: &str,
+    home: &Path,
+) -> Result<ResolverOutput> {
+    let tmp = tempfile::tempdir().context("failed to create temp directory for resolver script")?;
+    let script_path = tmp.path().join(script_filename);
+    std::fs::write(&script_path, script_bytes).with_context(|| {
+        format!(
+            "failed to write resolver script to {}",
+            script_path.display()
+        )
+    })?;
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(&script_path, std::fs::Permissions::from_mode(0o755))
+            .with_context(|| format!("failed to make {} executable", script_path.display()))?;
+    }
+
+    let mut resolver_cmd = resolver_invocation(&script_path, script_filename);
+    resolver_cmd.extend(extra_args.iter().cloned());
+
+    run_resolver(&resolver_cmd, tmp.path(), mcp_path, home)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -225,6 +283,51 @@ mod tests {
                 assert!(data.path.contains("\"home\":\"/home/x\""));
                 assert!(data.path.contains("\"os\":"));
             }
+            other => panic!("expected Ok, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn run_resolver_from_script_materializes_bundled_bytes_and_executes() {
+        let script = b"#!/usr/bin/env bash\ncat <<'EOF'\n{\"status\":\"ok\",\"data\":{\"path\":\"/resolved/settings.json\"}}\nEOF\n";
+
+        let output = run_resolver_from_script(
+            script,
+            "resolve-zed-path.sh",
+            &[],
+            "/bin/infigraph-mcp",
+            std::path::Path::new("/home/x"),
+        )
+        .unwrap();
+
+        match output {
+            ResolverOutput::Ok { data } => assert_eq!(data.path, "/resolved/settings.json"),
+            other => panic!("expected Ok, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn run_resolver_from_script_invokes_python_scripts_via_explicit_interpreter() {
+        // Regression test for the Windows resolver bug: a .py resolver must
+        // never be spawned via shebang-based direct execution (Windows has
+        // no such mechanism) -- it must always go through an explicit
+        // python/python3 interpreter invocation, proven here by using a
+        // script with NO shebang line at all (so this test would fail on
+        // every platform, not just Windows, if the fix ever regressed back
+        // to direct execution).
+        let script = b"import json, sys\nprint(json.dumps({'status': 'ok', 'data': {'path': '/resolved/from-python.json'}}))\n";
+
+        let output = run_resolver_from_script(
+            script,
+            "resolve-example.py",
+            &[],
+            "/bin/infigraph-mcp",
+            std::path::Path::new("/home/x"),
+        )
+        .unwrap();
+
+        match output {
+            ResolverOutput::Ok { data } => assert_eq!(data.path, "/resolved/from-python.json"),
             other => panic!("expected Ok, got {other:?}"),
         }
     }

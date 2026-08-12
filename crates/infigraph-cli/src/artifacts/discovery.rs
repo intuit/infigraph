@@ -10,9 +10,21 @@ use super::strategy::Strategy;
 use super::template::{substitute_mcp_path, TemplateFormat};
 
 #[derive(Debug, Clone, PartialEq)]
+pub(crate) struct ResolverSpec {
+    /// The script's normalized path within the bundled/user-override
+    /// registry, e.g. "zed/resolve-zed-path.sh" -- kept for error messages.
+    pub script_relative_path: String,
+    pub script_bytes: Vec<u8>,
+    /// Just the filename (e.g. "resolve-zed-path.sh"), used when writing the
+    /// script to a temp directory before spawning it.
+    pub script_filename: String,
+    pub extra_args: Vec<String>,
+}
+
+#[derive(Debug, Clone, PartialEq)]
 pub(crate) struct ResolvedArtifact {
     pub integration_label: String,
-    pub target_relative_path: String,
+    pub target_relative_path: Option<String>,
     pub strategy: Strategy,
     /// Fully resolved (template-substituted) content, ready to hand to the
     /// matching `strategy::apply_*` function. `None` only for resolver-driven
@@ -22,10 +34,7 @@ pub(crate) struct ResolvedArtifact {
     pub start: Option<String>,
     pub end: Option<String>,
     pub key_path: Option<Vec<String>>,
-    /// `(resolver_command, integration_directory)` -- the directory a
-    /// relative resolver command like `./resolve-zed-path.sh` should be
-    /// spawned from.
-    pub resolver: Option<(Vec<String>, PathBuf)>,
+    pub resolver: Option<ResolverSpec>,
     pub step: InstallStep,
 }
 
@@ -110,6 +119,14 @@ fn walk_files(root: &Path) -> Result<Vec<PathBuf>> {
     Ok(out)
 }
 
+fn template_format_for_strategy(strategy: Strategy) -> Option<TemplateFormat> {
+    match strategy {
+        Strategy::JsonDeepMerge | Strategy::JsonKeyPath => Some(TemplateFormat::Json),
+        Strategy::TomlSection => Some(TemplateFormat::Toml),
+        Strategy::Overwrite | Strategy::MarkerDelimited => None,
+    }
+}
+
 fn resolve_content_file(
     files: &BTreeMap<String, Vec<u8>>,
     integration_dir: &str,
@@ -174,9 +191,44 @@ pub(crate) fn discover_artifacts(
             .unwrap_or_else(|| integration_dir.to_string());
 
         for entry in &manifest.artifacts {
-            let strategy = Strategy::parse(&entry.strategy).with_context(|| {
-                format!("in manifest {relative_path}, artifact \"{}\"", entry.path)
-            })?;
+            let strategy = Strategy::parse(&entry.strategy)
+                .with_context(|| format!("in manifest {relative_path}, artifact declaration"))?;
+
+            anyhow::ensure!(
+                entry.path.is_some() || entry.resolver.is_some(),
+                "in manifest {relative_path}: artifact must declare either \"path\" or \"resolver\""
+            );
+
+            let resolver_spec = match &entry.resolver {
+                Some(resolver_cmd) => {
+                    anyhow::ensure!(
+                        !resolver_cmd.is_empty(),
+                        "in manifest {relative_path}: resolver command must not be empty"
+                    );
+                    let script_arg = &resolver_cmd[0];
+                    let script_relative = script_arg.strip_prefix("./").unwrap_or(script_arg);
+                    let combined = format!("{integration_dir}/{script_relative}");
+                    let normalized = normalize_relative_path(&combined);
+                    let script_bytes = files.get(&normalized).cloned().with_context(|| {
+                        format!(
+                            "resolver script \"{script_arg}\" (resolved to \"{normalized}\") not found"
+                        )
+                    })?;
+                    manifest_claimed.insert(normalized.clone());
+                    let script_filename = Path::new(&normalized)
+                        .file_name()
+                        .expect("resolver script path must have a filename")
+                        .to_string_lossy()
+                        .to_string();
+                    Some(ResolverSpec {
+                        script_relative_path: normalized,
+                        script_bytes,
+                        script_filename,
+                        extra_args: resolver_cmd[1..].to_vec(),
+                    })
+                }
+                None => None,
+            };
 
             let content = match &entry.content_file {
                 Some(content_file) => {
@@ -187,13 +239,25 @@ pub(crate) fn discover_artifacts(
                     let text = String::from_utf8(raw).with_context(|| {
                         format!("content_file \"{content_file}\" is not valid UTF-8")
                     })?;
-                    let substituted = match template_format_for(&entry.path) {
+                    // Format is derived from the artifact's *strategy*, not its
+                    // (possibly absent) path -- a resolver-only artifact like
+                    // VS Code's has no static path but still needs a JSON
+                    // template substitution for its local content_file.
+                    let substituted = match template_format_for_strategy(strategy) {
                         Some(format) => substitute_mcp_path(&text, mcp_path, format),
                         None => text,
                     };
                     Some(substituted.into_bytes())
                 }
                 None => None,
+            };
+
+            let step = match &entry.path {
+                Some(path) => InstallStep::classify(path, strategy),
+                // Both current resolver-driven artifacts (VS Code, Zed) are
+                // MCP registrations; revisit if a future resolver-driven
+                // artifact is ever a hook or doc/rules entry instead.
+                None => InstallStep::McpRegistration,
             };
 
             artifacts.push(ResolvedArtifact {
@@ -204,11 +268,8 @@ pub(crate) fn discover_artifacts(
                 start: entry.start.clone(),
                 end: entry.end.clone(),
                 key_path: entry.key_path.clone(),
-                resolver: entry
-                    .resolver
-                    .clone()
-                    .map(|cmd| (cmd, PathBuf::from(integration_dir))),
-                step: InstallStep::classify(&entry.path, strategy),
+                resolver: resolver_spec,
+                step,
             });
         }
     }
@@ -260,7 +321,7 @@ pub(crate) fn discover_artifacts(
         let target_relative_path = strip_integration_prefix(relative_path, integration_dir);
         artifacts.push(ResolvedArtifact {
             integration_label: integration_dir.to_string(),
-            target_relative_path,
+            target_relative_path: Some(target_relative_path),
             strategy,
             content: Some(text_for_template),
             start: None,
@@ -297,7 +358,8 @@ mod tests {
         assert_eq!(artifacts.len(), 1);
         let a = &artifacts[0];
         assert_eq!(
-            a.target_relative_path, ".claude.json",
+            a.target_relative_path.as_deref(),
+            Some(".claude.json"),
             "the leading \"claude-code/\" integration-directory segment must be stripped -- \
              the bundled subtree already mirrors the real path below $HOME"
         );
@@ -353,7 +415,10 @@ content_file = "mcp-section.toml"
         assert_eq!(artifacts.len(), 1);
         let a = &artifacts[0];
         assert_eq!(a.integration_label, "Codex");
-        assert_eq!(a.target_relative_path, ".codex/config.toml");
+        assert_eq!(
+            a.target_relative_path.as_deref(),
+            Some(".codex/config.toml")
+        );
         assert_eq!(a.strategy, Strategy::TomlSection);
         assert_eq!(
             a.key_path,
@@ -428,7 +493,7 @@ content_file = "../shared/agents.md"
         assert_eq!(artifacts.len(), 2);
         assert!(artifacts
             .iter()
-            .any(|a| a.target_relative_path == "hooks/new-hook.sh"));
+            .any(|a| a.target_relative_path.as_deref() == Some("hooks/new-hook.sh")));
     }
 
     #[test]
@@ -444,7 +509,10 @@ content_file = "../shared/agents.md"
         let artifacts = discover_artifacts(bundled, user_dir.path(), "/bin/infigraph-mcp").unwrap();
 
         assert_eq!(artifacts.len(), 1);
-        assert_eq!(artifacts[0].target_relative_path, ".custom/mcp.json");
+        assert_eq!(
+            artifacts[0].target_relative_path.as_deref(),
+            Some(".custom/mcp.json")
+        );
     }
 
     #[test]
@@ -493,14 +561,66 @@ content_file = "../shared/agents.md"
 
         let hook = artifacts
             .iter()
-            .find(|a| a.target_relative_path == "hooks/enforce.sh")
+            .find(|a| a.target_relative_path.as_deref() == Some("hooks/enforce.sh"))
             .unwrap();
         assert_eq!(hook.step, super::super::step::InstallStep::Hooks);
 
         let mcp = artifacts
             .iter()
-            .find(|a| a.target_relative_path == ".claude.json")
+            .find(|a| a.target_relative_path.as_deref() == Some(".claude.json"))
             .unwrap();
         assert_eq!(mcp.step, super::super::step::InstallStep::McpRegistration);
+    }
+
+    #[test]
+    fn resolver_only_manifest_entry_has_no_static_target_path() {
+        let bundled: &[(&str, &[u8])] = &[
+            (
+                "zed/config.toml",
+                br#"label = "Zed"
+
+[[artifact]]
+strategy = "json_key_path"
+key_path = ["context_servers", "infigraph"]
+resolver = ["./resolve-zed-path.sh"]
+"#,
+            ),
+            (
+                "zed/resolve-zed-path.sh",
+                b"#!/usr/bin/env bash\necho resolver\n",
+            ),
+        ];
+        let user_dir = tempfile::tempdir().unwrap();
+
+        let artifacts = discover_artifacts(bundled, user_dir.path(), "/bin/infigraph-mcp").unwrap();
+
+        assert_eq!(artifacts.len(), 1);
+        let a = &artifacts[0];
+        assert!(a.target_relative_path.is_none());
+        assert!(a.content.is_none());
+        let resolver = a.resolver.as_ref().expect("should have a resolver spec");
+        assert_eq!(resolver.script_filename, "resolve-zed-path.sh");
+        assert_eq!(
+            resolver.script_bytes,
+            b"#!/usr/bin/env bash\necho resolver\n"
+        );
+        assert!(resolver.extra_args.is_empty());
+        assert_eq!(a.step, super::super::step::InstallStep::McpRegistration);
+    }
+
+    #[test]
+    fn manifest_entry_missing_both_path_and_resolver_is_an_error() {
+        let bundled: &[(&str, &[u8])] = &[(
+            "broken/config.toml",
+            br#"[[artifact]]
+strategy = "overwrite"
+"#,
+        )];
+        let user_dir = tempfile::tempdir().unwrap();
+        let result = discover_artifacts(bundled, user_dir.path(), "/bin/infigraph-mcp");
+        assert!(
+            result.is_err(),
+            "an artifact with neither path nor resolver is a manifest bug"
+        );
     }
 }

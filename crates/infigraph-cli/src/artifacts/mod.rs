@@ -10,6 +10,8 @@
 //! non-test callers make it unnecessary.
 #![allow(dead_code, unused_imports)]
 
+use anyhow::Context;
+
 mod convention;
 mod discovery;
 mod manifest;
@@ -27,30 +29,61 @@ include!(concat!(env!("OUT_DIR"), "/bundled_integrations.rs"));
 pub(crate) fn apply_resolved_artifact(
     artifact: &ResolvedArtifact,
     home: &std::path::Path,
+    mcp_path: &str,
 ) -> anyhow::Result<ApplyOutcome> {
-    let target_path = home.join(&artifact.target_relative_path);
+    let (target_path, resolved_content) = match &artifact.resolver {
+        Some(spec) => {
+            let output = resolver::run_resolver_from_script(
+                &spec.script_bytes,
+                &spec.script_filename,
+                &spec.extra_args,
+                mcp_path,
+                home,
+            )
+            .with_context(|| format!("running resolver {}", spec.script_relative_path))?;
+            match output {
+                resolver::ResolverOutput::Ok { data } => {
+                    let content = match data.content {
+                        Some(v) => Some(serde_json::to_vec(&v)?),
+                        None => artifact.content.clone(),
+                    };
+                    (std::path::PathBuf::from(data.path), content)
+                }
+                resolver::ResolverOutput::Skip { message } => {
+                    return Ok(ApplyOutcome::Skipped {
+                        reason: format!("resolver reported skip: {message}"),
+                        manual_snippet: String::new(),
+                    });
+                }
+                resolver::ResolverOutput::Error { message } => {
+                    anyhow::bail!("resolver {} failed: {message}", spec.script_relative_path);
+                }
+            }
+        }
+        None => {
+            let relative = artifact.target_relative_path.as_ref().ok_or_else(|| {
+                anyhow::anyhow!("artifact has neither a static path nor a resolver")
+            })?;
+            (home.join(relative), artifact.content.clone())
+        }
+    };
+
     match artifact.strategy {
         Strategy::JsonDeepMerge => {
-            let content = artifact
-                .content
-                .as_ref()
+            let content = resolved_content
                 .ok_or_else(|| anyhow::anyhow!("json_deep_merge artifact has no content"))?;
-            let text = std::str::from_utf8(content)?;
+            let text = std::str::from_utf8(&content)?;
             strategy::apply_json_deep_merge(&target_path, text)
         }
         Strategy::Overwrite => {
-            let content = artifact
-                .content
-                .as_ref()
+            let content = resolved_content
                 .ok_or_else(|| anyhow::anyhow!("overwrite artifact has no content"))?;
-            strategy::apply_overwrite(&target_path, content)
+            strategy::apply_overwrite(&target_path, &content)
         }
         Strategy::MarkerDelimited => {
-            let content = artifact
-                .content
-                .as_ref()
+            let content = resolved_content
                 .ok_or_else(|| anyhow::anyhow!("marker_delimited artifact has no content"))?;
-            let text = std::str::from_utf8(content)?;
+            let text = std::str::from_utf8(&content)?;
             let start = artifact
                 .start
                 .as_deref()
@@ -62,11 +95,9 @@ pub(crate) fn apply_resolved_artifact(
             strategy::apply_marker_delimited(&target_path, start, end, text)
         }
         Strategy::TomlSection => {
-            let content = artifact
-                .content
-                .as_ref()
+            let content = resolved_content
                 .ok_or_else(|| anyhow::anyhow!("toml_section artifact has no content"))?;
-            let text = std::str::from_utf8(content)?;
+            let text = std::str::from_utf8(&content)?;
             let key_path = artifact
                 .key_path
                 .as_deref()
@@ -74,11 +105,9 @@ pub(crate) fn apply_resolved_artifact(
             strategy::apply_toml_section(&target_path, key_path, text)
         }
         Strategy::JsonKeyPath => {
-            let content = artifact
-                .content
-                .as_ref()
+            let content = resolved_content
                 .ok_or_else(|| anyhow::anyhow!("json_key_path artifact has no content"))?;
-            let text = std::str::from_utf8(content)?;
+            let text = std::str::from_utf8(&content)?;
             let key_path = artifact
                 .key_path
                 .as_deref()
@@ -91,8 +120,34 @@ pub(crate) fn apply_resolved_artifact(
 pub(crate) fn remove_resolved_artifact(
     artifact: &ResolvedArtifact,
     home: &std::path::Path,
+    mcp_path: &str,
 ) -> anyhow::Result<bool> {
-    let target_path = home.join(&artifact.target_relative_path);
+    let target_path = match &artifact.resolver {
+        Some(spec) => {
+            let output = resolver::run_resolver_from_script(
+                &spec.script_bytes,
+                &spec.script_filename,
+                &spec.extra_args,
+                mcp_path,
+                home,
+            )
+            .with_context(|| format!("running resolver {}", spec.script_relative_path))?;
+            match output {
+                resolver::ResolverOutput::Ok { data } => std::path::PathBuf::from(data.path),
+                resolver::ResolverOutput::Skip { .. } => return Ok(false),
+                resolver::ResolverOutput::Error { message } => {
+                    anyhow::bail!("resolver {} failed: {message}", spec.script_relative_path);
+                }
+            }
+        }
+        None => {
+            let relative = artifact.target_relative_path.as_ref().ok_or_else(|| {
+                anyhow::anyhow!("artifact has neither a static path nor a resolver")
+            })?;
+            home.join(relative)
+        }
+    };
+
     match artifact.strategy {
         Strategy::JsonDeepMerge => {
             let content = artifact
@@ -188,7 +243,7 @@ content_file = "mcp-section.toml"
         assert_eq!(artifacts.len(), 4);
 
         for artifact in &artifacts {
-            let outcome = apply_resolved_artifact(artifact, home).unwrap();
+            let outcome = apply_resolved_artifact(artifact, home, mcp_path).unwrap();
             assert!(
                 matches!(outcome, ApplyOutcome::Written),
                 "{:?} failed to apply",
@@ -219,7 +274,7 @@ content_file = "mcp-section.toml"
         // Reapply is idempotent (no duplication) -- exercises the whole
         // pipeline's self-healing property, not just one strategy in isolation.
         for artifact in &artifacts {
-            apply_resolved_artifact(artifact, home).unwrap();
+            apply_resolved_artifact(artifact, home, mcp_path).unwrap();
         }
         let claude_json_again: serde_json::Value =
             serde_json::from_str(&std::fs::read_to_string(home.join(".claude.json")).unwrap())
@@ -234,7 +289,7 @@ content_file = "mcp-section.toml"
 
         // Uninstall every artifact, verify each is actually gone.
         for artifact in &artifacts {
-            let removed = remove_resolved_artifact(artifact, home).unwrap();
+            let removed = remove_resolved_artifact(artifact, home, mcp_path).unwrap();
             assert!(
                 removed,
                 "{:?} was not removed",
@@ -275,12 +330,61 @@ content_file = "mcp-section.toml"
 
         let artifacts = discover_artifacts(bundled, user_dir.path(), mcp_path).unwrap();
         for artifact in &artifacts {
-            apply_resolved_artifact(artifact, home_dir.path()).unwrap();
+            apply_resolved_artifact(artifact, home_dir.path(), mcp_path).unwrap();
         }
 
         let content =
             std::fs::read_to_string(home_dir.path().join(".claude/hooks/infigraph-enforce.sh"))
                 .unwrap();
         assert!(content.contains("echo overridden"));
+    }
+
+    #[test]
+    fn resolver_driven_artifact_applies_to_resolver_computed_path() {
+        let bundled: &[(&str, &[u8])] = &[
+            (
+                "zed/config.toml",
+                br#"label = "Zed"
+
+[[artifact]]
+strategy = "json_key_path"
+key_path = ["context_servers", "infigraph"]
+resolver = ["./resolve-zed-path.sh"]
+"#,
+            ),
+            (
+                "zed/resolve-zed-path.sh",
+                // Real resolvers (VS Code, Zed) compute a fully absolute
+                // destination path themselves -- apply_resolved_artifact uses
+                // `data.path` directly with no `home`-joining of its own.
+                // This fixture mirrors that by reading "home" out of the
+                // ResolverInput JSON on stdin and building an absolute path,
+                // instead of returning a bare relative filename.
+                b"#!/usr/bin/env bash\npython3 -c \"\nimport json, sys\nd = json.load(sys.stdin)\nout = {'status': 'ok', 'data': {'path': d['home'] + '/zed-settings.json', 'content': {'command': d['mcp_path'], 'args': ['--mcp'], 'env': {}}}}\nprint(json.dumps(out))\n\"\n",
+            ),
+        ];
+        let user_dir = tempfile::tempdir().unwrap();
+        let home_dir = tempfile::tempdir().unwrap();
+        let mcp_path = "/opt/infigraph/bin/infigraph-mcp";
+
+        let artifacts = discover_artifacts(bundled, user_dir.path(), mcp_path).unwrap();
+        assert_eq!(artifacts.len(), 1);
+
+        let outcome = apply_resolved_artifact(&artifacts[0], home_dir.path(), mcp_path).unwrap();
+        assert!(matches!(outcome, ApplyOutcome::Written));
+
+        let written: serde_json::Value = serde_json::from_str(
+            &std::fs::read_to_string(home_dir.path().join("zed-settings.json")).unwrap(),
+        )
+        .unwrap();
+        assert_eq!(written["context_servers"]["infigraph"]["command"], mcp_path);
+
+        let removed = remove_resolved_artifact(&artifacts[0], home_dir.path(), mcp_path).unwrap();
+        assert!(removed);
+        let after: serde_json::Value = serde_json::from_str(
+            &std::fs::read_to_string(home_dir.path().join("zed-settings.json")).unwrap(),
+        )
+        .unwrap();
+        assert!(after["context_servers"]["infigraph"].is_null());
     }
 }
