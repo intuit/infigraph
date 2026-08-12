@@ -29,6 +29,14 @@
 (preproc_include
   path: (_) @import.module)
 
-; Base class specifier (inheritance)
-(base_class_clause
-  (type_identifier) @inherit.parent)
+; Base class specifier (inheritance): class Foo : public Bar
+(class_specifier
+  name: (type_identifier) @inherit.child
+  (base_class_clause
+    (type_identifier) @inherit.parent))
+
+; Base class specifier (inheritance): struct Foo : public Bar
+(struct_specifier
+  name: (type_identifier) @inherit.child
+  (base_class_clause
+    (type_identifier) @inherit.parent))
