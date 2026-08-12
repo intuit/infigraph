@@ -2,6 +2,30 @@ use std::path::Path;
 
 use anyhow::{Context, Result};
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum Strategy {
+    JsonDeepMerge,
+    Overwrite,
+    MarkerDelimited,
+    TomlSection,
+    JsonKeyPath,
+}
+
+impl Strategy {
+    pub(crate) fn parse(s: &str) -> anyhow::Result<Strategy> {
+        match s {
+            "json_deep_merge" => Ok(Strategy::JsonDeepMerge),
+            "overwrite" => Ok(Strategy::Overwrite),
+            "marker_delimited" => Ok(Strategy::MarkerDelimited),
+            "toml_section" => Ok(Strategy::TomlSection),
+            "json_key_path" => Ok(Strategy::JsonKeyPath),
+            other => anyhow::bail!(
+                "unknown artifact strategy \"{other}\" (expected one of: json_deep_merge, overwrite, marker_delimited, toml_section, json_key_path)"
+            ),
+        }
+    }
+}
+
 #[derive(Debug, Clone, PartialEq)]
 pub(crate) enum ApplyOutcome {
     Written,

@@ -8,7 +8,7 @@
 //! `cmd_install`/`cmd_uninstall` (Tasks 18-19) call into the module from
 //! `install.rs`. Suppressed here rather than per-item; remove once real
 //! non-test callers make it unnecessary.
-#![allow(dead_code)]
+#![allow(dead_code, unused_imports)]
 
 mod convention;
 mod discovery;
@@ -17,3 +17,8 @@ mod resolver;
 mod step;
 mod strategy;
 mod template;
+
+pub(crate) use discovery::{discover_artifacts, ResolvedArtifact};
+pub(crate) use strategy::{ApplyOutcome, Strategy};
+
+include!(concat!(env!("OUT_DIR"), "/bundled_integrations.rs"));
