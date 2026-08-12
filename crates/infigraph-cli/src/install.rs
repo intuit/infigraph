@@ -4,6 +4,11 @@ use anyhow::{Context, Result};
 
 use crate::config_targets::{self, ConfigFormat, AGENT_TARGETS};
 
+pub(crate) struct InstallReport {
+    pub written: Vec<String>,
+    pub skipped: Vec<(String, String)>, // (path, reason)
+}
+
 /// Locate the infigraph-mcp binary: first check the same directory as the running
 /// binary, then fall back to searching PATH.
 pub(crate) fn find_mcp_binary() -> Result<PathBuf> {
@@ -41,66 +46,128 @@ pub(crate) fn find_mcp_binary() -> Result<PathBuf> {
 
 pub(crate) fn cmd_install() -> Result<()> {
     let mcp_path = find_mcp_binary()?;
-    let mcp_path_str = mcp_path.to_string_lossy().to_string();
-
-    println!("Found infigraph-mcp at: {}", mcp_path_str);
+    println!("Found infigraph-mcp at: {}", mcp_path.to_string_lossy());
 
     let home = dirs::home_dir().context("Could not determine home directory")?;
-    let mut configured = Vec::new();
 
-    for target in AGENT_TARGETS {
-        let dir = home.join(target.dir_name);
+    let report = run_install(&mcp_path, &home)?;
 
-        std::fs::create_dir_all(&dir)
-            .with_context(|| format!("Failed to create directory {}", dir.display()))?;
-
-        let config_path = if target.config_file == "CLAUDE_CODE_SPECIAL" {
-            home.join(".claude.json")
-        } else {
-            dir.join(target.config_file)
-        };
-
-        match target.format {
-            ConfigFormat::Json => config_targets::install_json_target(&config_path, &mcp_path_str)?,
-            ConfigFormat::Toml => config_targets::install_toml_target(&config_path, &mcp_path_str)?,
-        }
-
-        configured.push(target.label);
-        println!("  Configured {} ({})", target.label, config_path.display());
-    }
-
-    if configured.is_empty() {
+    if report.written.is_empty() {
         println!("No agents were configured.");
     } else {
-        print_capabilities_summary(&configured);
+        for path in &report.written {
+            println!("  Configured: {}", home.join(path).display());
+        }
+        let configured_labels = configured_integration_labels(&mcp_path, &home, &report)?;
+        print_capabilities_summary(&configured_labels);
     }
 
-    // Write primary search instructions to ~/.claude/CLAUDE.md
-    write_claude_md_instructions(&home)?;
+    for (path, reason) in &report.skipped {
+        eprintln!("  Skipped {}: {}", home.join(path).display(), reason);
+    }
 
-    // Write cursor/windsurf rules
-    write_editor_rules(&home)?;
-
-    // Write /infigraph-reindex command to ~/.claude/commands/
-    write_reindex_command(&home)?;
-
-    // Install hooks and Claude Code allowlist
-    crate::hooks::install_enforcement_hook(&home)?;
-    crate::hooks::install_edit_tracker_hook(&home)?;
-    crate::hooks::install_session_save_hook(&home)?;
-    crate::hooks::install_clear_suggest_hook(&home)?;
-    crate::hooks::install_clear_guard_hook(&home)?;
-    crate::hooks::install_session_end_hook(&home)?;
-    crate::hooks::install_test_context_sentinel_hook(&home)?;
-    crate::hooks::install_search_fallback_sentinel_hook(&home)?;
-    crate::hooks::install_claude_allowlist(&home)?;
-
-    // Copy model files to ~/.infigraph/models/
+    // Copy model files to ~/.infigraph/models/ -- unchanged, not artifact-based.
     install_models(&mcp_path, &home)?;
 
     Ok(())
 }
 
+/// The actual artifact-engine install logic, factored out from `cmd_install`
+/// so it's testable against a fake `$HOME` without touching the real one.
+pub(crate) fn run_install(mcp_path: &Path, home: &Path) -> Result<InstallReport> {
+    let mcp_path_str = mcp_path.to_string_lossy().to_string();
+    let user_override_dir = home.join(".infigraph").join("integrations");
+
+    let artifacts = crate::artifacts::discover_artifacts(
+        crate::artifacts::BUNDLED_INTEGRATIONS,
+        &user_override_dir,
+        &mcp_path_str,
+    )?;
+
+    let mut report = InstallReport {
+        written: Vec::new(),
+        skipped: Vec::new(),
+    };
+
+    for artifact in &artifacts {
+        let outcome = crate::artifacts::apply_resolved_artifact(artifact, home, &mcp_path_str)
+            .with_context(|| {
+                format!(
+                    "applying {} artifact for {}",
+                    artifact.integration_label,
+                    artifact
+                        .target_relative_path
+                        .as_deref()
+                        .unwrap_or("(resolver-determined path)")
+                )
+            })?;
+        let label = artifact
+            .target_relative_path
+            .clone()
+            .unwrap_or_else(|| format!("{} (resolver-determined)", artifact.integration_label));
+        match outcome {
+            crate::artifacts::ApplyOutcome::Written => report.written.push(label),
+            crate::artifacts::ApplyOutcome::Skipped { reason, .. } => {
+                report.skipped.push((label, reason))
+            }
+        }
+    }
+
+    write_claude_allowlist_and_hooks_extras(home)?;
+
+    Ok(report)
+}
+
+/// Everything the artifact engine doesn't cover: the Claude Code permission
+/// allowlist (a grant list, not "content deployed to a path" -- see the
+/// design spec's "stays outside the artifact mechanism").
+fn write_claude_allowlist_and_hooks_extras(home: &Path) -> Result<()> {
+    crate::hooks::install_claude_allowlist(home)?;
+    Ok(())
+}
+
+/// Derives the human-readable "Configured for: X, Y, Z" summary from which
+/// integrations actually had at least one artifact written -- replaces the
+/// old per-`AgentTarget` `configured.push(target.label)` bookkeeping now that
+/// artifacts (not agent targets) are the unit of installation.
+fn configured_integration_labels(
+    mcp_path: &Path,
+    home: &Path,
+    report: &InstallReport,
+) -> Result<Vec<String>> {
+    let mcp_path_str = mcp_path.to_string_lossy().to_string();
+    let user_override_dir = home.join(".infigraph").join("integrations");
+    let artifacts = crate::artifacts::discover_artifacts(
+        crate::artifacts::BUNDLED_INTEGRATIONS,
+        &user_override_dir,
+        &mcp_path_str,
+    )?;
+
+    let written_set: std::collections::HashSet<&str> =
+        report.written.iter().map(|s| s.as_str()).collect();
+
+    let mut labels: Vec<String> = artifacts
+        .iter()
+        .filter(|a| {
+            let key = a
+                .target_relative_path
+                .as_deref()
+                .map(|p| p.to_string())
+                .unwrap_or_else(|| format!("{} (resolver-determined)", a.integration_label));
+            written_set.contains(key.as_str())
+        })
+        .map(|a| a.integration_label.clone())
+        .collect();
+    labels.sort();
+    labels.dedup();
+    Ok(labels)
+}
+
+// Superseded by the artifact engine (cmd_install/run_install above); no
+// longer called. Deleted outright in Task 20 along with config_targets.rs.
+// Suppressed here rather than deleted early, to keep this task's diff
+// scoped to rewiring cmd_install, not removing the old code path yet.
+#[allow(dead_code)]
 fn write_claude_md_instructions(home: &Path) -> Result<()> {
     let claude_md = home.join(".claude").join("CLAUDE.md");
     let marker = "<!-- infigraph-primary-search -->";
@@ -186,6 +253,8 @@ For tasks requiring a subagent, use **general-purpose** — it has full MCP/infi
 
 // Project-level CLAUDE.md generation moved to infigraph_core::claude_md
 
+// Superseded by the artifact engine; see write_claude_md_instructions above.
+#[allow(dead_code)]
 fn write_editor_rules(home: &Path) -> Result<()> {
     let marker = "<!-- infigraph-primary-search -->";
     let instructions = crate::agent::infigraph_instructions();
@@ -215,6 +284,8 @@ fn write_editor_rules(home: &Path) -> Result<()> {
     Ok(())
 }
 
+// Superseded by the artifact engine; see write_claude_md_instructions above.
+#[allow(dead_code)]
 fn write_reindex_command(home: &Path) -> Result<()> {
     let commands_dir = home.join(".claude").join("commands");
     std::fs::create_dir_all(&commands_dir)?;
@@ -551,7 +622,7 @@ pub(crate) fn self_update(version: &str) -> Result<()> {
     Ok(())
 }
 
-pub(crate) fn print_capabilities_summary(configured: &[&str]) {
+pub(crate) fn print_capabilities_summary(configured: &[String]) {
     let version = env!("CARGO_PKG_VERSION");
     let count = configured.len();
     let agents = configured.join(", ");
@@ -773,4 +844,52 @@ pub(crate) fn cmd_update() -> Result<()> {
     }
 
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn cmd_install_writes_every_convention_based_integration_under_a_fake_home() {
+        let home_dir = tempfile::tempdir().unwrap();
+        let mcp_path = "/opt/infigraph/bin/infigraph-mcp";
+
+        let report = run_install(&std::path::PathBuf::from(mcp_path), home_dir.path()).unwrap();
+
+        assert!(report.written.iter().any(|p| p == ".claude.json"));
+        assert!(report.written.iter().any(|p| p == ".gemini/settings.json"));
+        assert!(report.written.iter().any(|p| p == ".codex/config.toml"));
+        assert!(
+            report.skipped.is_empty(),
+            "nothing should be skipped against an empty $HOME"
+        );
+
+        let claude_json: serde_json::Value = serde_json::from_str(
+            &std::fs::read_to_string(home_dir.path().join(".claude.json")).unwrap(),
+        )
+        .unwrap();
+        assert_eq!(claude_json["mcpServers"]["infigraph"]["command"], mcp_path);
+    }
+
+    #[test]
+    fn cmd_install_is_idempotent() {
+        let home_dir = tempfile::tempdir().unwrap();
+        let mcp_path = "/opt/infigraph/bin/infigraph-mcp";
+
+        run_install(&std::path::PathBuf::from(mcp_path), home_dir.path()).unwrap();
+        run_install(&std::path::PathBuf::from(mcp_path), home_dir.path()).unwrap();
+
+        let claude_json: serde_json::Value = serde_json::from_str(
+            &std::fs::read_to_string(home_dir.path().join(".claude.json")).unwrap(),
+        )
+        .unwrap();
+        assert_eq!(
+            claude_json["mcpServers"]["infigraph"]["args"]
+                .as_array()
+                .unwrap()
+                .len(),
+            1
+        );
+    }
 }

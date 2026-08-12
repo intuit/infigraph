@@ -83,6 +83,11 @@ pub(crate) const AGENT_TARGETS: &[AgentTarget] = &[
     },
 ];
 
+// Superseded by the artifact engine (crates/infigraph-cli/src/install.rs's
+// cmd_install/run_install); no longer called. This whole file is deleted in
+// Task 20, along with uninstall_json_target/uninstall_toml_target once
+// cmd_uninstall is rewired (Task 19).
+#[allow(dead_code)]
 pub(crate) fn install_json_target(config_path: &std::path::Path, mcp_path_str: &str) -> Result<()> {
     let mut config: serde_json::Value = if config_path.is_file() {
         let content = std::fs::read_to_string(config_path)
@@ -109,6 +114,8 @@ pub(crate) fn install_json_target(config_path: &std::path::Path, mcp_path_str: &
     Ok(())
 }
 
+// Superseded by the artifact engine; see install_json_target above.
+#[allow(dead_code)]
 pub(crate) fn install_toml_target(config_path: &std::path::Path, mcp_path_str: &str) -> Result<()> {
     let existing = if config_path.is_file() {
         std::fs::read_to_string(config_path)
