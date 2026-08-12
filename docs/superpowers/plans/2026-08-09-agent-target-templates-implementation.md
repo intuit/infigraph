@@ -16,7 +16,7 @@
 - Every `apply_*` function returns `Result<ApplyOutcome>` (`Written` or `Skipped { reason, manual_snippet }`) — never a bare `Result<()>` — so `cmd_install` (Task 19) can report skips instead of silently swallowing them.
 - Bundled content embedded via `build.rs` must be re-derivable from `crates/infigraph-cli/resources/integrations/` alone — no hand-maintained duplicate list of filenames anywhere else in the crate.
 - Every bundled MCP-registration fragment (`.json` or `.toml`) uses the literal placeholder `{{mcp_path}}` for the `infigraph-mcp` binary path — never a hardcoded path — substituted at discovery/apply time via `template::substitute_mcp_path` (Task 3).
-- Hook scripts (Task 14) are copied byte-for-byte from their current `hooks.rs` string constants — no behavioral changes to any hook's logic in this plan; only *how* they reach `~/.claude/hooks/` changes (bundled file + `overwrite` convention, not a Rust `std::fs::write` call).
+- Hook scripts (Task 14) are copied byte-for-byte from their current `hooks.rs` string constants, with exactly one deliberate exception: `infigraph-enforce.sh` folds in a real grep-piping detection bug fix (caught live this session) that was never fixed in `hooks.rs` on any branch — see Task 14 Step 3 for the exact diff. Every other hook's logic is unchanged; only *how* they reach `~/.claude/hooks/` changes (bundled file + `overwrite` convention, not a Rust `std::fs::write` call).
 - Run `cargo fmt --all` and `cargo clippy --all-targets -- -D warnings` before every commit in this plan (per this repo's CI gate) — fix any warning the new code introduces before moving to the next task.
 - This work is destined for **upstream** (`intuit/infigraph`), not the fork — do not push or open a PR without explicit user approval, regardless of how complete the plan is.
 
@@ -3852,6 +3852,39 @@ Append to the `#[cfg(test)] mod integration_tests { ... }` block in `crates/infi
     }
 
     #[test]
+    fn bundled_enforce_hook_allows_piped_grep_but_still_blocks_bare_grep() {
+        // Regression test for the grep-piping detection bug caught live this
+        // session: a real Bash command filtering another command's output
+        // (`cmd 2>&1 | grep -iE "error"`, explicitly allowed by this repo's
+        // own CLAUDE.md guidance) must NOT be blocked, while a bare/leading
+        // grep call (a real code search) must still be blocked. This checks
+        // the bundled content carries the fix's `cmd_without_piped_grep`
+        // logic rather than the old blanket substring check.
+        let user_dir = tempfile::tempdir().unwrap();
+        let home_dir = tempfile::tempdir().unwrap();
+        let mcp_path = "/opt/infigraph/bin/infigraph-mcp";
+
+        let artifacts = discover_artifacts(BUNDLED_INTEGRATIONS, user_dir.path(), mcp_path).unwrap();
+        let enforce = artifacts
+            .iter()
+            .find(|a| a.target_relative_path.as_deref() == Some(".claude/hooks/infigraph-enforce.sh"))
+            .unwrap();
+        apply_resolved_artifact(enforce, home_dir.path(), mcp_path).unwrap();
+        let content =
+            std::fs::read_to_string(home_dir.path().join(".claude/hooks/infigraph-enforce.sh"))
+                .unwrap();
+        assert!(
+            content.contains("cmd_without_piped_grep"),
+            "enforce.sh must carry the piped-grep exemption, not the old blanket check"
+        );
+        assert!(
+            !content.contains("\\b"),
+            "the sed substitution must not use \\b -- unsupported by macOS's BSD sed, \
+             verified live during this fix (silently no-ops instead of erroring)"
+        );
+    }
+
+    #[test]
     fn bundled_hook_scripts_have_expected_content() {
         let user_dir = tempfile::tempdir().unwrap();
         let home_dir = tempfile::tempdir().unwrap();
@@ -3887,16 +3920,15 @@ Append to the `#[cfg(test)] mod integration_tests { ... }` block in `crates/infi
 
 - [ ] **Step 2: Run the tests to verify they fail**
 
-Run: `cargo test -p infigraph-cli artifacts::integration_tests::bundled_claude -- --nocapture` and `cargo test -p infigraph-cli artifacts::integration_tests::bundled_settings -- --nocapture` and `cargo test -p infigraph-cli artifacts::integration_tests::bundled_hook -- --nocapture`
-Expected: all fail (`.expect`/`.unwrap_or_else` panics) — none of the bundled files exist yet.
+Run: `cargo test -p infigraph-cli artifacts::integration_tests::bundled_claude -- --nocapture`, `cargo test -p infigraph-cli artifacts::integration_tests::bundled_settings -- --nocapture`, `cargo test -p infigraph-cli artifacts::integration_tests::bundled_hook -- --nocapture`, and `cargo test -p infigraph-cli artifacts::integration_tests::bundled_enforce_hook -- --nocapture`
+Expected: all fail (`.expect`/`.unwrap()` panics) — none of the bundled files exist yet.
 
-- [ ] **Step 3: Copy the 10 hook scripts verbatim from `hooks.rs`**
+- [ ] **Step 3: Copy 9 of the 10 hook scripts verbatim from `hooks.rs`; write `infigraph-enforce.sh` with one folded-in bug fix**
 
 Each destination file's content is the named constant's raw-string body from `crates/infigraph-cli/src/hooks.rs` — everything from the line after the constant's `= r#"` (or `= r##"` for the two using `##` delimiters, since their content itself contains a `#`) through the line before the matching closing `"#;`/`"##;`, copied byte-for-byte (no Rust escaping to undo — these are raw strings). Strip only the opening/closing raw-string delimiter lines themselves.
 
 | Destination | Source constant | Source lines (content only, delimiters excluded) |
 |---|---|---|
-| `claude-code/.claude/hooks/infigraph-enforce.sh` | `ENFORCE_HOOK_SCRIPT` | `hooks.rs:4-129` |
 | `claude-code/.claude/hooks/infigraph-session-save.sh` | `SESSION_SAVE_HOOK_SCRIPT` | `hooks.rs:132-196` |
 | `claude-code/.claude/hooks/infigraph-session-reset.sh` | `SESSION_RESET_HOOK_SCRIPT` | `hooks.rs:199-218` |
 | `claude-code/.claude/hooks/infigraph-session-start.sh` | `SESSION_START_HOOK_SCRIPT` | `hooks.rs:221-347` |
@@ -3908,6 +3940,40 @@ Each destination file's content is the named constant's raw-string body from `cr
 | `claude-code/.claude/hooks/infigraph-edit-tracker.sh` | `EDIT_TRACKER_HOOK_SCRIPT` | `hooks.rs:623-648` |
 
 For each row: `Read` the source line range from the current `crates/infigraph-cli/src/hooks.rs` (re-check the exact line numbers first — Tasks 15-21 don't touch `hooks.rs`, but confirm nothing shifted them since this table was written), then `Write` that exact text to the destination path. No behavioral changes — this is a pure copy.
+
+`infigraph-enforce.sh` is the one deliberate exception: `hooks.rs:4-129`'s current `ENFORCE_HOOK_SCRIPT` blocks *any* Bash command containing `grep`/`rg`/etc., including when piping another command's output for filtering (`cmd 2>&1 | grep -iE "error"`) — a real bug caught live this session (a mobile Claude Code session got blocked filtering build output), fixed only in a local, untracked copy of the hook, never in `hooks.rs` on any branch. A pure "verbatim copy" here would carry that bug straight into the bundled default every future install gets. Write `claude-code/.claude/hooks/infigraph-enforce.sh` as `hooks.rs:4-129`'s content with only the `Bash)` case's grep-detection block changed from:
+
+```bash
+    cmd=$(echo "$input" | jq -r '.tool_input.command // empty')
+    if echo "$cmd" | grep -qE '(^|\s|/)(grep|egrep|fgrep|rg|ripgrep|ag|ack)(\s|$)'; then
+      cat <<ENDJSON
+{"hookSpecificOutput":{"hookEventName":"PreToolUse","additionalContext":"BLOCKED: Use mcp__infigraph__search instead of grep/rg. $recovery_hint"}}
+ENDJSON
+      exit 2
+    fi
+```
+
+to:
+
+```bash
+    cmd=$(echo "$input" | jq -r '.tool_input.command // empty')
+    # Only flag grep/rg-family tools when NOT immediately preceded by a pipe --
+    # `cmd 2>&1 | grep -iE "error"` filters another command's output (allowed,
+    # matches this repo's own CLAUDE.md guidance); a bare/leading grep call is
+    # a code search and should go through mcp__infigraph__search instead.
+    # Note: intentionally avoids \b (unsupported by macOS's BSD sed) in favor
+    # of an explicit [[:space:]]/end-of-string bound -- verified against both
+    # GNU and BSD sed during this fix.
+    cmd_without_piped_grep=$(echo "$cmd" | sed -E 's/\|[[:space:]]*(grep|egrep|fgrep|rg|ripgrep|ag|ack)([[:space:]]|$)[^|]*/|/g')
+    if echo "$cmd_without_piped_grep" | grep -qE '(^|\s|/)(grep|egrep|fgrep|rg|ripgrep|ag|ack)(\s|$)'; then
+      cat <<ENDJSON
+{"hookSpecificOutput":{"hookEventName":"PreToolUse","additionalContext":"BLOCKED: Use mcp__infigraph__search instead of grep/rg. $recovery_hint"}}
+ENDJSON
+      exit 2
+    fi
+```
+
+Everything else in the script (the `find -name` check right after, the `Grep`/`Glob`/`Agent`/`Read`/`Write|Edit` cases, the MCP-liveness gate, the sentinel logic) is unchanged from `hooks.rs:4-129`, copied verbatim same as the other 9 scripts.
 
 - [ ] **Step 4: Create `.claude.json`**
 
@@ -4168,7 +4234,7 @@ content_file = "../shared/skills/infigraph-reindex/SKILL.md"
 - [ ] **Step 9: Run the tests to verify they pass**
 
 Run: `cargo test -p infigraph-cli artifacts::integration_tests -- --nocapture`
-Expected: every test in `integration_tests` passes, including all 4 new ones from this task and all 5 from Task 13.
+Expected: every test in `integration_tests` passes, including all 5 new ones from this task (including `bundled_enforce_hook_allows_piped_grep_but_still_blocks_bare_grep`, added after Step 3's discovery) and all 5 from Task 13.
 
 - [ ] **Step 10: Commit**
 
