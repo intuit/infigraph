@@ -950,6 +950,52 @@ Append inside the existing `#[cfg(test)] mod tests { ... }` block in `crates/inf
         .unwrap();
         assert!(!removed);
     }
+
+    #[test]
+    fn apply_marker_delimited_refuses_to_guess_when_end_marker_missing() {
+        // Regression test: a damaged/hand-edited file with the start marker
+        // but no matching end marker must not have its trailing content
+        // silently destroyed by treating "no end marker" as "ends at EOF".
+        let dir = tempfile::tempdir().unwrap();
+        let target = dir.path().join("CLAUDE.md");
+        let original = "# My notes\n<!-- infigraph-primary-search -->\nold block\n\n## Important content the user wrote after the block, with the end marker accidentally deleted\n";
+        std::fs::write(&target, original).unwrap();
+
+        let outcome = apply_marker_delimited(
+            &target,
+            "<!-- infigraph-primary-search -->",
+            "<!-- /infigraph-primary-search -->",
+            "new instructions",
+        )
+        .unwrap();
+
+        match outcome {
+            ApplyOutcome::Skipped { reason, .. } => {
+                assert!(reason.contains("end marker"));
+            }
+            ApplyOutcome::Written => panic!("must not write when the end marker is missing"),
+        }
+        let after = std::fs::read_to_string(&target).unwrap();
+        assert_eq!(after, original, "file must be completely untouched on refusal");
+    }
+
+    #[test]
+    fn remove_marker_delimited_refuses_to_guess_when_end_marker_missing() {
+        let dir = tempfile::tempdir().unwrap();
+        let target = dir.path().join("CLAUDE.md");
+        let original = "<!-- infigraph-primary-search -->\nold block\n\n## User content after a damaged end marker\n";
+        std::fs::write(&target, original).unwrap();
+
+        let removed = remove_marker_delimited(
+            &target,
+            "<!-- infigraph-primary-search -->",
+            "<!-- /infigraph-primary-search -->",
+        )
+        .unwrap();
+        assert!(!removed);
+        let after = std::fs::read_to_string(&target).unwrap();
+        assert_eq!(after, original, "file must be completely untouched on refusal");
+    }
 ```
 
 - [ ] **Step 2: Run the tests to verify they fail**
@@ -977,19 +1023,35 @@ pub(crate) fn apply_marker_delimited(
 
     let block = format!("{start}\n{content}\n{end}");
 
-    let new_content = if let Some(start_pos) = existing.find(start) {
-        let end_pos = existing[start_pos..]
-            .find(end)
-            .map(|p| start_pos + p + end.len())
-            .unwrap_or(existing.len());
-        format!("{}{}{}", &existing[..start_pos], block, &existing[end_pos..])
-    } else {
-        let sep = if existing.is_empty() || existing.ends_with('\n') {
-            ""
-        } else {
-            "\n"
-        };
-        format!("{existing}{sep}{block}\n")
+    let start_pos = existing.find(start);
+    let end_pos = start_pos.and_then(|sp| existing[sp..].find(end).map(|p| sp + p + end.len()));
+
+    let new_content = match (start_pos, end_pos) {
+        (Some(start_pos), Some(end_pos)) => {
+            format!("{}{}{}", &existing[..start_pos], block, &existing[end_pos..])
+        }
+        (Some(_), None) => {
+            // Start marker present but end marker missing or damaged (e.g. a
+            // user hand-edited the file and deleted/corrupted it). Guessing
+            // "the block ends at EOF" would silently destroy every byte of
+            // real user content after the start marker -- refuse instead,
+            // same as the JSON-parse-failure bail path.
+            return Ok(ApplyOutcome::Skipped {
+                reason: format!(
+                    "{} has the start marker \"{start}\" but not a matching end marker \"{end}\" -- refusing to guess where the managed block ends",
+                    target_path.display()
+                ),
+                manual_snippet: block,
+            });
+        }
+        (None, _) => {
+            let sep = if existing.is_empty() || existing.ends_with('\n') {
+                ""
+            } else {
+                "\n"
+            };
+            format!("{existing}{sep}{block}\n")
+        }
     };
 
     ensure_parent_dir(target_path)?;
@@ -1007,10 +1069,12 @@ pub(crate) fn remove_marker_delimited(target_path: &Path, start: &str, end: &str
     let Some(start_pos) = existing.find(start) else {
         return Ok(false);
     };
-    let end_pos = existing[start_pos..]
-        .find(end)
-        .map(|p| start_pos + p + end.len())
-        .unwrap_or(existing.len());
+    // Same refusal as apply_marker_delimited: a missing/damaged end marker
+    // must not be treated as "the block extends to EOF" -- that would delete
+    // real trailing user content instead of just the managed block.
+    let Some(end_pos) = existing[start_pos..].find(end).map(|p| start_pos + p + end.len()) else {
+        return Ok(false);
+    };
 
     let removed = format!(
         "{}{}",
@@ -1032,7 +1096,7 @@ pub(crate) fn remove_marker_delimited(target_path: &Path, start: &str, end: &str
 - [ ] **Step 4: Run the tests to verify they pass**
 
 Run: `cargo test -p infigraph-cli artifacts::strategy -- --nocapture`
-Expected: all 18 tests pass.
+Expected: all 20 tests pass, including the two malformed-end-marker regression tests.
 
 - [ ] **Step 5: Commit**
 
@@ -1154,6 +1218,66 @@ Append inside the `#[cfg(test)] mod tests { ... }` block in `crates/infigraph-cl
         .unwrap();
         assert!(!removed);
     }
+
+    #[test]
+    fn toml_section_does_not_match_a_longer_header_with_our_header_as_a_prefix() {
+        // Regression test: a raw substring search for "[mcp_servers.infigraph]"
+        // must not treat "[mcp_servers.infigraph_extra]" as a match just
+        // because it shares a prefix -- that would corrupt or delete an
+        // unrelated, differently-named section.
+        let dir = tempfile::tempdir().unwrap();
+        let target = dir.path().join("config.toml");
+        std::fs::write(
+            &target,
+            "[mcp_servers.infigraph_extra]\ncommand = \"unrelated-tool\"\n",
+        )
+        .unwrap();
+        let key_path = vec!["mcp_servers".to_string(), "infigraph".to_string()];
+
+        apply_toml_section(&target, &key_path, "command = \"/bin/infigraph-mcp\"").unwrap();
+
+        let content = std::fs::read_to_string(&target).unwrap();
+        assert!(
+            content.contains("[mcp_servers.infigraph_extra]"),
+            "unrelated prefix-colliding section must survive untouched: {content}"
+        );
+        assert!(content.contains("unrelated-tool"));
+        assert!(content.contains("[mcp_servers.infigraph]"));
+
+        let removed = remove_toml_section(&target, &key_path).unwrap();
+        assert!(removed);
+        let after = std::fs::read_to_string(&target).unwrap();
+        assert!(
+            after.contains("[mcp_servers.infigraph_extra]") && after.contains("unrelated-tool"),
+            "removing our section must not touch the prefix-colliding one: {after}"
+        );
+    }
+
+    #[test]
+    fn toml_section_does_not_match_header_text_inside_a_comment() {
+        // Regression test: a comment merely mentioning the header text must
+        // not be mistaken for the real table header.
+        let dir = tempfile::tempdir().unwrap();
+        let target = dir.path().join("config.toml");
+        std::fs::write(
+            &target,
+            "# see [mcp_servers.infigraph] in the docs for an example\n[mcp_servers.other]\ncommand = \"other\"\n",
+        )
+        .unwrap();
+        let key_path = vec!["mcp_servers".to_string(), "infigraph".to_string()];
+
+        apply_toml_section(&target, &key_path, "command = \"/bin/infigraph-mcp\"").unwrap();
+
+        let content = std::fs::read_to_string(&target).unwrap();
+        assert!(
+            content.contains("# see [mcp_servers.infigraph] in the docs for an example"),
+            "the comment must survive untouched: {content}"
+        );
+        assert!(content.contains("[mcp_servers.other]"));
+        assert!(content.contains("command = \"other\""));
+        // Our real section should have been appended, not spliced into the comment.
+        assert_eq!(content.matches("[mcp_servers.infigraph]").count(), 1);
+    }
 ```
 
 - [ ] **Step 2: Run the tests to verify they fail**
@@ -1170,6 +1294,44 @@ fn toml_section_header(key_path: &[String]) -> String {
     format!("[{}]", key_path.join("."))
 }
 
+/// Locates a TOML table-header line matching `header` exactly (ignoring
+/// surrounding whitespace and a trailing `#` comment), returning the byte
+/// range from that line's own start through (but not including) the next
+/// line that looks like a table header, or through EOF if there is none.
+/// Returns `None` if no line matches.
+///
+/// Deliberately line-based rather than a raw substring search: a substring
+/// search would also match `header` appearing inside a comment (e.g. `# see
+/// [mcp_servers.infigraph] above`), inside a quoted string value, or as a
+/// prefix of an unrelated longer header -- any of which would corrupt or
+/// delete content that isn't actually infigraph's own section. This still
+/// isn't a full TOML parser (a header-like line inside a multi-line `"""`
+/// string would still confuse it) -- that's a deliberate, documented scope
+/// boundary, same as the JSON-parse-safety bail path's.
+fn find_toml_section_bounds(content: &str, header: &str) -> Option<(usize, usize)> {
+    let mut offsets = Vec::new();
+    let mut pos = 0usize;
+    for line in content.split_inclusive('\n') {
+        offsets.push((pos, line));
+        pos += line.len();
+    }
+
+    let header_line_index = offsets.iter().position(|(_, line)| {
+        let trimmed = line.trim_end_matches('\n').trim();
+        let header_only = trimmed.split('#').next().unwrap_or(trimmed).trim();
+        header_only == header
+    })?;
+
+    let start = offsets[header_line_index].0;
+    let end = offsets[header_line_index + 1..]
+        .iter()
+        .find(|(_, line)| line.trim_start().starts_with('['))
+        .map(|(offset, _)| *offset)
+        .unwrap_or(content.len());
+
+    Some((start, end))
+}
+
 pub(crate) fn apply_toml_section(target_path: &Path, key_path: &[String], body: &str) -> Result<ApplyOutcome> {
     anyhow::ensure!(!key_path.is_empty(), "toml_section requires a non-empty key_path");
     let header = toml_section_header(key_path);
@@ -1183,18 +1345,13 @@ pub(crate) fn apply_toml_section(target_path: &Path, key_path: &[String], body: 
 
     let section = format!("{header}\n{}\n", body.trim_end());
 
-    let new_content = if let Some(start) = existing.find(&header) {
-        let after_header = start + header.len();
-        let section_end = existing[after_header..]
-            .find("\n[")
-            .map(|pos| after_header + pos + 1)
-            .unwrap_or(existing.len());
-        format!("{}{}{}", &existing[..start], section, &existing[section_end..])
-    } else if existing.is_empty() {
-        section
-    } else {
-        let sep = if existing.ends_with('\n') { "" } else { "\n" };
-        format!("{existing}{sep}\n{section}")
+    let new_content = match find_toml_section_bounds(&existing, &header) {
+        Some((start, end)) => format!("{}{}{}", &existing[..start], section, &existing[end..]),
+        None if existing.is_empty() => section,
+        None => {
+            let sep = if existing.ends_with('\n') { "" } else { "\n" };
+            format!("{existing}{sep}\n{section}")
+        }
     };
 
     ensure_parent_dir(target_path)?;
@@ -1211,16 +1368,11 @@ pub(crate) fn remove_toml_section(target_path: &Path, key_path: &[String]) -> Re
     let content = std::fs::read_to_string(target_path)
         .with_context(|| format!("failed to read {}", target_path.display()))?;
 
-    let Some(start) = content.find(&header) else {
+    let Some((start, end)) = find_toml_section_bounds(&content, &header) else {
         return Ok(false);
     };
-    let after_header = start + header.len();
-    let section_end = content[after_header..]
-        .find("\n[")
-        .map(|pos| after_header + pos + 1)
-        .unwrap_or(content.len());
 
-    let new_content = format!("{}{}", &content[..start], &content[section_end..]);
+    let new_content = format!("{}{}", &content[..start], &content[end..]);
     let trimmed = new_content.trim_end();
     let final_content = if trimmed.is_empty() {
         String::new()
@@ -1236,7 +1388,7 @@ pub(crate) fn remove_toml_section(target_path: &Path, key_path: &[String]) -> Re
 - [ ] **Step 4: Run the tests to verify they pass**
 
 Run: `cargo test -p infigraph-cli artifacts::strategy -- --nocapture`
-Expected: all 23 tests pass.
+Expected: all 27 tests pass (20 from Task 5 + 5 new `toml_section` tests + 2 header-collision regression tests).
 
 - [ ] **Step 5: Commit**
 
@@ -1827,7 +1979,7 @@ pub(crate) fn remove_json_key_path(target_path: &Path, key_path: &[String]) -> R
 - [ ] **Step 8: Run the tests to verify they pass**
 
 Run: `cargo test -p infigraph-cli artifacts::strategy -- --nocapture` and `cargo test -p infigraph-cli artifacts::resolver -- --nocapture`
-Expected: all 28 `strategy` tests and all 5 `resolver` tests pass.
+Expected: all 32 `strategy` tests and all 5 `resolver` tests pass.
 
 - [ ] **Step 9: Commit**
 
@@ -3101,7 +3253,35 @@ Add to the `#[cfg(test)] mod tests { ... }` block in `crates/infigraph-cli/src/a
             other => panic!("expected Ok, got {other:?}"),
         }
     }
+
+    #[test]
+    fn run_resolver_from_script_invokes_python_scripts_via_explicit_interpreter() {
+        // Regression test for the Windows resolver bug: a .py resolver must
+        // never be spawned via shebang-based direct execution (Windows has
+        // no such mechanism) -- it must always go through an explicit
+        // python/python3 interpreter invocation, proven here by using a
+        // script with NO shebang line at all (so this test would fail on
+        // every platform, not just Windows, if the fix ever regressed back
+        // to direct execution).
+        let script = b"import json, sys\nprint(json.dumps({'status': 'ok', 'data': {'path': '/resolved/from-python.json'}}))\n";
+
+        let output = run_resolver_from_script(
+            script,
+            "resolve-example.py",
+            &[],
+            "/bin/infigraph-mcp",
+            std::path::Path::new("/home/x"),
+        )
+        .unwrap();
+
+        match output {
+            ResolverOutput::Ok { data } => assert_eq!(data.path, "/resolved/from-python.json"),
+            other => panic!("expected Ok, got {other:?}"),
+        }
+    }
 ```
+
+This test requires `python3` (or `python` on Windows) on the test runner's `PATH`, same as Task 17's resolver fixture tests.
 
 - [ ] **Step 2: Run the tests to verify they fail**
 
@@ -3257,16 +3437,36 @@ fn template_format_for_strategy(strategy: Strategy) -> Option<TemplateFormat> {
 
 5. Add `use super::step::InstallStep;` to the top of `discovery.rs` if not already present from Task 10.
 
-- [ ] **Step 5: Implement `run_resolver_from_script`**
+- [ ] **Step 5: Implement `run_resolver_from_script`, interpreter-aware by extension**
+
+Shebang-based direct execution (`./resolve-vscode-path.py`) only works on Unix, where the kernel reads the `#!/usr/bin/env python3` line itself. Windows has no equivalent mechanism at the `CreateProcess` level -- `std::process::Command::new("./script.py")` doesn't consult file associations, so every bundled `.py` resolver (Task 17 ships two: VS Code, Zed) would simply fail to spawn on Windows, even though both integrations' resolvers are specifically needed to handle Windows paths (`%APPDATA%\Code\User\mcp.json`, etc.) among others. Fix: for a `.py` script, invoke the interpreter explicitly instead of relying on the shebang at all -- correct on every platform, not just a Windows patch.
 
 Add to `crates/infigraph-cli/src/artifacts/resolver.rs`, just above `#[cfg(test)]`:
 
 ```rust
+/// Builds the actual command to invoke a resolver script, interpreter-aware
+/// by extension rather than relying on shebang-based direct execution (which
+/// only works on Unix). `.py` scripts are launched via an explicit Python
+/// interpreter on every platform; anything else falls back to direct
+/// execution, which remains correct on Unix (and is a clear, immediate
+/// spawn failure on Windows rather than a silent wrong-path resolver run --
+/// this design bundles only `.py` resolvers, so that fallback path isn't
+/// expected to be exercised today).
+fn resolver_invocation(script_path: &Path, script_filename: &str) -> Vec<String> {
+    if Path::new(script_filename).extension().and_then(|e| e.to_str()) == Some("py") {
+        let python = if cfg!(windows) { "python" } else { "python3" };
+        vec![python.to_string(), script_path.to_string_lossy().to_string()]
+    } else {
+        vec![format!("./{script_filename}")]
+    }
+}
+
 /// Writes a bundled/user-override resolver script's bytes to a temp file,
-/// makes it executable, spawns it via `run_resolver`, and cleans up
-/// afterward. Needed because bundled content is embedded bytes in the
-/// binary, not a real file on disk -- `run_resolver` alone can only spawn a
-/// command that already exists at some real `cwd`.
+/// makes it executable (Unix only -- irrelevant for an explicitly
+/// interpreter-invoked script, but harmless), spawns it via `run_resolver`,
+/// and cleans up afterward. Needed because bundled content is embedded bytes
+/// in the binary, not a real file on disk -- `run_resolver` alone can only
+/// spawn a command that already exists at some real `cwd`.
 pub(crate) fn run_resolver_from_script(
     script_bytes: &[u8],
     script_filename: &str,
@@ -3285,7 +3485,7 @@ pub(crate) fn run_resolver_from_script(
             .with_context(|| format!("failed to make {} executable", script_path.display()))?;
     }
 
-    let mut resolver_cmd = vec![format!("./{script_filename}")];
+    let mut resolver_cmd = resolver_invocation(&script_path, script_filename);
     resolver_cmd.extend(extra_args.iter().cloned());
 
     run_resolver(&resolver_cmd, tmp.path(), mcp_path, home)
@@ -4728,7 +4928,7 @@ else:
 - [ ] **Step 5: Run the tests to verify they pass**
 
 Run: `cargo test -p infigraph-cli artifacts::integration_tests -- --nocapture`
-Expected: every test passes, including the 2 new ones. On Windows CI, confirm the resolver scripts are still invoked correctly through `python3` (not `python`) — if the runner only has `python`, add a `#!/usr/bin/env python3` fallback note to the CI config rather than changing the script's shebang, since `python3` is the correct modern convention and matches the existing hook scripts.
+Expected: every test passes, including the 2 new ones. These exercise `resolver_invocation`'s interpreter-aware dispatch from Task 12 (`python3` on Unix, `python` on Windows, explicit interpreter invocation either way — never shebang-based direct execution of the `.py` file). Confirm on Windows CI specifically that `python` resolves on `PATH` there; if the runner only ships `python3`, that's a CI environment gap to fix (install/alias `python`), not a reason to change `resolver_invocation`'s platform branch.
 
 - [ ] **Step 6: Commit**
 
@@ -5045,12 +5245,7 @@ pub(crate) fn cmd_uninstall() -> Result<()> {
         }
     }
 
-    // Remove model cache ~/.infigraph/
-    let model_cache = home.join(".infigraph");
-    if model_cache.exists() {
-        std::fs::remove_dir_all(&model_cache)?;
-        println!("  Removed model cache: {}", model_cache.display());
-    }
+    clean_infigraph_cache_dir(&home)?;
 
     Ok(())
 }
@@ -5083,14 +5278,74 @@ pub(crate) fn run_uninstall(mcp_path: &Path, home: &Path) -> Result<Vec<String>>
     removed.dedup();
     Ok(removed)
 }
+
+/// Removes disposable caches under `~/.infigraph/` (the semantic-search
+/// model files, the update-check cache) while deliberately preserving
+/// `~/.infigraph/integrations/` -- the persistent, user-authored override
+/// directory the two-tier discovery system depends on (see Task 9). Before
+/// this PR, `~/.infigraph/` only ever held disposable caches, so wiping the
+/// whole directory on uninstall was safe; now that it also holds real user
+/// customization work, that would silently destroy it. Extracted as its own
+/// function (rather than inlined in `cmd_uninstall`) specifically so it's
+/// testable against a fake home directory -- `cmd_uninstall` itself calls
+/// `dirs::home_dir()` directly and can't be pointed at a temp dir in a test.
+fn clean_infigraph_cache_dir(home: &Path) -> Result<()> {
+    let models_cache = home.join(".infigraph").join("models");
+    if models_cache.exists() {
+        std::fs::remove_dir_all(&models_cache)?;
+        println!("  Removed model cache: {}", models_cache.display());
+    }
+    let update_check_cache = home.join(".infigraph").join("update_check.json");
+    if update_check_cache.exists() {
+        let _ = std::fs::remove_file(&update_check_cache);
+    }
+    Ok(())
+}
 ```
 
 (`remove_resolved_artifact` is `pub(crate)` from Task 11/12 in `crates/infigraph-cli/src/artifacts/mod.rs` — confirm it's still exported there; no change needed if so.)
 
+- [ ] **Step 3.5: Add the regression test `run_uninstall` alone can't cover**
+
+`cmd_uninstall_removes_everything_cmd_install_wrote` (Step 1) calls `run_uninstall` directly, which never touches `clean_infigraph_cache_dir` — that logic lives in `cmd_uninstall` itself and needs its own direct test. Append to `crates/infigraph-cli/src/install.rs`'s `#[cfg(test)] mod tests { ... }` block:
+
+```rust
+    #[test]
+    fn clean_infigraph_cache_dir_preserves_user_integration_overrides() {
+        let home_dir = tempfile::tempdir().unwrap();
+        let integrations_dir = home_dir.path().join(".infigraph").join("integrations");
+        std::fs::create_dir_all(&integrations_dir).unwrap();
+        std::fs::write(
+            integrations_dir.join("my-custom-agent.json"),
+            "a user's own override, not a cache",
+        )
+        .unwrap();
+
+        let models_dir = home_dir
+            .path()
+            .join(".infigraph")
+            .join("models")
+            .join("potion-base-8M");
+        std::fs::create_dir_all(&models_dir).unwrap();
+        std::fs::write(models_dir.join("model.safetensors"), "fake model data").unwrap();
+
+        clean_infigraph_cache_dir(home_dir.path()).unwrap();
+
+        assert!(
+            integrations_dir.join("my-custom-agent.json").exists(),
+            "user-authored integration overrides must survive uninstall's cache cleanup"
+        );
+        assert!(!models_dir.exists(), "the model cache should still be removed");
+    }
+```
+
+Run: `cargo test -p infigraph-cli install::tests::clean_infigraph_cache_dir -- --nocapture`
+Expected: fails first (compile error, function doesn't exist until Step 3's code lands — if running Step 3 and this step together, it should already pass); passes once Step 3's `clean_infigraph_cache_dir` exists.
+
 - [ ] **Step 4: Run the tests to verify they pass**
 
 Run: `cargo test -p infigraph-cli install:: -- --nocapture`
-Expected: all `install::tests` pass, including the new uninstall test. Same as Task 18 Step 4 — this compiles fine with `dead_code` warnings for the not-yet-deleted old functions, which Task 20 removes.
+Expected: all `install::tests` pass, including the new uninstall test and `clean_infigraph_cache_dir_preserves_user_integration_overrides`. Same as Task 18 Step 4 — this compiles fine with `dead_code` warnings for the not-yet-deleted old functions, which Task 20 removes.
 
 - [ ] **Step 5: Commit**
 
@@ -5209,4 +5464,9 @@ This task is pure verification — if any step fails, fix the specific regressio
   2. `ArtifactEntry.path` is optional, not required — the spec's own Zed example manifest omits `path` entirely; Task 12 makes the schema match the spec's own example.
   3. The spec's Claude Code directory-layout diagram was corrected (this session, before Task 14 was written) to nest `settings.json`/`hooks/` under `.claude/`, matching every other integration's own diagram entry, and hook script filenames keep the `infigraph-` prefix so the array-ownership marker still matches them.
   4. `content_file` is allowed on a resolver-driven artifact with no static `path` (needed for VS Code, whose resolver determines only the path); template-format inference for a manifest artifact's `content_file` is strategy-based, not path-based, to support this.
-- **Real behavior changes from the current shipped tool** (distinct from spec deviations above — these are user-visible differences from what `infigraph install`/`uninstall` do today, also worth their own PR-description callout): per-agent path/shape fixes for issue #29 (Windsurf, Kiro, GitHub Copilot CLI, OpenCode, VS Code, Zed — see the spec's research table); universal hook matcher self-healing and the dropped edit-tracker merge-into-existing-entry special case (both already documented in the spec's "Deliberate behavior changes" section); Cursor and Windsurf's rules now get the fuller instructional text CLAUDE.md already had (Subagents guidance, Verbose tools guidance, the reindex mention) instead of the shorter text `agent::infigraph_instructions()` previously gave them — that function and its callers (`cmd_init`'s project-level `AGENTS.md`/`GEMINI.md`/etc. writers) are untouched, out of scope, and keep using their own separate text.
+- **Real behavior changes from the current shipped tool** (distinct from spec deviations above — these are user-visible differences from what `infigraph install`/`uninstall` do today, also worth their own PR-description callout): per-agent path/shape fixes for issue #29 (Windsurf, Kiro, GitHub Copilot CLI, OpenCode, VS Code, Zed — see the spec's research table); universal hook matcher self-healing and the dropped edit-tracker merge-into-existing-entry special case (both already documented in the spec's "Deliberate behavior changes" section); Cursor and Windsurf's rules now get the fuller instructional text CLAUDE.md already had (Subagents guidance, Verbose tools guidance, the reindex mention) instead of the shorter text `agent::infigraph_instructions()` previously gave them — that function and its callers (`cmd_init`'s project-level `AGENTS.md`/`GEMINI.md`/etc. writers) are untouched, out of scope, and keep using their own separate text; `infigraph-enforce.sh` no longer blocks a Bash command piping another command's output through `grep`/`rg` for filtering (a real bug caught live this session), folded into Task 14's bundled content rather than a byte-for-byte `hooks.rs` copy.
+- **Fixes from an adversarial review pass** (`/codex:adversarial-review --base upstream/main`, run against the fully-written plan) — all four were genuine data-loss/portability bugs in what the plan originally specified, not implementation-detail nitpicks, fixed in place before any code was written:
+  1. `apply_marker_delimited`/`remove_marker_delimited` (Task 5) previously treated a present-but-unmatched start marker as "the managed block extends to EOF," silently destroying all trailing user content in a damaged `CLAUDE.md`. Now refuses (returns `Skipped`/`false`) rather than guessing, with two regression tests proving the file is left byte-for-byte untouched.
+  2. `apply_toml_section`/`remove_toml_section` (Task 6) used a raw substring search for the table header, so a comment mentioning the header text, or an unrelated header sharing our header as a prefix (e.g. `[mcp_servers.infigraph_extra]`), could be corrupted or deleted. Now uses `find_toml_section_bounds`, a line-based match (header text, trailing-comment-stripped, must be a whole trimmed line) with two collision regression tests.
+  3. `cmd_uninstall` (Task 19) recursively removed all of `~/.infigraph/`, which — now that this PR adds `~/.infigraph/integrations/` as a persistent, user-authored override directory — would silently destroy real user customization work on every uninstall, not just disposable cache data. Extracted into its own `clean_infigraph_cache_dir(home: &Path)` function (needed for testability against a fake home anyway, since `cmd_uninstall` itself calls `dirs::home_dir()` directly) that only removes `models/` and `update_check.json`, with a regression test proving `integrations/` survives.
+  4. `run_resolver_from_script` (Task 12) always spawned resolver scripts via shebang-based direct execution (`./script.py`), which only works on Unix — every bundled `.py` resolver (VS Code, Zed; Task 17) would fail to even start on Windows, despite both resolvers existing specifically to handle Windows-among-other-OS profile paths. Added `resolver_invocation`, which launches `.py` scripts via an explicit `python3`/`python` interpreter call on every platform, with a shebang-less regression test that would fail on any platform if this regressed back to direct execution.
