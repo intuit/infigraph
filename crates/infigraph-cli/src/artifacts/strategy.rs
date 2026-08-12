@@ -192,6 +192,98 @@ pub(crate) fn remove_overwrite(target_path: &Path) -> Result<bool> {
     Ok(true)
 }
 
+pub(crate) fn apply_marker_delimited(
+    target_path: &Path,
+    start: &str,
+    end: &str,
+    content: &str,
+) -> Result<ApplyOutcome> {
+    let existing = if target_path.is_file() {
+        std::fs::read_to_string(target_path)
+            .with_context(|| format!("failed to read {}", target_path.display()))?
+    } else {
+        String::new()
+    };
+
+    let block = format!("{start}\n{content}\n{end}");
+
+    let start_pos = existing.find(start);
+    let end_pos = start_pos.and_then(|sp| existing[sp..].find(end).map(|p| sp + p + end.len()));
+
+    let new_content = match (start_pos, end_pos) {
+        (Some(start_pos), Some(end_pos)) => {
+            format!(
+                "{}{}{}",
+                &existing[..start_pos],
+                block,
+                &existing[end_pos..]
+            )
+        }
+        (Some(_), None) => {
+            // Start marker present but end marker missing or damaged (e.g. a
+            // user hand-edited the file and deleted/corrupted it). Guessing
+            // "the block ends at EOF" would silently destroy every byte of
+            // real user content after the start marker -- refuse instead,
+            // same as the JSON-parse-failure bail path.
+            return Ok(ApplyOutcome::Skipped {
+                reason: format!(
+                    "{} has the start marker \"{start}\" but not a matching end marker \"{end}\" -- refusing to guess where the managed block ends",
+                    target_path.display()
+                ),
+                manual_snippet: block,
+            });
+        }
+        (None, _) => {
+            let sep = if existing.is_empty() || existing.ends_with('\n') {
+                ""
+            } else {
+                "\n"
+            };
+            format!("{existing}{sep}{block}\n")
+        }
+    };
+
+    ensure_parent_dir(target_path)?;
+    std::fs::write(target_path, new_content)
+        .with_context(|| format!("failed to write {}", target_path.display()))?;
+    Ok(ApplyOutcome::Written)
+}
+
+pub(crate) fn remove_marker_delimited(target_path: &Path, start: &str, end: &str) -> Result<bool> {
+    if !target_path.is_file() {
+        return Ok(false);
+    }
+    let existing = std::fs::read_to_string(target_path)
+        .with_context(|| format!("failed to read {}", target_path.display()))?;
+    let Some(start_pos) = existing.find(start) else {
+        return Ok(false);
+    };
+    // Same refusal as apply_marker_delimited: a missing/damaged end marker
+    // must not be treated as "the block extends to EOF" -- that would delete
+    // real trailing user content instead of just the managed block.
+    let Some(end_pos) = existing[start_pos..]
+        .find(end)
+        .map(|p| start_pos + p + end.len())
+    else {
+        return Ok(false);
+    };
+
+    let removed = format!(
+        "{}{}",
+        existing[..start_pos].trim_end(),
+        &existing[end_pos..]
+    );
+    let trimmed = removed.trim_end();
+    let final_content = if trimmed.is_empty() {
+        String::new()
+    } else {
+        format!("{trimmed}\n")
+    };
+    std::fs::write(target_path, final_content)
+        .with_context(|| format!("failed to write {}", target_path.display()))?;
+    Ok(true)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -426,5 +518,165 @@ mod tests {
         let target = dir.path().join("does-not-exist.mdc");
         let removed = remove_overwrite(&target).unwrap();
         assert!(!removed);
+    }
+
+    #[test]
+    fn marker_delimited_inserts_into_empty_file() {
+        let dir = tempfile::tempdir().unwrap();
+        let target = dir.path().join("CLAUDE.md");
+        apply_marker_delimited(
+            &target,
+            "<!-- infigraph-primary-search -->",
+            "<!-- /infigraph-primary-search -->",
+            "## Infigraph instructions",
+        )
+        .unwrap();
+        let content = std::fs::read_to_string(&target).unwrap();
+        assert!(content.contains("<!-- infigraph-primary-search -->"));
+        assert!(content.contains("## Infigraph instructions"));
+        assert!(content.contains("<!-- /infigraph-primary-search -->"));
+    }
+
+    #[test]
+    fn marker_delimited_preserves_content_outside_markers() {
+        let dir = tempfile::tempdir().unwrap();
+        let target = dir.path().join("CLAUDE.md");
+        std::fs::write(&target, "# My project notes\n\nSome custom content.\n").unwrap();
+
+        apply_marker_delimited(
+            &target,
+            "<!-- infigraph-primary-search -->",
+            "<!-- /infigraph-primary-search -->",
+            "## Infigraph instructions",
+        )
+        .unwrap();
+
+        let content = std::fs::read_to_string(&target).unwrap();
+        assert!(content.contains("# My project notes"));
+        assert!(content.contains("Some custom content."));
+        assert!(content.contains("## Infigraph instructions"));
+    }
+
+    #[test]
+    fn marker_delimited_reapply_replaces_not_duplicates() {
+        let dir = tempfile::tempdir().unwrap();
+        let target = dir.path().join("CLAUDE.md");
+
+        apply_marker_delimited(
+            &target,
+            "<!-- infigraph-primary-search -->",
+            "<!-- /infigraph-primary-search -->",
+            "old instructions",
+        )
+        .unwrap();
+        apply_marker_delimited(
+            &target,
+            "<!-- infigraph-primary-search -->",
+            "<!-- /infigraph-primary-search -->",
+            "new instructions",
+        )
+        .unwrap();
+
+        let content = std::fs::read_to_string(&target).unwrap();
+        assert_eq!(
+            content.matches("<!-- infigraph-primary-search -->").count(),
+            1,
+            "marker should appear exactly once, got: {content}"
+        );
+        assert!(!content.contains("old instructions"));
+        assert!(content.contains("new instructions"));
+    }
+
+    #[test]
+    fn remove_marker_delimited_strips_block_and_keeps_rest() {
+        let dir = tempfile::tempdir().unwrap();
+        let target = dir.path().join("CLAUDE.md");
+        std::fs::write(&target, "# My notes\n").unwrap();
+        apply_marker_delimited(
+            &target,
+            "<!-- infigraph-primary-search -->",
+            "<!-- /infigraph-primary-search -->",
+            "instructions",
+        )
+        .unwrap();
+
+        let removed = remove_marker_delimited(
+            &target,
+            "<!-- infigraph-primary-search -->",
+            "<!-- /infigraph-primary-search -->",
+        )
+        .unwrap();
+        assert!(removed);
+
+        let content = std::fs::read_to_string(&target).unwrap();
+        assert!(content.contains("# My notes"));
+        assert!(!content.contains("infigraph-primary-search"));
+        assert!(!content.contains("instructions"));
+    }
+
+    #[test]
+    fn remove_marker_delimited_returns_false_when_marker_absent() {
+        let dir = tempfile::tempdir().unwrap();
+        let target = dir.path().join("CLAUDE.md");
+        std::fs::write(&target, "# My notes\n").unwrap();
+        let removed = remove_marker_delimited(
+            &target,
+            "<!-- infigraph-primary-search -->",
+            "<!-- /infigraph-primary-search -->",
+        )
+        .unwrap();
+        assert!(!removed);
+    }
+
+    #[test]
+    fn apply_marker_delimited_refuses_to_guess_when_end_marker_missing() {
+        // Regression test: a damaged/hand-edited file with the start marker
+        // but no matching end marker must not have its trailing content
+        // silently destroyed by treating "no end marker" as "ends at EOF".
+        let dir = tempfile::tempdir().unwrap();
+        let target = dir.path().join("CLAUDE.md");
+        let original = "# My notes\n<!-- infigraph-primary-search -->\nold block\n\n## Important content the user wrote after the block, with the end marker accidentally deleted\n";
+        std::fs::write(&target, original).unwrap();
+
+        let outcome = apply_marker_delimited(
+            &target,
+            "<!-- infigraph-primary-search -->",
+            "<!-- /infigraph-primary-search -->",
+            "new instructions",
+        )
+        .unwrap();
+
+        match outcome {
+            ApplyOutcome::Skipped { reason, .. } => {
+                assert!(reason.contains("end marker"));
+            }
+            ApplyOutcome::Written => panic!("must not write when the end marker is missing"),
+        }
+        let after = std::fs::read_to_string(&target).unwrap();
+        assert_eq!(
+            after, original,
+            "file must be completely untouched on refusal"
+        );
+    }
+
+    #[test]
+    fn remove_marker_delimited_refuses_to_guess_when_end_marker_missing() {
+        let dir = tempfile::tempdir().unwrap();
+        let target = dir.path().join("CLAUDE.md");
+        let original = "<!-- infigraph-primary-search -->\nold block\n\n## User content after a damaged end marker\n";
+        std::fs::write(&target, original).unwrap();
+
+        let removed = remove_marker_delimited(
+            &target,
+            "<!-- infigraph-primary-search -->",
+            "<!-- /infigraph-primary-search -->",
+        )
+        .unwrap();
+        assert!(!removed);
+        let after = std::fs::read_to_string(&target).unwrap();
+        assert_eq!(
+            after, original,
+            "file must be completely untouched on refusal"
+        );
     }
 }
