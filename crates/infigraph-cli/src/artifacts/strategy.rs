@@ -385,6 +385,108 @@ pub(crate) fn remove_toml_section(target_path: &Path, key_path: &[String]) -> Re
     Ok(true)
 }
 
+fn navigate_to_parent<'a>(
+    root: &'a mut serde_json::Value,
+    key_path: &[String],
+) -> &'a mut serde_json::Map<String, serde_json::Value> {
+    if !root.is_object() {
+        *root = serde_json::json!({});
+    }
+    let mut cursor = root;
+    for key in &key_path[..key_path.len() - 1] {
+        if !cursor.is_object() {
+            *cursor = serde_json::json!({});
+        }
+        cursor = cursor
+            .as_object_mut()
+            .expect("just ensured object")
+            .entry(key.clone())
+            .or_insert_with(|| serde_json::json!({}));
+    }
+    if !cursor.is_object() {
+        *cursor = serde_json::json!({});
+    }
+    cursor.as_object_mut().expect("just ensured object")
+}
+
+pub(crate) fn apply_json_key_path(
+    target_path: &Path,
+    key_path: &[String],
+    value_content: &str,
+) -> Result<ApplyOutcome> {
+    anyhow::ensure!(
+        !key_path.is_empty(),
+        "json_key_path requires a non-empty key_path"
+    );
+    let value: serde_json::Value = serde_json::from_str(value_content).context(
+        "resolver/content value is not valid JSON (this is an infigraph bug, please report)",
+    )?;
+
+    let mut target: serde_json::Value = if target_path.is_file() {
+        let raw = std::fs::read_to_string(target_path)
+            .with_context(|| format!("failed to read {}", target_path.display()))?;
+        match serde_json::from_str(&raw) {
+            Ok(v) => v,
+            Err(e) => {
+                return Ok(ApplyOutcome::Skipped {
+                    reason: format!(
+                        "{} is not valid JSON ({e}) -- possibly hand-edited with comments or trailing commas",
+                        target_path.display()
+                    ),
+                    manual_snippet: format!("{}: {}", key_path.join("."), value_content),
+                });
+            }
+        }
+    } else {
+        serde_json::json!({})
+    };
+
+    let leaf_key = key_path.last().expect("checked non-empty above").clone();
+    navigate_to_parent(&mut target, key_path).insert(leaf_key, value);
+
+    ensure_parent_dir(target_path)?;
+    let pretty = serde_json::to_string_pretty(&target)?;
+    std::fs::write(target_path, pretty)
+        .with_context(|| format!("failed to write {}", target_path.display()))?;
+    Ok(ApplyOutcome::Written)
+}
+
+pub(crate) fn remove_json_key_path(target_path: &Path, key_path: &[String]) -> Result<bool> {
+    anyhow::ensure!(
+        !key_path.is_empty(),
+        "json_key_path requires a non-empty key_path"
+    );
+    if !target_path.is_file() {
+        return Ok(false);
+    }
+    let raw = std::fs::read_to_string(target_path)
+        .with_context(|| format!("failed to read {}", target_path.display()))?;
+    let mut target: serde_json::Value = match serde_json::from_str(&raw) {
+        Ok(v) => v,
+        Err(_) => return Ok(false),
+    };
+
+    let mut cursor = &mut target;
+    for key in &key_path[..key_path.len() - 1] {
+        let Some(next) = cursor.get_mut(key) else {
+            return Ok(false);
+        };
+        cursor = next;
+    }
+    let leaf_key = key_path.last().expect("checked non-empty above");
+    let Some(map) = cursor.as_object_mut() else {
+        return Ok(false);
+    };
+    let removed = map.remove(leaf_key).is_some();
+
+    if removed {
+        let pretty = serde_json::to_string_pretty(&target)?;
+        std::fs::write(target_path, pretty)
+            .with_context(|| format!("failed to write {}", target_path.display()))?;
+    }
+    Ok(removed)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -943,5 +1045,99 @@ mod tests {
             real_header_lines, 1,
             "exactly one real header line expected, got: {content}"
         );
+    }
+
+    #[test]
+    fn json_key_path_sets_nested_value_in_empty_file() {
+        let dir = tempfile::tempdir().unwrap();
+        let target = dir.path().join("settings.json");
+        apply_json_key_path(
+            &target,
+            &["context_servers".to_string(), "infigraph".to_string()],
+            r#"{"command":"/bin/infigraph-mcp","args":["--mcp"],"env":{}}"#,
+        )
+        .unwrap();
+
+        let v = read_json(&target);
+        assert_eq!(
+            v["context_servers"]["infigraph"]["command"],
+            "/bin/infigraph-mcp"
+        );
+    }
+
+    #[test]
+    fn json_key_path_preserves_unrelated_top_level_keys() {
+        let dir = tempfile::tempdir().unwrap();
+        let target = dir.path().join("settings.json");
+        std::fs::write(&target, r#"{"theme":"dark","font_size":14}"#).unwrap();
+
+        apply_json_key_path(
+            &target,
+            &["context_servers".to_string(), "infigraph".to_string()],
+            r#"{"command":"/bin/infigraph-mcp"}"#,
+        )
+        .unwrap();
+
+        let v = read_json(&target);
+        assert_eq!(v["theme"], "dark");
+        assert_eq!(v["font_size"], 14);
+        assert_eq!(
+            v["context_servers"]["infigraph"]["command"],
+            "/bin/infigraph-mcp"
+        );
+    }
+
+    #[test]
+    fn json_key_path_reapply_replaces_not_duplicates() {
+        let dir = tempfile::tempdir().unwrap();
+        let target = dir.path().join("settings.json");
+        let key_path = vec!["context_servers".to_string(), "infigraph".to_string()];
+
+        apply_json_key_path(&target, &key_path, r#"{"command":"/old"}"#).unwrap();
+        apply_json_key_path(&target, &key_path, r#"{"command":"/new"}"#).unwrap();
+
+        let v = read_json(&target);
+        assert_eq!(v["context_servers"]["infigraph"]["command"], "/new");
+        assert!(
+            v["context_servers"].as_object().unwrap().len() == 1,
+            "should not accumulate duplicate sibling keys"
+        );
+    }
+
+    #[test]
+    fn json_key_path_parse_failure_returns_skipped() {
+        let dir = tempfile::tempdir().unwrap();
+        let target = dir.path().join("settings.json");
+        std::fs::write(&target, "{ trailing, comma, }").unwrap();
+        let before = std::fs::read_to_string(&target).unwrap();
+
+        let outcome = apply_json_key_path(
+            &target,
+            &["context_servers".to_string(), "infigraph".to_string()],
+            r#"{"command":"/bin/infigraph-mcp"}"#,
+        )
+        .unwrap();
+        assert!(matches!(outcome, ApplyOutcome::Skipped { .. }));
+        assert_eq!(std::fs::read_to_string(&target).unwrap(), before);
+    }
+
+    #[test]
+    fn remove_json_key_path_removes_leaf_and_keeps_siblings() {
+        let dir = tempfile::tempdir().unwrap();
+        let target = dir.path().join("settings.json");
+        std::fs::write(
+            &target,
+            r#"{"context_servers":{"other":{"command":"other"}}}"#,
+        )
+        .unwrap();
+        let key_path = vec!["context_servers".to_string(), "infigraph".to_string()];
+        apply_json_key_path(&target, &key_path, r#"{"command":"/bin/infigraph-mcp"}"#).unwrap();
+
+        let removed = remove_json_key_path(&target, &key_path).unwrap();
+        assert!(removed);
+
+        let v = read_json(&target);
+        assert!(v["context_servers"]["infigraph"].is_null());
+        assert_eq!(v["context_servers"]["other"]["command"], "other");
     }
 }
