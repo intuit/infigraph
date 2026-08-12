@@ -15,6 +15,16 @@
   function: (qualified_identifier
     name: (identifier) @call.func)) @call.site
 
+; Template calls: func<T>() or ns::func<T>()
+(call_expression
+  function: (template_function
+    name: (identifier) @call.func)) @call.site
+
+(call_expression
+  function: (qualified_identifier
+    name: (template_function
+      name: (identifier) @call.func))) @call.site
+
 ; Include directives
 (preproc_include
   path: (_) @import.module)
