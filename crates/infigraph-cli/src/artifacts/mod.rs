@@ -875,4 +875,72 @@ resolver = ["./resolve-zed-path.sh"]
             std::fs::read_to_string(home_dir.path().join(".codex/config.toml")).unwrap();
         assert_eq!(toml_content.matches("[mcp_servers.infigraph]").count(), 1);
     }
+
+    #[test]
+    fn bundled_vscode_resolver_resolves_path_and_uses_local_content() {
+        let user_dir = tempfile::tempdir().unwrap();
+        let home_dir = tempfile::tempdir().unwrap();
+        let mcp_path = "/opt/infigraph/bin/infigraph-mcp";
+
+        let artifacts =
+            discover_artifacts(BUNDLED_INTEGRATIONS, user_dir.path(), mcp_path).unwrap();
+        let vscode = artifacts
+            .iter()
+            .find(|a| a.integration_label == "VS Code")
+            .expect("VS Code resolver artifact should be discovered");
+        assert_eq!(vscode.strategy, Strategy::JsonDeepMerge);
+        assert!(vscode.target_relative_path.is_none());
+        assert!(vscode.resolver.is_some());
+
+        let outcome = apply_resolved_artifact(vscode, home_dir.path(), mcp_path).unwrap();
+        assert!(matches!(outcome, ApplyOutcome::Written));
+
+        // The resolver branches on OS -- assert against whichever path it
+        // actually resolved to for the OS running this test.
+        let expected_suffix = match std::env::consts::OS {
+            "macos" => "Library/Application Support/Code/User/mcp.json",
+            "linux" => ".config/Code/User/mcp.json",
+            "windows" => "AppData/Roaming/Code/User/mcp.json",
+            other => panic!("unhandled test OS {other}"),
+        };
+        let path = home_dir.path().join(expected_suffix);
+        let written: serde_json::Value =
+            serde_json::from_str(&std::fs::read_to_string(&path).unwrap()).unwrap();
+        assert_eq!(written["servers"]["infigraph"]["command"], mcp_path);
+    }
+
+    #[test]
+    fn bundled_zed_resolver_resolves_path_and_content() {
+        let user_dir = tempfile::tempdir().unwrap();
+        let home_dir = tempfile::tempdir().unwrap();
+        let mcp_path = "/opt/infigraph/bin/infigraph-mcp";
+
+        let artifacts =
+            discover_artifacts(BUNDLED_INTEGRATIONS, user_dir.path(), mcp_path).unwrap();
+        let zed = artifacts
+            .iter()
+            .find(|a| a.integration_label == "Zed")
+            .expect("Zed resolver artifact should be discovered");
+        assert_eq!(zed.strategy, Strategy::JsonKeyPath);
+        assert_eq!(
+            zed.key_path,
+            Some(vec!["context_servers".to_string(), "infigraph".to_string()])
+        );
+        assert!(zed.target_relative_path.is_none());
+
+        let outcome = apply_resolved_artifact(zed, home_dir.path(), mcp_path).unwrap();
+        assert!(matches!(outcome, ApplyOutcome::Written));
+
+        let expected_suffix = match std::env::consts::OS {
+            "macos" => "Library/Application Support/Zed/settings.json",
+            "linux" => ".config/zed/settings.json",
+            "windows" => "AppData/Roaming/Zed/settings.json",
+            other => panic!("unhandled test OS {other}"),
+        };
+        let path = home_dir.path().join(expected_suffix);
+        let written: serde_json::Value =
+            serde_json::from_str(&std::fs::read_to_string(&path).unwrap()).unwrap();
+        assert_eq!(written["context_servers"]["infigraph"]["command"], mcp_path);
+        assert_eq!(written["context_servers"]["infigraph"]["args"][0], "--mcp");
+    }
 }
