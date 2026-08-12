@@ -2,8 +2,6 @@ use std::path::{Path, PathBuf};
 
 use anyhow::{Context, Result};
 
-use crate::config_targets::{self, ConfigFormat, AGENT_TARGETS};
-
 pub(crate) struct InstallReport {
     pub written: Vec<String>,
     pub skipped: Vec<(String, String)>, // (path, reason)
@@ -375,86 +373,20 @@ pub(crate) fn install_models(mcp_path: &Path, home: &Path) -> Result<()> {
 
 pub(crate) fn cmd_uninstall() -> Result<()> {
     let home = dirs::home_dir().context("Could not determine home directory")?;
-    let mut removed = Vec::new();
+    let mcp_path = find_mcp_binary().unwrap_or_else(|_| PathBuf::from("infigraph-mcp"));
 
-    for target in AGENT_TARGETS {
-        let config_path = if target.config_file == "CLAUDE_CODE_SPECIAL" {
-            home.join(".claude.json")
-        } else {
-            home.join(target.dir_name).join(target.config_file)
-        };
-
-        let result = match target.format {
-            ConfigFormat::Json => {
-                config_targets::uninstall_json_target(&config_path, target.label)?
-            }
-            ConfigFormat::Toml => {
-                config_targets::uninstall_toml_target(&config_path, target.label)?
-            }
-        };
-
-        if let Some(label) = result {
-            removed.push(label);
-        }
-    }
+    let removed = run_uninstall(&mcp_path, &home)?;
 
     if removed.is_empty() {
         println!("No agents had infigraph configured.");
     } else {
         println!(
-            "\nUninstalled infigraph MCP server from {} agent(s): {}",
-            removed.len(),
+            "\nUninstalled infigraph MCP server artifacts: {}",
             removed.join(", ")
         );
     }
 
-    // Remove primary search instructions from ~/.claude/CLAUDE.md
-    let claude_md = home.join(".claude").join("CLAUDE.md");
-    let marker = "<!-- infigraph-primary-search -->";
-    if claude_md.exists() {
-        let content = std::fs::read_to_string(&claude_md)?;
-        if let Some(start) = content.find(marker) {
-            let new_content = content[..start].trim_end().to_string();
-            std::fs::write(
-                &claude_md,
-                if new_content.is_empty() {
-                    String::new()
-                } else {
-                    format!("{}\n", new_content)
-                },
-            )?;
-            println!(
-                "  Removed primary search instructions from {}",
-                claude_md.display()
-            );
-        }
-    }
-
-    // Remove Cursor rules
-    let cursor_rule = home.join(".cursor").join("rules").join("infigraph.mdc");
-    if cursor_rule.exists() {
-        std::fs::remove_file(&cursor_rule)?;
-        println!("  Removed Cursor rules: {}", cursor_rule.display());
-    }
-
-    // Remove Windsurf rules
-    let windsurf_rule = home.join(".windsurf").join("rules").join("infigraph.md");
-    if windsurf_rule.exists() {
-        std::fs::remove_file(&windsurf_rule)?;
-        println!("  Removed Windsurf rules: {}", windsurf_rule.display());
-    }
-
-    // Remove /infigraph-reindex skill from ~/.claude/commands/
-    let reindex_cmd = home
-        .join(".claude")
-        .join("commands")
-        .join("infigraph-reindex.md");
-    if reindex_cmd.exists() {
-        std::fs::remove_file(&reindex_cmd)?;
-        println!("  Removed skill: {}", reindex_cmd.display());
-    }
-
-    // Remove hooks and Claude Code allowlist
+    // Remove hooks and Claude Code allowlist -- outside the artifact mechanism.
     crate::hooks::uninstall_hooks(&home)?;
     crate::hooks::uninstall_claude_allowlist(&home)?;
 
@@ -478,13 +410,59 @@ pub(crate) fn cmd_uninstall() -> Result<()> {
         }
     }
 
-    // Remove model cache ~/.infigraph/
-    let model_cache = home.join(".infigraph");
-    if model_cache.exists() {
-        std::fs::remove_dir_all(&model_cache)?;
-        println!("  Removed model cache: {}", model_cache.display());
-    }
+    clean_infigraph_cache_dir(&home)?;
 
+    Ok(())
+}
+
+/// The actual artifact-engine uninstall logic, factored out from
+/// `cmd_uninstall` so it's testable against a fake `$HOME`. Returns the list
+/// of artifact labels that were actually removed (mirrors `run_install`'s
+/// `InstallReport.written` shape, one label per artifact whose `remove_*`
+/// call reported `true`).
+pub(crate) fn run_uninstall(mcp_path: &Path, home: &Path) -> Result<Vec<String>> {
+    let mcp_path_str = mcp_path.to_string_lossy().to_string();
+    let user_override_dir = home.join(".infigraph").join("integrations");
+
+    let artifacts = crate::artifacts::discover_artifacts(
+        crate::artifacts::BUNDLED_INTEGRATIONS,
+        &user_override_dir,
+        &mcp_path_str,
+    )?;
+
+    let mut removed = Vec::new();
+    for artifact in &artifacts {
+        let was_removed = crate::artifacts::remove_resolved_artifact(artifact, home, &mcp_path_str)
+            .with_context(|| format!("removing {} artifact", artifact.integration_label))?;
+        if was_removed {
+            removed.push(artifact.integration_label.clone());
+        }
+    }
+    removed.sort();
+    removed.dedup();
+    Ok(removed)
+}
+
+/// Removes disposable caches under `~/.infigraph/` (the semantic-search
+/// model files, the update-check cache) while deliberately preserving
+/// `~/.infigraph/integrations/` -- the persistent, user-authored override
+/// directory the two-tier discovery system depends on (see Task 9). Before
+/// this PR, `~/.infigraph/` only ever held disposable caches, so wiping the
+/// whole directory on uninstall was safe; now that it also holds real user
+/// customization work, that would silently destroy it. Extracted as its own
+/// function (rather than inlined in `cmd_uninstall`) specifically so it's
+/// testable against a fake home directory -- `cmd_uninstall` itself calls
+/// `dirs::home_dir()` directly and can't be pointed at a temp dir in a test.
+fn clean_infigraph_cache_dir(home: &Path) -> Result<()> {
+    let models_cache = home.join(".infigraph").join("models");
+    if models_cache.exists() {
+        std::fs::remove_dir_all(&models_cache)?;
+        println!("  Removed model cache: {}", models_cache.display());
+    }
+    let update_check_cache = home.join(".infigraph").join("update_check.json");
+    if update_check_cache.exists() {
+        let _ = std::fs::remove_file(&update_check_cache);
+    }
     Ok(())
 }
 
@@ -890,6 +868,62 @@ mod tests {
                 .unwrap()
                 .len(),
             1
+        );
+    }
+
+    #[test]
+    fn cmd_uninstall_removes_everything_cmd_install_wrote() {
+        let home_dir = tempfile::tempdir().unwrap();
+        let mcp_path = "/opt/infigraph/bin/infigraph-mcp";
+
+        run_install(&std::path::PathBuf::from(mcp_path), home_dir.path()).unwrap();
+        assert!(home_dir.path().join(".claude.json").exists());
+
+        run_uninstall(&std::path::PathBuf::from(mcp_path), home_dir.path()).unwrap();
+
+        let claude_json: serde_json::Value = serde_json::from_str(
+            &std::fs::read_to_string(home_dir.path().join(".claude.json")).unwrap(),
+        )
+        .unwrap();
+        assert!(claude_json["mcpServers"]["infigraph"].is_null());
+        assert!(!home_dir
+            .path()
+            .join(".claude/hooks/infigraph-enforce.sh")
+            .exists());
+
+        let codex_toml =
+            std::fs::read_to_string(home_dir.path().join(".codex/config.toml")).unwrap();
+        assert!(!codex_toml.contains("[mcp_servers.infigraph]"));
+    }
+
+    #[test]
+    fn clean_infigraph_cache_dir_preserves_user_integration_overrides() {
+        let home_dir = tempfile::tempdir().unwrap();
+        let integrations_dir = home_dir.path().join(".infigraph").join("integrations");
+        std::fs::create_dir_all(&integrations_dir).unwrap();
+        std::fs::write(
+            integrations_dir.join("my-custom-agent.json"),
+            "a user's own override, not a cache",
+        )
+        .unwrap();
+
+        let models_dir = home_dir
+            .path()
+            .join(".infigraph")
+            .join("models")
+            .join("potion-base-8M");
+        std::fs::create_dir_all(&models_dir).unwrap();
+        std::fs::write(models_dir.join("model.safetensors"), "fake model data").unwrap();
+
+        clean_infigraph_cache_dir(home_dir.path()).unwrap();
+
+        assert!(
+            integrations_dir.join("my-custom-agent.json").exists(),
+            "user-authored integration overrides must survive uninstall's cache cleanup"
+        );
+        assert!(
+            !models_dir.exists(),
+            "the model cache should still be removed"
         );
     }
 }

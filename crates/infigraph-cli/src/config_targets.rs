@@ -1,3 +1,10 @@
+// Superseded by the artifact engine (crates/infigraph-cli/src/artifacts/):
+// cmd_install and cmd_uninstall (install.rs) no longer reference anything in
+// this file. Deleted outright in Task 20 -- suppressed here in the meantime
+// rather than deleted early, to keep this task's diff scoped to rewiring
+// cmd_uninstall.
+#![allow(dead_code)]
+
 use anyhow::{Context, Result};
 use serde_json::json;
 
