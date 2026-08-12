@@ -712,4 +712,104 @@ resolver = ["./resolve-zed-path.sh"]
             );
         }
     }
+
+    #[test]
+    fn bundled_cursor_rules_and_mcp_apply_correctly() {
+        let user_dir = tempfile::tempdir().unwrap();
+        let home_dir = tempfile::tempdir().unwrap();
+        let mcp_path = "/opt/infigraph/bin/infigraph-mcp";
+
+        let artifacts =
+            discover_artifacts(BUNDLED_INTEGRATIONS, user_dir.path(), mcp_path).unwrap();
+
+        let rules = artifacts
+            .iter()
+            .find(|a| a.target_relative_path.as_deref() == Some(".cursor/rules/infigraph.mdc"))
+            .expect("cursor rules artifact should be discovered from cursor/config.toml");
+        assert_eq!(rules.strategy, Strategy::Overwrite);
+        apply_resolved_artifact(rules, home_dir.path(), mcp_path).unwrap();
+        let rules_content =
+            std::fs::read_to_string(home_dir.path().join(".cursor/rules/infigraph.mdc")).unwrap();
+        assert!(rules_content.contains("## Infigraph — Primary Code Intelligence"));
+
+        let mcp = artifacts
+            .iter()
+            .find(|a| a.target_relative_path.as_deref() == Some(".cursor/mcp.json"))
+            .expect("cursor mcp.json fragment should be discovered");
+        assert_eq!(mcp.strategy, Strategy::JsonDeepMerge);
+        apply_resolved_artifact(mcp, home_dir.path(), mcp_path).unwrap();
+        let mcp_written: serde_json::Value = serde_json::from_str(
+            &std::fs::read_to_string(home_dir.path().join(".cursor/mcp.json")).unwrap(),
+        )
+        .unwrap();
+        assert_eq!(mcp_written["mcpServers"]["infigraph"]["command"], mcp_path);
+    }
+
+    #[test]
+    fn bundled_windsurf_rules_and_mcp_apply_correctly() {
+        let user_dir = tempfile::tempdir().unwrap();
+        let home_dir = tempfile::tempdir().unwrap();
+        let mcp_path = "/opt/infigraph/bin/infigraph-mcp";
+
+        let artifacts =
+            discover_artifacts(BUNDLED_INTEGRATIONS, user_dir.path(), mcp_path).unwrap();
+
+        let rules = artifacts
+            .iter()
+            .find(|a| a.target_relative_path.as_deref() == Some(".windsurf/rules/infigraph.md"))
+            .expect("windsurf rules artifact should be discovered from windsurf/config.toml");
+        assert_eq!(rules.strategy, Strategy::Overwrite);
+        apply_resolved_artifact(rules, home_dir.path(), mcp_path).unwrap();
+        let rules_content =
+            std::fs::read_to_string(home_dir.path().join(".windsurf/rules/infigraph.md")).unwrap();
+        assert!(rules_content.contains("## Infigraph — Primary Code Intelligence"));
+
+        let mcp = artifacts
+            .iter()
+            .find(|a| {
+                a.target_relative_path.as_deref() == Some(".codeium/windsurf/mcp_config.json")
+            })
+            .expect("windsurf mcp_config.json fragment should be discovered");
+        assert_eq!(mcp.strategy, Strategy::JsonDeepMerge);
+        apply_resolved_artifact(mcp, home_dir.path(), mcp_path).unwrap();
+        let mcp_written: serde_json::Value = serde_json::from_str(
+            &std::fs::read_to_string(home_dir.path().join(".codeium/windsurf/mcp_config.json"))
+                .unwrap(),
+        )
+        .unwrap();
+        assert_eq!(mcp_written["mcpServers"]["infigraph"]["command"], mcp_path);
+    }
+
+    #[test]
+    fn shared_agents_md_override_changes_both_cursor_and_windsurf_output() {
+        let user_dir = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(user_dir.path().join("shared")).unwrap();
+        std::fs::write(
+            user_dir.path().join("shared/agents.md"),
+            "## Overridden instructions",
+        )
+        .unwrap();
+        let mcp_path = "/opt/infigraph/bin/infigraph-mcp";
+
+        let artifacts =
+            discover_artifacts(BUNDLED_INTEGRATIONS, user_dir.path(), mcp_path).unwrap();
+
+        let cursor_rules = artifacts
+            .iter()
+            .find(|a| a.target_relative_path.as_deref() == Some(".cursor/rules/infigraph.mdc"))
+            .unwrap();
+        assert_eq!(
+            String::from_utf8(cursor_rules.content.clone().unwrap()).unwrap(),
+            "## Overridden instructions"
+        );
+
+        let windsurf_rules = artifacts
+            .iter()
+            .find(|a| a.target_relative_path.as_deref() == Some(".windsurf/rules/infigraph.md"))
+            .unwrap();
+        assert_eq!(
+            String::from_utf8(windsurf_rules.content.clone().unwrap()).unwrap(),
+            "## Overridden instructions"
+        );
+    }
 }
