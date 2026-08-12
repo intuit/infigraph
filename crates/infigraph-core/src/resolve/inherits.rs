@@ -17,6 +17,20 @@ pub(crate) fn resolve_inherits(
 ) -> Result<usize> {
     let mut resolved_pairs: Vec<(String, String)> = Vec::new();
 
+    // Span size per symbol id, used to prefer a real definition over a
+    // same-named forward-declaration stub (e.g. `class ITpsContext;`) when
+    // multiple cross-file candidates remain after import/kind disambiguation.
+    let span_by_id: HashMap<&str, u32> = extractions
+        .iter()
+        .flat_map(|ext| ext.symbols.iter())
+        .map(|sym| {
+            (
+                sym.id.as_str(),
+                sym.span.end_line.saturating_sub(sym.span.start_line),
+            )
+        })
+        .collect();
+
     for ext in extractions {
         let local_symbols: std::collections::HashSet<&str> =
             ext.symbols.iter().map(|s| s.name.as_str()).collect();
@@ -69,7 +83,15 @@ pub(crate) fn resolve_inherits(
                             shortest_id(cross_file.iter().copied(), |(_, _, k)| k == "Interface")
                         })
                         .flatten();
-                    in_scope.or(by_kind).or_else(|| {
+                    // Prefer the candidate with the largest body — a real definition
+                    // over a same-named forward-declaration stub (e.g. `class Foo;`,
+                    // which spans 0 lines and has no members).
+                    let by_definition_size = cross_file
+                        .iter()
+                        .max_by_key(|(id, _, _)| span_by_id.get(id.as_str()).copied().unwrap_or(0))
+                        .filter(|(id, _, _)| span_by_id.get(id.as_str()).copied().unwrap_or(0) > 0)
+                        .map(|(id, _, _)| id.clone());
+                    in_scope.or(by_kind).or(by_definition_size).or_else(|| {
                         cross_file
                             .iter()
                             .min_by(|(a, _, _), (b, _, _)| {
