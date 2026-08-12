@@ -209,6 +209,32 @@ pub fn extract_relations_with_custom_edges(
 }
 
 /// Walk up the AST to find the enclosing function/method definition and return its name.
+/// Walk a C/C++ declarator chain (pointer_declarator, reference_declarator,
+/// etc.) down to the innermost function_declarator, if any.
+fn find_cpp_function_declarator(function_definition: Node) -> Option<Node> {
+    let mut current = function_definition.child_by_field_name("declarator")?;
+    loop {
+        if current.kind() == "function_declarator" {
+            return Some(current);
+        }
+        current = current.child_by_field_name("declarator")?;
+    }
+}
+
+/// Reduce a declarator name node to its identifier: qualified names
+/// (`ClassName::method`) and destructor names (`~ClassName`) carry the
+/// leaf identifier in a nested field rather than as their own text.
+fn rightmost_identifier(node: Node) -> Node {
+    match node.kind() {
+        "qualified_identifier" => node
+            .child_by_field_name("name")
+            .map(rightmost_identifier)
+            .unwrap_or(node),
+        "destructor_name" => node.named_child(0).unwrap_or(node),
+        _ => node,
+    }
+}
+
 fn find_enclosing_function(node: Node, source: &[u8]) -> Option<String> {
     let func_kinds = [
         "function_definition",  // Python, JS, Lua, VB6 Function
@@ -229,6 +255,18 @@ fn find_enclosing_function(node: Node, source: &[u8]) -> Option<String> {
         if func_kinds.contains(&n.kind()) {
             if let Some(name_node) = n.child_by_field_name("name") {
                 return Some(node_text(name_node, source));
+            }
+        }
+        // C/C++: function_definition has no "name" field — the name is nested
+        // inside its "declarator" field, itself possibly wrapped in
+        // pointer_declarator/reference_declarator (e.g. `T* foo()`) before
+        // reaching the function_declarator whose own "declarator" field holds
+        // the identifier/field_identifier/qualified_identifier/destructor_name.
+        if n.kind() == "function_definition" {
+            if let Some(func_declarator) = find_cpp_function_declarator(n) {
+                if let Some(name_field) = func_declarator.child_by_field_name("declarator") {
+                    return Some(node_text(rightmost_identifier(name_field), source));
+                }
             }
         }
         // Pascal: defProc → header (declProc) → name

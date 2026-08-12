@@ -221,7 +221,12 @@ pub fn bundled_registry() -> Result<LanguageRegistry> {
         Err(e) => eprintln!("warning: failed to load C language pack: {e}"),
     }
     match cpp_pack() {
-        Ok(pack) => registry.register(pack),
+        // `.h` is claimed by the C pack by extension, but in a C++ codebase the
+        // overwhelming majority of headers are C++ (templates, classes,
+        // namespaces) — parsing those with the C grammar silently drops every
+        // class, template, and namespace symbol in them. Probe the content and
+        // route C++-looking headers to the C++ grammar instead.
+        Ok(pack) => registry.register_with_content_probe(pack, &[".h"], is_cpp_header),
         Err(e) => eprintln!("warning: failed to load C++ language pack: {e}"),
     }
     match ruby_pack() {
@@ -518,6 +523,32 @@ fn java_pack() -> Result<LanguagePack> {
 fn c_pack() -> Result<LanguagePack> {
     let grammar = tree_sitter_c::LANGUAGE.into();
     LanguagePack::new("c", vec![".c", ".h"], grammar, C_ENTITIES, C_RELATIONS)
+}
+
+/// Content probe for `.h` files: true when the header uses C++-only syntax.
+///
+/// `.h` is ambiguous — valid for both C and C++ — and extension lookup alone
+/// sends every one of them to the C grammar, which cannot represent classes,
+/// templates, or namespaces. Each marker below is a construct that does not
+/// parse as C, so a match means the file must be treated as C++. Plain C
+/// headers match none of them and keep the C grammar.
+fn is_cpp_header(content: &[u8]) -> bool {
+    let Ok(text) = std::str::from_utf8(content) else {
+        return false;
+    };
+    const CPP_MARKERS: &[&str] = &[
+        "template<",
+        "template <",
+        "namespace ",
+        "class ",
+        "public:",
+        "private:",
+        "protected:",
+        "virtual ",
+        "std::",
+        "extern \"C\"",
+    ];
+    CPP_MARKERS.iter().any(|m| text.contains(m))
 }
 
 fn cpp_pack() -> Result<LanguagePack> {

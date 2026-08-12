@@ -395,6 +395,83 @@ fn test_extraction_smoke_java() {
     assert!(names.contains(&"add"), "should extract add: {names:?}");
 }
 
+#[test]
+fn test_extraction_cpp_produces_call_relations() {
+    let registry = bundled_registry().unwrap();
+    let pack = registry.for_extension(".cpp").unwrap();
+
+    let source = b"void helper() {}\n\nvoid caller() {\n    helper();\n}\n\nnamespace ns {\n    void nsFunc() {}\n}\n\nvoid callsQualified() {\n    ns::nsFunc();\n}\n\ntemplate<class T>\nvoid templ(T x) {}\n\nvoid callsTemplate() {\n    templ<int>(5);\n}\n";
+    let extraction = infigraph_core::extract::extract_file("calls.cpp", source, pack)
+        .expect("extraction should succeed");
+
+    let calls: Vec<&str> = extraction
+        .relations
+        .iter()
+        .filter(|r| r.kind == infigraph_core::model::RelationKind::Calls)
+        .map(|r| r.target_id.as_str())
+        .collect();
+    assert!(
+        calls.iter().any(|t| t.contains("helper")),
+        "should detect plain helper() call: {calls:?}"
+    );
+    assert!(
+        calls.iter().any(|t| t.contains("nsFunc")),
+        "should detect ns::nsFunc() qualified call: {calls:?}"
+    );
+    assert!(
+        calls.iter().any(|t| t.contains("templ")),
+        "should detect templ<int>(5) template call: {calls:?}"
+    );
+}
+
+#[test]
+fn test_cpp_out_of_line_method_definitions_extracted() {
+    let registry = bundled_registry().unwrap();
+    let pack = registry.for_extension(".cpp").unwrap();
+
+    // A pointer/reference return type wraps the function_declarator in a
+    // pointer_declarator, which an unwrapped query pattern misses entirely.
+    let source = b"const char* zctFormSet::GetTaxMLTaxReturnTag() const\n{\n    return mTag;\n}\n\nvoid zctFormSet::PlainMethod()\n{\n}\n\nFoo& zctFormSet::RefReturn()\n{\n    return mFoo;\n}\n";
+    let extraction = infigraph_core::extract::extract_file("ctFSet.cpp", source, pack)
+        .expect("extraction should succeed");
+
+    let names: Vec<&str> = extraction.symbols.iter().map(|s| s.name.as_str()).collect();
+    for expected in ["GetTaxMLTaxReturnTag", "PlainMethod", "RefReturn"] {
+        assert!(
+            names.contains(&expected),
+            "out-of-line method {expected} should be extracted: {names:?}"
+        );
+    }
+}
+
+#[test]
+fn test_cpp_header_routed_to_cpp_grammar_by_content_probe() {
+    let registry = bundled_registry().unwrap();
+
+    // A C++ header named .h — extension alone sends this to the C pack, whose
+    // grammar has no template_declaration, so ParseFormML would vanish.
+    let cpp_header = b"template<class Handler>\nvoid ParseFormML(const char* s, Handler& h) {}\n";
+    let pack = registry
+        .for_file_with_content("zssFormMLSaxParser.h", cpp_header)
+        .expect("should resolve a pack for .h");
+    assert_eq!(pack.name, "cpp", "C++ header should route to cpp grammar");
+
+    let extraction = infigraph_core::extract::extract_file("hdr.h", cpp_header, pack)
+        .expect("extraction should succeed");
+    let names: Vec<&str> = extraction.symbols.iter().map(|s| s.name.as_str()).collect();
+    assert!(
+        names.contains(&"ParseFormML"),
+        "template function should be extracted: {names:?}"
+    );
+
+    // A plain C header must keep the C grammar.
+    let c_header = b"#ifndef FOO_H\n#define FOO_H\nint add(int a, int b);\n#endif\n";
+    let pack = registry
+        .for_file_with_content("foo.h", c_header)
+        .expect("should resolve a pack for .h");
+    assert_eq!(pack.name, "c", "plain C header should stay on c grammar");
+}
+
 /// Regression test: TypeScript inheritance clauses whose base type is a generic
 /// (`Shape<T>`) or qualified/dotted name (`ns.Bar`) or member expression
 /// (`React.Component`) previously resolved to the WRONG identifier once the
