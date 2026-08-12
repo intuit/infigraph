@@ -5,6 +5,7 @@ use anyhow::{Context, Result};
 
 use super::convention::{infer_strategy, ConventionStrategy};
 use super::manifest::parse_manifest;
+use super::step::InstallStep;
 use super::strategy::Strategy;
 use super::template::{substitute_mcp_path, TemplateFormat};
 
@@ -25,6 +26,7 @@ pub(crate) struct ResolvedArtifact {
     /// relative resolver command like `./resolve-zed-path.sh` should be
     /// spawned from.
     pub resolver: Option<(Vec<String>, PathBuf)>,
+    pub step: InstallStep,
 }
 
 fn is_toml_extension(relative_path: &str) -> bool {
@@ -206,6 +208,7 @@ pub(crate) fn discover_artifacts(
                     .resolver
                     .clone()
                     .map(|cmd| (cmd, PathBuf::from(integration_dir))),
+                step: InstallStep::classify(&entry.path, strategy),
             });
         }
     }
@@ -264,6 +267,7 @@ pub(crate) fn discover_artifacts(
             end: None,
             key_path: None,
             resolver: None,
+            step: InstallStep::classify(relative_path, strategy),
         });
     }
 
@@ -472,5 +476,31 @@ content_file = "../shared/agents.md"
             artifacts.is_empty(),
             "shared/ content must only be reachable via a content_file reference, never applied directly"
         );
+    }
+
+    #[test]
+    fn discovered_artifacts_get_correct_install_step() {
+        let bundled: &[(&str, &[u8])] = &[
+            ("claude-code/hooks/enforce.sh", b"#!/bin/bash\n"),
+            (
+                "claude-code/.claude.json",
+                br#"{"mcpServers":{"infigraph":{"command":"{{mcp_path}}"}}}"#,
+            ),
+        ];
+        let user_dir = tempfile::tempdir().unwrap();
+
+        let artifacts = discover_artifacts(bundled, user_dir.path(), "/bin/infigraph-mcp").unwrap();
+
+        let hook = artifacts
+            .iter()
+            .find(|a| a.target_relative_path == "hooks/enforce.sh")
+            .unwrap();
+        assert_eq!(hook.step, super::super::step::InstallStep::Hooks);
+
+        let mcp = artifacts
+            .iter()
+            .find(|a| a.target_relative_path == ".claude.json")
+            .unwrap();
+        assert_eq!(mcp.step, super::super::step::InstallStep::McpRegistration);
     }
 }

@@ -19,6 +19,7 @@ mod strategy;
 mod template;
 
 pub(crate) use discovery::{discover_artifacts, ResolvedArtifact};
+pub(crate) use step::InstallStep;
 pub(crate) use strategy::{ApplyOutcome, Strategy};
 
 include!(concat!(env!("OUT_DIR"), "/bundled_integrations.rs"));
