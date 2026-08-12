@@ -3547,11 +3547,1600 @@ git commit -m "fix(cli): make resolver-driven artifacts (VS Code, Zed) actually 
 
 ---
 
+## Task 13: Five simple convention-based integrations (Gemini CLI, OpenCode, Aider, Kiro, GitHub Copilot CLI)
+
+These five integrations need no `config.toml` manifest at all — each is a single bundled `.json` fragment at its real, mirrored destination path (the "core idea" convention: a `.json` file's mere presence at a mirrored path is its own registration). Paths and shapes are the ones independently re-verified in the design spec's "Research: verified per-agent MCP schemas" table, and (per this session's live research) VS Code and GitHub Copilot CLI's configs remain genuinely separate, so Copilot CLI's own dedicated path/shape stands as designed.
+
+**Files:**
+- Create: `crates/infigraph-cli/resources/integrations/gemini-cli/.gemini/settings.json`
+- Create: `crates/infigraph-cli/resources/integrations/opencode/.config/opencode/opencode.json`
+- Create: `crates/infigraph-cli/resources/integrations/aider/.aider/mcp.json`
+- Create: `crates/infigraph-cli/resources/integrations/kiro/.kiro/settings/mcp.json`
+- Create: `crates/infigraph-cli/resources/integrations/github-copilot-cli/.copilot/mcp-config.json`
+- Modify: `crates/infigraph-cli/src/artifacts/mod.rs` (fixture tests appended to `integration_tests`)
+
+**Interfaces:**
+- Consumes: `discover_artifacts`, `apply_resolved_artifact`, `Strategy` (Tasks 9-12), and — for the first time — the real compiled `BUNDLED_INTEGRATIONS` registry from `build.rs` (Task 9), instead of a synthetic fixture.
+
+- [ ] **Step 1: Write the failing tests**
+
+Append to the `#[cfg(test)] mod integration_tests { ... }` block in `crates/infigraph-cli/src/artifacts/mod.rs`:
+
+```rust
+    #[test]
+    fn bundled_gemini_cli_mcp_fragment_applies_correctly() {
+        let user_dir = tempfile::tempdir().unwrap();
+        let home_dir = tempfile::tempdir().unwrap();
+        let mcp_path = "/opt/infigraph/bin/infigraph-mcp";
+
+        let artifacts = discover_artifacts(BUNDLED_INTEGRATIONS, user_dir.path(), mcp_path).unwrap();
+        let gemini = artifacts
+            .iter()
+            .find(|a| a.target_relative_path.as_deref() == Some(".gemini/settings.json"))
+            .expect("gemini-cli fragment should be discovered from the bundled registry");
+        assert_eq!(gemini.strategy, Strategy::JsonDeepMerge);
+
+        apply_resolved_artifact(gemini, home_dir.path(), mcp_path).unwrap();
+        let written: serde_json::Value = serde_json::from_str(
+            &std::fs::read_to_string(home_dir.path().join(".gemini/settings.json")).unwrap(),
+        )
+        .unwrap();
+        assert_eq!(written["mcpServers"]["infigraph"]["command"], mcp_path);
+        assert_eq!(written["mcpServers"]["infigraph"]["args"][0], "--mcp");
+    }
+
+    #[test]
+    fn bundled_opencode_mcp_fragment_applies_correctly() {
+        let user_dir = tempfile::tempdir().unwrap();
+        let home_dir = tempfile::tempdir().unwrap();
+        let mcp_path = "/opt/infigraph/bin/infigraph-mcp";
+
+        let artifacts = discover_artifacts(BUNDLED_INTEGRATIONS, user_dir.path(), mcp_path).unwrap();
+        let opencode = artifacts
+            .iter()
+            .find(|a| a.target_relative_path.as_deref() == Some(".config/opencode/opencode.json"))
+            .expect("opencode fragment should be discovered from the bundled registry");
+        assert_eq!(opencode.strategy, Strategy::JsonDeepMerge);
+
+        apply_resolved_artifact(opencode, home_dir.path(), mcp_path).unwrap();
+        let written: serde_json::Value = serde_json::from_str(
+            &std::fs::read_to_string(home_dir.path().join(".config/opencode/opencode.json"))
+                .unwrap(),
+        )
+        .unwrap();
+        assert_eq!(written["mcp"]["infigraph"]["type"], "local");
+        assert_eq!(written["mcp"]["infigraph"]["command"][0], mcp_path);
+        assert_eq!(written["mcp"]["infigraph"]["command"][1], "--mcp");
+    }
+
+    #[test]
+    fn bundled_aider_mcp_fragment_applies_correctly() {
+        let user_dir = tempfile::tempdir().unwrap();
+        let home_dir = tempfile::tempdir().unwrap();
+        let mcp_path = "/opt/infigraph/bin/infigraph-mcp";
+
+        let artifacts = discover_artifacts(BUNDLED_INTEGRATIONS, user_dir.path(), mcp_path).unwrap();
+        let aider = artifacts
+            .iter()
+            .find(|a| a.target_relative_path.as_deref() == Some(".aider/mcp.json"))
+            .expect("aider fragment should be discovered from the bundled registry");
+        assert_eq!(aider.strategy, Strategy::JsonDeepMerge);
+
+        apply_resolved_artifact(aider, home_dir.path(), mcp_path).unwrap();
+        let written: serde_json::Value = serde_json::from_str(
+            &std::fs::read_to_string(home_dir.path().join(".aider/mcp.json")).unwrap(),
+        )
+        .unwrap();
+        assert_eq!(written["mcpServers"]["infigraph"]["command"], mcp_path);
+        assert_eq!(written["mcpServers"]["infigraph"]["args"][0], "--mcp");
+    }
+
+    #[test]
+    fn bundled_kiro_mcp_fragment_applies_correctly() {
+        let user_dir = tempfile::tempdir().unwrap();
+        let home_dir = tempfile::tempdir().unwrap();
+        let mcp_path = "/opt/infigraph/bin/infigraph-mcp";
+
+        let artifacts = discover_artifacts(BUNDLED_INTEGRATIONS, user_dir.path(), mcp_path).unwrap();
+        let kiro = artifacts
+            .iter()
+            .find(|a| a.target_relative_path.as_deref() == Some(".kiro/settings/mcp.json"))
+            .expect("kiro fragment should be discovered from the bundled registry");
+        assert_eq!(kiro.strategy, Strategy::JsonDeepMerge);
+
+        apply_resolved_artifact(kiro, home_dir.path(), mcp_path).unwrap();
+        let written: serde_json::Value = serde_json::from_str(
+            &std::fs::read_to_string(home_dir.path().join(".kiro/settings/mcp.json")).unwrap(),
+        )
+        .unwrap();
+        assert_eq!(written["mcpServers"]["infigraph"]["command"], mcp_path);
+        assert_eq!(written["mcpServers"]["infigraph"]["args"][0], "--mcp");
+    }
+
+    #[test]
+    fn bundled_github_copilot_cli_mcp_fragment_applies_correctly() {
+        let user_dir = tempfile::tempdir().unwrap();
+        let home_dir = tempfile::tempdir().unwrap();
+        let mcp_path = "/opt/infigraph/bin/infigraph-mcp";
+
+        let artifacts = discover_artifacts(BUNDLED_INTEGRATIONS, user_dir.path(), mcp_path).unwrap();
+        let copilot = artifacts
+            .iter()
+            .find(|a| a.target_relative_path.as_deref() == Some(".copilot/mcp-config.json"))
+            .expect("github-copilot-cli fragment should be discovered from the bundled registry");
+        assert_eq!(copilot.strategy, Strategy::JsonDeepMerge);
+
+        apply_resolved_artifact(copilot, home_dir.path(), mcp_path).unwrap();
+        let written: serde_json::Value = serde_json::from_str(
+            &std::fs::read_to_string(home_dir.path().join(".copilot/mcp-config.json")).unwrap(),
+        )
+        .unwrap();
+        assert_eq!(written["mcpServers"]["infigraph"]["command"], mcp_path);
+        assert_eq!(written["mcpServers"]["infigraph"]["args"][0], "--mcp");
+    }
+```
+
+- [ ] **Step 2: Run the tests to verify they fail**
+
+Run: `cargo test -p infigraph-cli artifacts::integration_tests::bundled -- --nocapture`
+Expected: all 5 tests fail on the `.expect(...)` (`.find(...)` returns `None`) — the bundled files don't exist yet.
+
+- [ ] **Step 3: Create the five bundled fragment files**
+
+Write `crates/infigraph-cli/resources/integrations/gemini-cli/.gemini/settings.json`:
+
+```json
+{"mcpServers":{"infigraph":{"command":"{{mcp_path}}","args":["--mcp"]}}}
+```
+
+Write `crates/infigraph-cli/resources/integrations/opencode/.config/opencode/opencode.json`:
+
+```json
+{"mcp":{"infigraph":{"type":"local","command":["{{mcp_path}}","--mcp"]}}}
+```
+
+Write `crates/infigraph-cli/resources/integrations/aider/.aider/mcp.json`:
+
+```json
+{"mcpServers":{"infigraph":{"command":"{{mcp_path}}","args":["--mcp"]}}}
+```
+
+Write `crates/infigraph-cli/resources/integrations/kiro/.kiro/settings/mcp.json`:
+
+```json
+{"mcpServers":{"infigraph":{"command":"{{mcp_path}}","args":["--mcp"]}}}
+```
+
+Write `crates/infigraph-cli/resources/integrations/github-copilot-cli/.copilot/mcp-config.json`:
+
+```json
+{"mcpServers":{"infigraph":{"command":"{{mcp_path}}","args":["--mcp"]}}}
+```
+
+- [ ] **Step 4: Run the tests to verify they pass**
+
+Run: `cargo test -p infigraph-cli artifacts::integration_tests::bundled -- --nocapture`
+Expected: all 5 tests pass. (`cargo test` triggers `build.rs` to re-walk `resources/integrations/` automatically, per its `cargo:rerun-if-changed` directive from Task 9 — no separate build step needed.)
+
+- [ ] **Step 5: Commit**
+
+```bash
+git add crates/infigraph-cli/resources/integrations/gemini-cli crates/infigraph-cli/resources/integrations/opencode crates/infigraph-cli/resources/integrations/aider crates/infigraph-cli/resources/integrations/kiro crates/infigraph-cli/resources/integrations/github-copilot-cli crates/infigraph-cli/src/artifacts/mod.rs
+git commit -m "feat(cli): bundle MCP config for Gemini CLI, OpenCode, Aider, Kiro, GitHub Copilot CLI"
+```
+
+---
+
+## Task 14: Claude Code (hooks, settings.json, .claude.json, CLAUDE.md, and the shared reindex skill)
+
+The most complex integration: 10 hook scripts, a `settings.json` fragment wiring all of them into their exact current event/matcher/timeout/async shape, the `.claude.json` MCP registration, and — via `config.toml` — CLAUDE.md's marker-delimited instructional block and the shared reindex skill, both pulled from `shared/`.
+
+**Files:**
+- Create: `crates/infigraph-cli/resources/integrations/claude-code/.claude.json`
+- Create: `crates/infigraph-cli/resources/integrations/claude-code/.claude/settings.json`
+- Create: `crates/infigraph-cli/resources/integrations/claude-code/.claude/hooks/infigraph-enforce.sh` (and 9 more — see Step 3)
+- Create: `crates/infigraph-cli/resources/integrations/shared/agents.md`
+- Create: `crates/infigraph-cli/resources/integrations/shared/skills/infigraph-reindex/SKILL.md`
+- Create: `crates/infigraph-cli/resources/integrations/claude-code/config.toml`
+- Modify: `crates/infigraph-cli/src/artifacts/mod.rs` (fixture tests)
+
+**Interfaces:**
+- Consumes: everything from Tasks 1-13.
+
+- [ ] **Step 1: Write the failing tests**
+
+Append to the `#[cfg(test)] mod integration_tests { ... }` block in `crates/infigraph-cli/src/artifacts/mod.rs`:
+
+```rust
+    #[test]
+    fn bundled_claude_json_applies_correctly() {
+        let user_dir = tempfile::tempdir().unwrap();
+        let home_dir = tempfile::tempdir().unwrap();
+        let mcp_path = "/opt/infigraph/bin/infigraph-mcp";
+
+        let artifacts = discover_artifacts(BUNDLED_INTEGRATIONS, user_dir.path(), mcp_path).unwrap();
+        let claude_json = artifacts
+            .iter()
+            .find(|a| a.target_relative_path.as_deref() == Some(".claude.json"))
+            .expect("claude-code's .claude.json fragment should be discovered");
+        assert_eq!(claude_json.strategy, Strategy::JsonDeepMerge);
+
+        apply_resolved_artifact(claude_json, home_dir.path(), mcp_path).unwrap();
+        let written: serde_json::Value = serde_json::from_str(
+            &std::fs::read_to_string(home_dir.path().join(".claude.json")).unwrap(),
+        )
+        .unwrap();
+        assert_eq!(written["mcpServers"]["infigraph"]["command"], mcp_path);
+    }
+
+    #[test]
+    fn bundled_claude_md_and_reindex_skill_apply_via_manifest() {
+        let user_dir = tempfile::tempdir().unwrap();
+        let home_dir = tempfile::tempdir().unwrap();
+        let mcp_path = "/opt/infigraph/bin/infigraph-mcp";
+
+        let artifacts = discover_artifacts(BUNDLED_INTEGRATIONS, user_dir.path(), mcp_path).unwrap();
+
+        let claude_md = artifacts
+            .iter()
+            .find(|a| a.target_relative_path.as_deref() == Some(".claude/CLAUDE.md"))
+            .expect("CLAUDE.md marker_delimited artifact should be discovered from claude-code/config.toml");
+        assert_eq!(claude_md.strategy, Strategy::MarkerDelimited);
+        apply_resolved_artifact(claude_md, home_dir.path(), mcp_path).unwrap();
+        let claude_md_content =
+            std::fs::read_to_string(home_dir.path().join(".claude/CLAUDE.md")).unwrap();
+        assert!(claude_md_content.contains("## Infigraph — Primary Code Intelligence"));
+        assert!(claude_md_content.contains("<!-- infigraph-primary-search -->"));
+
+        let skill = artifacts
+            .iter()
+            .find(|a| a.target_relative_path.as_deref() == Some(".claude/skills/infigraph-reindex/SKILL.md"))
+            .expect("reindex skill artifact should be discovered from claude-code/config.toml");
+        assert_eq!(skill.strategy, Strategy::Overwrite);
+        apply_resolved_artifact(skill, home_dir.path(), mcp_path).unwrap();
+        let skill_content = std::fs::read_to_string(
+            home_dir.path().join(".claude/skills/infigraph-reindex/SKILL.md"),
+        )
+        .unwrap();
+        assert!(skill_content.starts_with("---\nname: infigraph-reindex"));
+        assert!(skill_content.contains("mcp__infigraph__index_project"));
+    }
+
+    #[test]
+    fn bundled_settings_json_multi_event_test() {
+        let user_dir = tempfile::tempdir().unwrap();
+        let home_dir = tempfile::tempdir().unwrap();
+        let mcp_path = "/opt/infigraph/bin/infigraph-mcp";
+
+        let artifacts = discover_artifacts(BUNDLED_INTEGRATIONS, user_dir.path(), mcp_path).unwrap();
+        let settings = artifacts
+            .iter()
+            .find(|a| a.target_relative_path.as_deref() == Some(".claude/settings.json"))
+            .expect("settings.json fragment should be discovered");
+        assert_eq!(settings.strategy, Strategy::JsonDeepMerge);
+
+        apply_resolved_artifact(settings, home_dir.path(), mcp_path).unwrap();
+        apply_resolved_artifact(settings, home_dir.path(), mcp_path).unwrap(); // reapply: must not duplicate
+
+        let written: serde_json::Value = serde_json::from_str(
+            &std::fs::read_to_string(home_dir.path().join(".claude/settings.json")).unwrap(),
+        )
+        .unwrap();
+
+        for (event, expected_count) in [
+            ("PreToolUse", 1),
+            ("PostToolUse", 4),
+            ("UserPromptSubmit", 3),
+            ("SessionStart", 1),
+            ("SessionEnd", 1),
+            ("PreCompact", 1),
+        ] {
+            let arr = written["hooks"][event]
+                .as_array()
+                .unwrap_or_else(|| panic!("{event} should be an array"));
+            assert_eq!(
+                arr.len(),
+                expected_count,
+                "{event} should have exactly {expected_count} entries after reapply, got {arr:?}"
+            );
+        }
+
+        let enforce_command = written["hooks"]["PreToolUse"][0]["hooks"][0]["command"]
+            .as_str()
+            .unwrap();
+        assert!(enforce_command.contains("infigraph-enforce.sh"));
+    }
+
+    #[test]
+    fn bundled_hook_scripts_have_expected_content() {
+        let user_dir = tempfile::tempdir().unwrap();
+        let home_dir = tempfile::tempdir().unwrap();
+        let mcp_path = "/opt/infigraph/bin/infigraph-mcp";
+
+        let artifacts = discover_artifacts(BUNDLED_INTEGRATIONS, user_dir.path(), mcp_path).unwrap();
+        for (relative, expected_substring) in [
+            (".claude/hooks/infigraph-enforce.sh", "deny-by-default"),
+            (".claude/hooks/infigraph-edit-tracker.sh", "recent_edits.log"),
+            (".claude/hooks/infigraph-session-save.sh", "save_session"),
+            (".claude/hooks/infigraph-session-reset.sh", "save_session"),
+            (".claude/hooks/infigraph-session-start.sh", "inject_session_summary"),
+            (".claude/hooks/infigraph-session-end-save.sh", "unsaved-transcript"),
+            (".claude/hooks/infigraph-clear-suggest.sh", "save session and type"),
+            (".claude/hooks/infigraph-clear-guard.sh", "Session not saved"),
+            (".claude/hooks/infigraph-test-context-sentinel.sh", "generate_test_context"),
+            (".claude/hooks/infigraph-search-fallback-sentinel.sh", "search-fallback-allowed"),
+        ] {
+            let artifact = artifacts
+                .iter()
+                .find(|a| a.target_relative_path.as_deref() == Some(relative))
+                .unwrap_or_else(|| panic!("{relative} should be discovered"));
+            assert_eq!(artifact.strategy, Strategy::Overwrite);
+            apply_resolved_artifact(artifact, home_dir.path(), mcp_path).unwrap();
+            let content = std::fs::read_to_string(home_dir.path().join(relative)).unwrap();
+            assert!(
+                content.contains(expected_substring),
+                "{relative} should contain {expected_substring:?}"
+            );
+        }
+    }
+```
+
+- [ ] **Step 2: Run the tests to verify they fail**
+
+Run: `cargo test -p infigraph-cli artifacts::integration_tests::bundled_claude -- --nocapture` and `cargo test -p infigraph-cli artifacts::integration_tests::bundled_settings -- --nocapture` and `cargo test -p infigraph-cli artifacts::integration_tests::bundled_hook -- --nocapture`
+Expected: all fail (`.expect`/`.unwrap_or_else` panics) — none of the bundled files exist yet.
+
+- [ ] **Step 3: Copy the 10 hook scripts verbatim from `hooks.rs`**
+
+Each destination file's content is the named constant's raw-string body from `crates/infigraph-cli/src/hooks.rs` — everything from the line after the constant's `= r#"` (or `= r##"` for the two using `##` delimiters, since their content itself contains a `#`) through the line before the matching closing `"#;`/`"##;`, copied byte-for-byte (no Rust escaping to undo — these are raw strings). Strip only the opening/closing raw-string delimiter lines themselves.
+
+| Destination | Source constant | Source lines (content only, delimiters excluded) |
+|---|---|---|
+| `claude-code/.claude/hooks/infigraph-enforce.sh` | `ENFORCE_HOOK_SCRIPT` | `hooks.rs:4-129` |
+| `claude-code/.claude/hooks/infigraph-session-save.sh` | `SESSION_SAVE_HOOK_SCRIPT` | `hooks.rs:132-196` |
+| `claude-code/.claude/hooks/infigraph-session-reset.sh` | `SESSION_RESET_HOOK_SCRIPT` | `hooks.rs:199-218` |
+| `claude-code/.claude/hooks/infigraph-session-start.sh` | `SESSION_START_HOOK_SCRIPT` | `hooks.rs:221-347` |
+| `claude-code/.claude/hooks/infigraph-session-end-save.sh` | `SESSION_END_SAVE_HOOK_SCRIPT` | `hooks.rs:350-413` |
+| `claude-code/.claude/hooks/infigraph-clear-suggest.sh` | `CLEAR_SUGGEST_HOOK_SCRIPT` | `hooks.rs:416-439` |
+| `claude-code/.claude/hooks/infigraph-clear-guard.sh` | `CLEAR_GUARD_HOOK_SCRIPT` | `hooks.rs:442-469` |
+| `claude-code/.claude/hooks/infigraph-test-context-sentinel.sh` | `TEST_CONTEXT_SENTINEL_HOOK_SCRIPT` | `hooks.rs:583-596` |
+| `claude-code/.claude/hooks/infigraph-search-fallback-sentinel.sh` | `SEARCH_FALLBACK_SENTINEL_HOOK_SCRIPT` | `hooks.rs:599-620` |
+| `claude-code/.claude/hooks/infigraph-edit-tracker.sh` | `EDIT_TRACKER_HOOK_SCRIPT` | `hooks.rs:623-648` |
+
+For each row: `Read` the source line range from the current `crates/infigraph-cli/src/hooks.rs` (re-check the exact line numbers first — Tasks 15-21 don't touch `hooks.rs`, but confirm nothing shifted them since this table was written), then `Write` that exact text to the destination path. No behavioral changes — this is a pure copy.
+
+- [ ] **Step 4: Create `.claude.json`**
+
+Write `crates/infigraph-cli/resources/integrations/claude-code/.claude.json`:
+
+```json
+{"mcpServers":{"infigraph":{"command":"{{mcp_path}}","args":["--mcp"]}}}
+```
+
+- [ ] **Step 5: Create `settings.json`**
+
+Write `crates/infigraph-cli/resources/integrations/claude-code/.claude/settings.json`. Every `command` path is `~`-prefixed (tilde-expanded by the shell at hook-execution time, so it's correct for any user regardless of their actual `$HOME` — no `{{...}}` templating needed here) and, critically, keeps the `infigraph-` filename prefix so the array-ownership substring marker (`Strategy::JsonDeepMerge`'s "ours if it contains \"infigraph\"" rule) matches every entry:
+
+```json
+{
+  "hooks": {
+    "PreToolUse": [
+      {
+        "matcher": "Grep|Glob|Bash|Read|Write|Edit|Agent",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "~/.claude/hooks/infigraph-enforce.sh",
+            "timeout": 5
+          }
+        ]
+      }
+    ],
+    "PostToolUse": [
+      {
+        "matcher": "Edit|Write|NotebookEdit",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "~/.claude/hooks/infigraph-edit-tracker.sh",
+            "timeout": 5,
+            "async": true
+          }
+        ]
+      },
+      {
+        "matcher": "mcp__infigraph__save_session",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "~/.claude/hooks/infigraph-session-reset.sh",
+            "timeout": 5,
+            "async": true
+          }
+        ]
+      },
+      {
+        "matcher": "mcp__infigraph__generate_test_context",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "~/.claude/hooks/infigraph-test-context-sentinel.sh",
+            "timeout": 5,
+            "async": true
+          }
+        ]
+      },
+      {
+        "matcher": "mcp__infigraph__search|mcp__infigraph__search_code|mcp__infigraph__search_symbols|mcp__infigraph__list_files",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "~/.claude/hooks/infigraph-search-fallback-sentinel.sh",
+            "timeout": 5,
+            "async": true
+          }
+        ]
+      }
+    ],
+    "UserPromptSubmit": [
+      {
+        "matcher": "",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "~/.claude/hooks/infigraph-session-save.sh",
+            "timeout": 5
+          }
+        ]
+      },
+      {
+        "hooks": [
+          {
+            "type": "command",
+            "command": "~/.claude/hooks/infigraph-clear-suggest.sh",
+            "timeout": 5
+          }
+        ]
+      },
+      {
+        "hooks": [
+          {
+            "type": "command",
+            "command": "~/.claude/hooks/infigraph-clear-guard.sh",
+            "timeout": 5
+          }
+        ]
+      }
+    ],
+    "SessionStart": [
+      {
+        "hooks": [
+          {
+            "type": "command",
+            "command": "~/.claude/hooks/infigraph-session-start.sh",
+            "timeout": 5
+          }
+        ]
+      }
+    ],
+    "SessionEnd": [
+      {
+        "hooks": [
+          {
+            "type": "command",
+            "command": "~/.claude/hooks/infigraph-session-end-save.sh",
+            "timeout": 10
+          }
+        ]
+      }
+    ],
+    "PreCompact": [
+      {
+        "hooks": [
+          {
+            "type": "command",
+            "command": "~/.claude/hooks/infigraph-session-end-save.sh",
+            "timeout": 10
+          }
+        ]
+      }
+    ]
+  }
+}
+```
+
+- [ ] **Step 6: Create `shared/agents.md`**
+
+Write `crates/infigraph-cli/resources/integrations/shared/agents.md` — this is `install.rs`'s current `write_claude_md_instructions` body (its inline `format!` string, minus the `{marker}` line the engine now adds itself via `marker_delimited`'s `start`/`end`), with the "Reindex" line reworded to be tool-neutral now that it's a shared skill, not a Claude-Code-only slash command:
+
+```markdown
+## Infigraph — Primary Code Intelligence
+
+Infigraph MCP is indexed. Use Infigraph tools FIRST for all code tasks. Fall back to grep/Read only if Infigraph returns nothing or for non-code files.
+
+### Rules
+1. Check `list_projects` before indexing — don't re-index
+2. **`search`** for ALL code search — hybrid BM25+vector+grep in one call, auto-escalates
+3. **`get_doc_context`** before editing any function — returns source+callers+callees in one call
+4. **`trace_callers`** / **`find_all_references`** before refactoring — never grep for callers
+5. **`trace_callees`** / **`transitive_impact`** for blast radius — never manually trace call chains
+6. Read files directly only for non-code files (configs, docs, manifests) or Edit tool line-number context
+
+### Workflows
+- **Find code:** `search` → if need symbol detail: `get_code_snippet` or `symbol_context`
+- **Before editing:** `get_doc_context`
+- **Before refactoring:** `find_all_references` → `transitive_impact` → edit
+- **Onboarding:** `index_project` → `get_architecture` → `get_stats`
+- **Multi-repo:** `group_create` → `group_add` × N → `group_index` → `group_sync` → `group_link`
+
+### Subagents — infigraph-indexed projects
+Do NOT spawn these agent types for code tasks — they lack MCP access and will fall back to grep/glob:
+- **Explore** → use `search`, `search_code`, `search_symbols` directly instead
+- **Plan** → use `get_architecture`, `get_skeleton`, `get_stats` directly instead
+- **code-reviewer** → use `get_doc_context`, `get_code_snippet`, `review` directly instead
+
+For tasks requiring a subagent, use **general-purpose** — it has full MCP/infigraph access.
+
+### Verbose tools — delegate to subagent
+`get_architecture`, `transitive_impact`, `detect_dead_code`, `detect_clusters`, `detect_clones`, `export_graph`, `query_graph`, `trace_callers`/`trace_callees` (deep), `group_query`, `group_index`
+
+> All other Infigraph tools are safe to call inline. Each tool description says what it replaces — check descriptions when unsure which tool to use.
+
+**Reindex:** use the `infigraph-reindex` skill directly (`/infigraph-reindex [path]` in tools with slash-command support) — runs inline, not via subagent, to save tokens.
+
+### Session Continuity — MANDATORY
+- **On session start:** MUST call `get_latest_session` to resume prior context
+- **After context compaction:** if you see "continued from a previous conversation" or a compaction summary, IMMEDIATELY call `save_session` with whatever context survived before doing anything else
+- **MUST call `save_session` IMMEDIATELY (before responding to the user)** when ANY of these occur. No session-end signal exists — if you don't save now, context is lost forever:
+  1. **Finding** — root cause identified, discovered a bug, learned how something works
+  2. **Milestone** — bug fixed and verified, feature committed, test passing, build green
+  3. **Decision** — chose an approach, ruled something out, changed strategy
+  4. **Task done** — any pending task from a prior session is completed
+  5. **Periodic** — if you have NOT called `save_session` in the last 5 exchanges with the user, call it NOW regardless of whether anything dramatic happened. This is a hard rule, not a suggestion.
+- Do NOT defer saves ("I'll save later"). Do NOT batch them. Do NOT wait for user to ask.
+- "Later" does not exist — context compaction or session end can happen at any moment.
+- **Before `/clear`:** ALWAYS call `save_session` first — `/clear` wipes context and LM2 can only restore what was persisted. Unsaved reasoning, decisions, and in-flight work will be lost.
+- Same-day saves merge: summary/pending_tasks overwrite, decisions append, files_touched union
+- **Narrative dumps:** On every `save_session`, include `narrative` field with full session story — what was explored, found, reasoned, decided, and why. Chronological prose, not terse bullets. Written to `.infigraph/sessions/session_YYYY-MM-DD.md` and embedded for semantic search. On session start, if `get_latest_session` shows a narrative log path, read it when structured fields aren't enough context.
+
+### Session Field Guide
+- **decisions** — structured format: `Goal: X. Decision: Y. Why: Z. Invalidates-if: W.`
+- **constraints** — things that failed: `Tried: X. Failed because: Y. Do not retry unless: Z.`
+- **assumptions** — what current approach depends on: `Assumes: X. If X changes: Y.`
+- **blockers** — stuck items needing human input or external dependency
+- **narrative** — full session story: explorations, findings, reasoning, code changes, decisions in chronological order. Write as prose, not structured fields.
+```
+
+- [ ] **Step 7: Create the shared reindex skill**
+
+Write `crates/infigraph-cli/resources/integrations/shared/skills/infigraph-reindex/SKILL.md`:
+
+```markdown
+---
+name: infigraph-reindex
+description: Reindex the current project directly, without spawning a subagent, to save tokens. Use when the user asks to reindex, re-index, or refresh the infigraph index.
+---
+
+# Infigraph Reindex
+
+Reindex the project directly (no subagent — saves tokens).
+
+## Usage
+
+Invoke with an optional path argument (`/infigraph-reindex [path]` in tools with slash-command support). If omitted, uses the current working directory.
+
+## Instructions
+
+1. Determine project path: use the argument provided, or fall back to the current working directory.
+2. Load the tool schema: `ToolSearch("select:mcp__infigraph__index_project")`
+3. Call `mcp__infigraph__index_project` with that path directly (do NOT spawn an Agent).
+4. Report back in this exact format (nothing else):
+
+```
+Reindexed: <path>
+Files: <N> | Symbols: <N> | Calls: <N> resolved / <N> unresolved
+Languages: <comma-separated list with file counts>
+```
+
+If indexing fails, report the error verbatim. Do not attempt fixes.
+```
+
+- [ ] **Step 8: Create `claude-code/config.toml`**
+
+Write `crates/infigraph-cli/resources/integrations/claude-code/config.toml`:
+
+```toml
+label = "Claude Code"
+
+[[artifact]]
+path = ".claude/CLAUDE.md"
+strategy = "marker_delimited"
+start = "<!-- infigraph-primary-search -->"
+end = "<!-- /infigraph-primary-search -->"
+content_file = "../shared/agents.md"
+
+[[artifact]]
+path = ".claude/skills/infigraph-reindex/SKILL.md"
+strategy = "overwrite"
+content_file = "../shared/skills/infigraph-reindex/SKILL.md"
+```
+
+- [ ] **Step 9: Run the tests to verify they pass**
+
+Run: `cargo test -p infigraph-cli artifacts::integration_tests -- --nocapture`
+Expected: every test in `integration_tests` passes, including all 4 new ones from this task and all 5 from Task 13.
+
+- [ ] **Step 10: Commit**
+
+```bash
+git add crates/infigraph-cli/resources/integrations/claude-code crates/infigraph-cli/resources/integrations/shared crates/infigraph-cli/src/artifacts/mod.rs
+git commit -m "feat(cli): bundle Claude Code hooks, settings.json, CLAUDE.md, and the shared reindex skill"
+```
+
+---
+
+## Task 15: Cursor and Windsurf (shared rules content, convention-based MCP)
+
+**Files:**
+- Create: `crates/infigraph-cli/resources/integrations/cursor/config.toml`
+- Create: `crates/infigraph-cli/resources/integrations/cursor/.cursor/mcp.json`
+- Create: `crates/infigraph-cli/resources/integrations/windsurf/config.toml`
+- Create: `crates/infigraph-cli/resources/integrations/windsurf/.codeium/windsurf/mcp_config.json`
+- Modify: `crates/infigraph-cli/src/artifacts/mod.rs` (fixture tests)
+
+**Interfaces:**
+- Consumes: everything from Tasks 1-14, specifically `shared/agents.md` (Task 14).
+
+- [ ] **Step 1: Write the failing tests**
+
+Append to the `#[cfg(test)] mod integration_tests { ... }` block in `crates/infigraph-cli/src/artifacts/mod.rs`:
+
+```rust
+    #[test]
+    fn bundled_cursor_rules_and_mcp_apply_correctly() {
+        let user_dir = tempfile::tempdir().unwrap();
+        let home_dir = tempfile::tempdir().unwrap();
+        let mcp_path = "/opt/infigraph/bin/infigraph-mcp";
+
+        let artifacts = discover_artifacts(BUNDLED_INTEGRATIONS, user_dir.path(), mcp_path).unwrap();
+
+        let rules = artifacts
+            .iter()
+            .find(|a| a.target_relative_path.as_deref() == Some(".cursor/rules/infigraph.mdc"))
+            .expect("cursor rules artifact should be discovered from cursor/config.toml");
+        assert_eq!(rules.strategy, Strategy::Overwrite);
+        apply_resolved_artifact(rules, home_dir.path(), mcp_path).unwrap();
+        let rules_content =
+            std::fs::read_to_string(home_dir.path().join(".cursor/rules/infigraph.mdc")).unwrap();
+        assert!(rules_content.contains("## Infigraph — Primary Code Intelligence"));
+
+        let mcp = artifacts
+            .iter()
+            .find(|a| a.target_relative_path.as_deref() == Some(".cursor/mcp.json"))
+            .expect("cursor mcp.json fragment should be discovered");
+        assert_eq!(mcp.strategy, Strategy::JsonDeepMerge);
+        apply_resolved_artifact(mcp, home_dir.path(), mcp_path).unwrap();
+        let mcp_written: serde_json::Value = serde_json::from_str(
+            &std::fs::read_to_string(home_dir.path().join(".cursor/mcp.json")).unwrap(),
+        )
+        .unwrap();
+        assert_eq!(mcp_written["mcpServers"]["infigraph"]["command"], mcp_path);
+    }
+
+    #[test]
+    fn bundled_windsurf_rules_and_mcp_apply_correctly() {
+        let user_dir = tempfile::tempdir().unwrap();
+        let home_dir = tempfile::tempdir().unwrap();
+        let mcp_path = "/opt/infigraph/bin/infigraph-mcp";
+
+        let artifacts = discover_artifacts(BUNDLED_INTEGRATIONS, user_dir.path(), mcp_path).unwrap();
+
+        let rules = artifacts
+            .iter()
+            .find(|a| a.target_relative_path.as_deref() == Some(".windsurf/rules/infigraph.md"))
+            .expect("windsurf rules artifact should be discovered from windsurf/config.toml");
+        assert_eq!(rules.strategy, Strategy::Overwrite);
+        apply_resolved_artifact(rules, home_dir.path(), mcp_path).unwrap();
+        let rules_content =
+            std::fs::read_to_string(home_dir.path().join(".windsurf/rules/infigraph.md")).unwrap();
+        assert!(rules_content.contains("## Infigraph — Primary Code Intelligence"));
+
+        let mcp = artifacts
+            .iter()
+            .find(|a| {
+                a.target_relative_path.as_deref() == Some(".codeium/windsurf/mcp_config.json")
+            })
+            .expect("windsurf mcp_config.json fragment should be discovered");
+        assert_eq!(mcp.strategy, Strategy::JsonDeepMerge);
+        apply_resolved_artifact(mcp, home_dir.path(), mcp_path).unwrap();
+        let mcp_written: serde_json::Value = serde_json::from_str(
+            &std::fs::read_to_string(home_dir.path().join(".codeium/windsurf/mcp_config.json"))
+                .unwrap(),
+        )
+        .unwrap();
+        assert_eq!(mcp_written["mcpServers"]["infigraph"]["command"], mcp_path);
+    }
+
+    #[test]
+    fn shared_agents_md_override_changes_both_cursor_and_windsurf_output() {
+        let user_dir = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(user_dir.path().join("shared")).unwrap();
+        std::fs::write(
+            user_dir.path().join("shared/agents.md"),
+            "## Overridden instructions",
+        )
+        .unwrap();
+        let mcp_path = "/opt/infigraph/bin/infigraph-mcp";
+
+        let artifacts = discover_artifacts(BUNDLED_INTEGRATIONS, user_dir.path(), mcp_path).unwrap();
+
+        let cursor_rules = artifacts
+            .iter()
+            .find(|a| a.target_relative_path.as_deref() == Some(".cursor/rules/infigraph.mdc"))
+            .unwrap();
+        assert_eq!(
+            String::from_utf8(cursor_rules.content.clone().unwrap()).unwrap(),
+            "## Overridden instructions"
+        );
+
+        let windsurf_rules = artifacts
+            .iter()
+            .find(|a| a.target_relative_path.as_deref() == Some(".windsurf/rules/infigraph.md"))
+            .unwrap();
+        assert_eq!(
+            String::from_utf8(windsurf_rules.content.clone().unwrap()).unwrap(),
+            "## Overridden instructions"
+        );
+    }
+```
+
+- [ ] **Step 2: Run the tests to verify they fail**
+
+Run: `cargo test -p infigraph-cli artifacts::integration_tests::bundled_cursor -- --nocapture` and the `bundled_windsurf`/`shared_agents_md_override` variants
+Expected: all fail — none of the bundled files exist yet.
+
+- [ ] **Step 3: Create Cursor's files**
+
+Write `crates/infigraph-cli/resources/integrations/cursor/config.toml`:
+
+```toml
+label = "Cursor"
+
+[[artifact]]
+path = ".cursor/rules/infigraph.mdc"
+strategy = "overwrite"
+content_file = "../shared/agents.md"
+```
+
+Write `crates/infigraph-cli/resources/integrations/cursor/.cursor/mcp.json`:
+
+```json
+{"mcpServers":{"infigraph":{"command":"{{mcp_path}}","args":["--mcp"]}}}
+```
+
+- [ ] **Step 4: Create Windsurf's files**
+
+Write `crates/infigraph-cli/resources/integrations/windsurf/config.toml`:
+
+```toml
+label = "Windsurf"
+
+[[artifact]]
+path = ".windsurf/rules/infigraph.md"
+strategy = "overwrite"
+content_file = "../shared/agents.md"
+```
+
+Write `crates/infigraph-cli/resources/integrations/windsurf/.codeium/windsurf/mcp_config.json`:
+
+```json
+{"mcpServers":{"infigraph":{"command":"{{mcp_path}}","args":["--mcp"]}}}
+```
+
+- [ ] **Step 5: Run the tests to verify they pass**
+
+Run: `cargo test -p infigraph-cli artifacts::integration_tests -- --nocapture`
+Expected: every test passes, including the 3 new ones.
+
+- [ ] **Step 6: Commit**
+
+```bash
+git add crates/infigraph-cli/resources/integrations/cursor crates/infigraph-cli/resources/integrations/windsurf crates/infigraph-cli/src/artifacts/mod.rs
+git commit -m "feat(cli): bundle Cursor and Windsurf, both pulling shared/agents.md as rules"
+```
+
+---
+
+## Task 16: Codex (TOML section MCP registration + shared reindex skill)
+
+**Files:**
+- Create: `crates/infigraph-cli/resources/integrations/codex/config.toml`
+- Create: `crates/infigraph-cli/resources/integrations/codex/mcp-section.toml`
+- Modify: `crates/infigraph-cli/src/artifacts/mod.rs` (fixture tests)
+
+**Interfaces:**
+- Consumes: everything from Tasks 1-14, specifically `toml_section` (Task 6/12) and `shared/skills/infigraph-reindex/SKILL.md` (Task 14).
+
+- [ ] **Step 1: Write the failing tests**
+
+Append to the `#[cfg(test)] mod integration_tests { ... }` block in `crates/infigraph-cli/src/artifacts/mod.rs`:
+
+```rust
+    #[test]
+    fn bundled_codex_mcp_and_skill_apply_correctly() {
+        let user_dir = tempfile::tempdir().unwrap();
+        let home_dir = tempfile::tempdir().unwrap();
+        let mcp_path = "/opt/infigraph/bin/infigraph-mcp";
+
+        let artifacts = discover_artifacts(BUNDLED_INTEGRATIONS, user_dir.path(), mcp_path).unwrap();
+
+        let mcp = artifacts
+            .iter()
+            .find(|a| a.target_relative_path.as_deref() == Some(".codex/config.toml"))
+            .expect("codex toml_section MCP artifact should be discovered");
+        assert_eq!(mcp.strategy, Strategy::TomlSection);
+        assert_eq!(
+            mcp.key_path,
+            Some(vec!["mcp_servers".to_string(), "infigraph".to_string()])
+        );
+        apply_resolved_artifact(mcp, home_dir.path(), mcp_path).unwrap();
+        let toml_content =
+            std::fs::read_to_string(home_dir.path().join(".codex/config.toml")).unwrap();
+        assert!(toml_content.contains("[mcp_servers.infigraph]"));
+        assert!(toml_content.contains(mcp_path));
+
+        let skill = artifacts
+            .iter()
+            .find(|a| {
+                a.target_relative_path.as_deref() == Some(".codex/skills/infigraph-reindex/SKILL.md")
+            })
+            .expect("codex reindex skill artifact should be discovered");
+        assert_eq!(skill.strategy, Strategy::Overwrite);
+        apply_resolved_artifact(skill, home_dir.path(), mcp_path).unwrap();
+        let skill_content = std::fs::read_to_string(
+            home_dir.path().join(".codex/skills/infigraph-reindex/SKILL.md"),
+        )
+        .unwrap();
+        assert!(skill_content.starts_with("---\nname: infigraph-reindex"));
+    }
+
+    #[test]
+    fn bundled_codex_toml_reapply_does_not_duplicate_section() {
+        let user_dir = tempfile::tempdir().unwrap();
+        let home_dir = tempfile::tempdir().unwrap();
+        let mcp_path = "/opt/infigraph/bin/infigraph-mcp";
+
+        let artifacts = discover_artifacts(BUNDLED_INTEGRATIONS, user_dir.path(), mcp_path).unwrap();
+        let mcp = artifacts
+            .iter()
+            .find(|a| a.target_relative_path.as_deref() == Some(".codex/config.toml"))
+            .unwrap();
+
+        apply_resolved_artifact(mcp, home_dir.path(), mcp_path).unwrap();
+        apply_resolved_artifact(mcp, home_dir.path(), mcp_path).unwrap();
+
+        let toml_content =
+            std::fs::read_to_string(home_dir.path().join(".codex/config.toml")).unwrap();
+        assert_eq!(toml_content.matches("[mcp_servers.infigraph]").count(), 1);
+    }
+```
+
+- [ ] **Step 2: Run the tests to verify they fail**
+
+Run: `cargo test -p infigraph-cli artifacts::integration_tests::bundled_codex -- --nocapture`
+Expected: both fail — the bundled files don't exist yet.
+
+- [ ] **Step 3: Create Codex's files**
+
+Write `crates/infigraph-cli/resources/integrations/codex/config.toml`:
+
+```toml
+label = "Codex"
+
+[[artifact]]
+path = ".codex/config.toml"
+strategy = "toml_section"
+key_path = ["mcp_servers", "infigraph"]
+content_file = "mcp-section.toml"
+
+[[artifact]]
+path = ".codex/skills/infigraph-reindex/SKILL.md"
+strategy = "overwrite"
+content_file = "../shared/skills/infigraph-reindex/SKILL.md"
+```
+
+Write `crates/infigraph-cli/resources/integrations/codex/mcp-section.toml`:
+
+```toml
+command = "{{mcp_path}}"
+args = ["--mcp"]
+```
+
+- [ ] **Step 4: Run the tests to verify they pass**
+
+Run: `cargo test -p infigraph-cli artifacts::integration_tests -- --nocapture`
+Expected: every test passes, including the 2 new ones.
+
+- [ ] **Step 5: Commit**
+
+```bash
+git add crates/infigraph-cli/resources/integrations/codex crates/infigraph-cli/src/artifacts/mod.rs
+git commit -m "feat(cli): bundle Codex's toml_section MCP registration and reindex skill"
+```
+
+---
+
+## Task 17: VS Code and Zed (resolver-driven path/content)
+
+VS Code's resolver only determines the destination *path* (its content is a static local fragment, `strategy = "json_deep_merge"`). Zed's resolver determines both path and content (`strategy = "json_key_path"`, since the returned value has no enclosing key structure of its own to self-describe a merge target the way a `content_file` fragment does).
+
+**Files:**
+- Create: `crates/infigraph-cli/resources/integrations/vscode/config.toml`
+- Create: `crates/infigraph-cli/resources/integrations/vscode/mcp-fragment.json`
+- Create: `crates/infigraph-cli/resources/integrations/vscode/resolve-vscode-path.py`
+- Create: `crates/infigraph-cli/resources/integrations/zed/config.toml`
+- Create: `crates/infigraph-cli/resources/integrations/zed/resolve-zed-path.py`
+- Modify: `crates/infigraph-cli/src/artifacts/mod.rs` (fixture tests)
+
+**Interfaces:**
+- Consumes: `resolver::run_resolver_from_script` (Task 12), `Strategy::JsonKeyPath`/`Strategy::JsonDeepMerge` with a resolver (Task 12).
+
+- [ ] **Step 1: Write the failing tests**
+
+Append to the `#[cfg(test)] mod integration_tests { ... }` block in `crates/infigraph-cli/src/artifacts/mod.rs`:
+
+```rust
+    #[test]
+    fn bundled_vscode_resolver_resolves_path_and_uses_local_content() {
+        let user_dir = tempfile::tempdir().unwrap();
+        let home_dir = tempfile::tempdir().unwrap();
+        let mcp_path = "/opt/infigraph/bin/infigraph-mcp";
+
+        let artifacts = discover_artifacts(BUNDLED_INTEGRATIONS, user_dir.path(), mcp_path).unwrap();
+        let vscode = artifacts
+            .iter()
+            .find(|a| a.integration_label == "VS Code")
+            .expect("VS Code resolver artifact should be discovered");
+        assert_eq!(vscode.strategy, Strategy::JsonDeepMerge);
+        assert!(vscode.target_relative_path.is_none());
+        assert!(vscode.resolver.is_some());
+
+        let outcome = apply_resolved_artifact(vscode, home_dir.path(), mcp_path).unwrap();
+        assert!(matches!(outcome, ApplyOutcome::Written));
+
+        // The resolver branches on OS -- assert against whichever path it
+        // actually resolved to for the OS running this test.
+        let expected_suffix = match std::env::consts::OS {
+            "macos" => "Library/Application Support/Code/User/mcp.json",
+            "linux" => ".config/Code/User/mcp.json",
+            "windows" => "AppData/Roaming/Code/User/mcp.json",
+            other => panic!("unhandled test OS {other}"),
+        };
+        let path = home_dir.path().join(expected_suffix);
+        let written: serde_json::Value =
+            serde_json::from_str(&std::fs::read_to_string(&path).unwrap()).unwrap();
+        assert_eq!(written["servers"]["infigraph"]["command"], mcp_path);
+    }
+
+    #[test]
+    fn bundled_zed_resolver_resolves_path_and_content() {
+        let user_dir = tempfile::tempdir().unwrap();
+        let home_dir = tempfile::tempdir().unwrap();
+        let mcp_path = "/opt/infigraph/bin/infigraph-mcp";
+
+        let artifacts = discover_artifacts(BUNDLED_INTEGRATIONS, user_dir.path(), mcp_path).unwrap();
+        let zed = artifacts
+            .iter()
+            .find(|a| a.integration_label == "Zed")
+            .expect("Zed resolver artifact should be discovered");
+        assert_eq!(zed.strategy, Strategy::JsonKeyPath);
+        assert_eq!(
+            zed.key_path,
+            Some(vec!["context_servers".to_string(), "infigraph".to_string()])
+        );
+        assert!(zed.target_relative_path.is_none());
+
+        let outcome = apply_resolved_artifact(zed, home_dir.path(), mcp_path).unwrap();
+        assert!(matches!(outcome, ApplyOutcome::Written));
+
+        let expected_suffix = match std::env::consts::OS {
+            "macos" => "Library/Application Support/Zed/settings.json",
+            "linux" => ".config/zed/settings.json",
+            "windows" => "AppData/Roaming/Zed/settings.json",
+            other => panic!("unhandled test OS {other}"),
+        };
+        let path = home_dir.path().join(expected_suffix);
+        let written: serde_json::Value =
+            serde_json::from_str(&std::fs::read_to_string(&path).unwrap()).unwrap();
+        assert_eq!(written["context_servers"]["infigraph"]["command"], mcp_path);
+        assert_eq!(written["context_servers"]["infigraph"]["args"][0], "--mcp");
+    }
+```
+
+These two tests require `python3` on the test runner's `PATH`, consistent with several of this repo's existing hook scripts (`hooks.rs`'s `SESSION_START_HOOK_SCRIPT` already assumes it).
+
+- [ ] **Step 2: Run the tests to verify they fail**
+
+Run: `cargo test -p infigraph-cli artifacts::integration_tests::bundled_vscode -- --nocapture` and `bundled_zed`
+Expected: both fail (`.expect` panics) — the bundled files don't exist yet.
+
+- [ ] **Step 3: Create VS Code's files**
+
+Write `crates/infigraph-cli/resources/integrations/vscode/config.toml`:
+
+```toml
+label = "VS Code"
+
+[[artifact]]
+strategy = "json_deep_merge"
+resolver = ["./resolve-vscode-path.py"]
+content_file = "mcp-fragment.json"
+```
+
+Write `crates/infigraph-cli/resources/integrations/vscode/mcp-fragment.json`:
+
+```json
+{"servers":{"infigraph":{"command":"{{mcp_path}}","args":["--mcp"]}}}
+```
+
+Write `crates/infigraph-cli/resources/integrations/vscode/resolve-vscode-path.py` (executable):
+
+```python
+#!/usr/bin/env python3
+"""Resolves VS Code's user-level mcp.json path for the default profile.
+
+stdin:  {"mcp_path": "...", "os": "macos"|"linux"|"windows", "home": "..."}
+stdout: {"status": "ok", "data": {"path": "..."}} or {"status": "skip", "message": "..."}
+"""
+import json
+import sys
+
+data = json.load(sys.stdin)
+os_name = data["os"]
+home = data["home"]
+
+paths = {
+    "macos": f"{home}/Library/Application Support/Code/User/mcp.json",
+    "linux": f"{home}/.config/Code/User/mcp.json",
+    "windows": f"{home}/AppData/Roaming/Code/User/mcp.json",
+}
+
+path = paths.get(os_name)
+if path is None:
+    print(json.dumps({"status": "skip", "message": f"unsupported OS: {os_name}"}))
+else:
+    print(json.dumps({"status": "ok", "data": {"path": path}}))
+```
+
+- [ ] **Step 4: Create Zed's files**
+
+Write `crates/infigraph-cli/resources/integrations/zed/config.toml`:
+
+```toml
+label = "Zed"
+
+[[artifact]]
+strategy = "json_key_path"
+key_path = ["context_servers", "infigraph"]
+resolver = ["./resolve-zed-path.py"]
+```
+
+Write `crates/infigraph-cli/resources/integrations/zed/resolve-zed-path.py` (executable):
+
+```python
+#!/usr/bin/env python3
+"""Resolves Zed's settings.json path (default profile) and generates the
+context_servers.infigraph fragment directly -- Zed's settings.json is a
+general-purpose file with far more content than just this section, so unlike
+VS Code there's no separate mirrored file to keep as a static local fragment.
+
+stdin:  {"mcp_path": "...", "os": "macos"|"linux"|"windows", "home": "..."}
+stdout: {"status": "ok", "data": {"path": "...", "content": {...}}} or {"status": "skip", "message": "..."}
+"""
+import json
+import sys
+
+data = json.load(sys.stdin)
+os_name = data["os"]
+home = data["home"]
+mcp_path = data["mcp_path"]
+
+paths = {
+    "macos": f"{home}/Library/Application Support/Zed/settings.json",
+    "linux": f"{home}/.config/zed/settings.json",
+    "windows": f"{home}/AppData/Roaming/Zed/settings.json",
+}
+
+path = paths.get(os_name)
+if path is None:
+    print(json.dumps({"status": "skip", "message": f"unsupported OS: {os_name}"}))
+else:
+    content = {"command": mcp_path, "args": ["--mcp"], "env": {}}
+    print(json.dumps({"status": "ok", "data": {"path": path, "content": content}}))
+```
+
+- [ ] **Step 5: Run the tests to verify they pass**
+
+Run: `cargo test -p infigraph-cli artifacts::integration_tests -- --nocapture`
+Expected: every test passes, including the 2 new ones. On Windows CI, confirm the resolver scripts are still invoked correctly through `python3` (not `python`) — if the runner only has `python`, add a `#!/usr/bin/env python3` fallback note to the CI config rather than changing the script's shebang, since `python3` is the correct modern convention and matches the existing hook scripts.
+
+- [ ] **Step 6: Commit**
+
+```bash
+git add crates/infigraph-cli/resources/integrations/vscode crates/infigraph-cli/resources/integrations/zed crates/infigraph-cli/src/artifacts/mod.rs
+git commit -m "feat(cli): bundle VS Code and Zed resolver scripts for profile-dependent paths"
+```
+
+---
+
+## Task 18: Rewire `cmd_install` onto the artifact engine
+
+**Files:**
+- Modify: `crates/infigraph-cli/src/install.rs`
+
+**Interfaces:**
+- Consumes: `artifacts::{discover_artifacts, apply_resolved_artifact, ApplyOutcome, BUNDLED_INTEGRATIONS}` (Tasks 1-17), `find_mcp_binary` (existing, unchanged), `install_models`/`install_claude_allowlist` (existing, unchanged per the design spec's "stays outside the artifact mechanism").
+- Produces: `pub(crate) fn cmd_install() -> Result<()>` with the same external behavior/output shape users already expect (per-agent "Configured X" style reporting), now driven by the engine.
+
+- [ ] **Step 1: Write the failing test**
+
+Add to a new `#[cfg(test)] mod tests { ... }` block at the end of `crates/infigraph-cli/src/install.rs` (there isn't one yet — this is the first test in this file):
+
+```rust
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn cmd_install_writes_every_convention_based_integration_under_a_fake_home() {
+        let home_dir = tempfile::tempdir().unwrap();
+        let mcp_path = "/opt/infigraph/bin/infigraph-mcp";
+
+        let report = run_install(&std::path::PathBuf::from(mcp_path), home_dir.path()).unwrap();
+
+        assert!(report.written.iter().any(|p| p == ".claude.json"));
+        assert!(report.written.iter().any(|p| p == ".gemini/settings.json"));
+        assert!(report.written.iter().any(|p| p == ".codex/config.toml"));
+        assert!(report.skipped.is_empty(), "nothing should be skipped against an empty $HOME");
+
+        let claude_json: serde_json::Value = serde_json::from_str(
+            &std::fs::read_to_string(home_dir.path().join(".claude.json")).unwrap(),
+        )
+        .unwrap();
+        assert_eq!(claude_json["mcpServers"]["infigraph"]["command"], mcp_path);
+    }
+
+    #[test]
+    fn cmd_install_is_idempotent() {
+        let home_dir = tempfile::tempdir().unwrap();
+        let mcp_path = "/opt/infigraph/bin/infigraph-mcp";
+
+        run_install(&std::path::PathBuf::from(mcp_path), home_dir.path()).unwrap();
+        run_install(&std::path::PathBuf::from(mcp_path), home_dir.path()).unwrap();
+
+        let claude_json: serde_json::Value = serde_json::from_str(
+            &std::fs::read_to_string(home_dir.path().join(".claude.json")).unwrap(),
+        )
+        .unwrap();
+        assert_eq!(
+            claude_json["mcpServers"]["infigraph"]["args"]
+                .as_array()
+                .unwrap()
+                .len(),
+            1
+        );
+    }
+}
+```
+
+- [ ] **Step 2: Run the test to verify it fails**
+
+Run: `cargo test -p infigraph-cli install::tests -- --nocapture`
+Expected: compile error (`run_install`, `report.written`/`report.skipped` don't exist yet).
+
+- [ ] **Step 3: Implement `run_install` and rewire `cmd_install` to call it**
+
+In `crates/infigraph-cli/src/install.rs`, add near the top (below the existing `use` lines):
+
+```rust
+pub(crate) struct InstallReport {
+    pub written: Vec<String>,
+    pub skipped: Vec<(String, String)>, // (path, reason)
+}
+```
+
+Replace the body of `cmd_install` (currently lines 42-102, from `pub(crate) fn cmd_install() -> Result<()> {` through its closing `Ok(())\n}`) with:
+
+```rust
+pub(crate) fn cmd_install() -> Result<()> {
+    let mcp_path = find_mcp_binary()?;
+    println!("Found infigraph-mcp at: {}", mcp_path.to_string_lossy());
+
+    let home = dirs::home_dir().context("Could not determine home directory")?;
+
+    let report = run_install(&mcp_path, &home)?;
+
+    if report.written.is_empty() {
+        println!("No agents were configured.");
+    } else {
+        for path in &report.written {
+            println!("  Configured: {}", home.join(path).display());
+        }
+        let configured_labels = configured_integration_labels(&mcp_path, &home, &report)?;
+        print_capabilities_summary(&configured_labels);
+    }
+
+    for (path, reason) in &report.skipped {
+        eprintln!("  Skipped {}: {}", home.join(path).display(), reason);
+    }
+
+    // Copy model files to ~/.infigraph/models/ -- unchanged, not artifact-based.
+    install_models(&mcp_path, &home)?;
+
+    Ok(())
+}
+
+/// The actual artifact-engine install logic, factored out from `cmd_install`
+/// so it's testable against a fake `$HOME` without touching the real one.
+pub(crate) fn run_install(
+    mcp_path: &Path,
+    home: &Path,
+) -> Result<InstallReport> {
+    let mcp_path_str = mcp_path.to_string_lossy().to_string();
+    let user_override_dir = home.join(".infigraph").join("integrations");
+
+    let artifacts = crate::artifacts::discover_artifacts(
+        crate::artifacts::BUNDLED_INTEGRATIONS,
+        &user_override_dir,
+        &mcp_path_str,
+    )?;
+
+    let mut report = InstallReport {
+        written: Vec::new(),
+        skipped: Vec::new(),
+    };
+
+    for artifact in &artifacts {
+        let outcome = crate::artifacts::apply_resolved_artifact(artifact, home, &mcp_path_str)
+            .with_context(|| {
+                format!(
+                    "applying {} artifact for {}",
+                    artifact.integration_label,
+                    artifact
+                        .target_relative_path
+                        .as_deref()
+                        .unwrap_or("(resolver-determined path)")
+                )
+            })?;
+        let label = artifact
+            .target_relative_path
+            .clone()
+            .unwrap_or_else(|| format!("{} (resolver-determined)", artifact.integration_label));
+        match outcome {
+            crate::artifacts::ApplyOutcome::Written => report.written.push(label),
+            crate::artifacts::ApplyOutcome::Skipped { reason, .. } => {
+                report.skipped.push((label, reason))
+            }
+        }
+    }
+
+    write_claude_allowlist_and_hooks_extras(home)?;
+
+    Ok(report)
+}
+
+/// Everything the artifact engine doesn't cover: the Claude Code permission
+/// allowlist (a grant list, not "content deployed to a path" -- see the
+/// design spec's "stays outside the artifact mechanism").
+fn write_claude_allowlist_and_hooks_extras(home: &Path) -> Result<()> {
+    crate::hooks::install_claude_allowlist(home)?;
+    Ok(())
+}
+
+/// Derives the human-readable "Configured for: X, Y, Z" summary from which
+/// integrations actually had at least one artifact written -- replaces the
+/// old per-`AgentTarget` `configured.push(target.label)` bookkeeping now that
+/// artifacts (not agent targets) are the unit of installation.
+fn configured_integration_labels(
+    mcp_path: &Path,
+    home: &Path,
+    report: &InstallReport,
+) -> Result<Vec<String>> {
+    let mcp_path_str = mcp_path.to_string_lossy().to_string();
+    let user_override_dir = home.join(".infigraph").join("integrations");
+    let artifacts = crate::artifacts::discover_artifacts(
+        crate::artifacts::BUNDLED_INTEGRATIONS,
+        &user_override_dir,
+        &mcp_path_str,
+    )?;
+
+    let written_set: std::collections::HashSet<&str> =
+        report.written.iter().map(|s| s.as_str()).collect();
+
+    let mut labels: Vec<String> = artifacts
+        .iter()
+        .filter(|a| {
+            let key = a
+                .target_relative_path
+                .as_deref()
+                .map(|p| p.to_string())
+                .unwrap_or_else(|| format!("{} (resolver-determined)", a.integration_label));
+            written_set.contains(key.as_str())
+        })
+        .map(|a| a.integration_label.clone())
+        .collect();
+    labels.sort();
+    labels.dedup();
+    Ok(labels)
+}
+```
+
+Update the top of the file: change `use crate::config_targets::{self, ConfigFormat, AGENT_TARGETS};` to remove that import entirely (nothing in the new `cmd_install` references `config_targets` anymore — it's deleted in Task 20) and add `use std::path::Path;` if not already present via the existing `use std::path::{Path, PathBuf};` line (it already is, at line 1 — no change needed there).
+
+Also update `print_capabilities_summary`'s signature at the bottom of the file from `pub(crate) fn print_capabilities_summary(configured: &[&str])` to `pub(crate) fn print_capabilities_summary(configured: &[String])`, and its one call site inside it (`configured.join(", ")`) — `Vec<String>::join` and `&[&str]::join` both work identically here, so the function body itself needs no other change, only the parameter type.
+
+- [ ] **Step 4: Run the tests to verify they pass**
+
+Run: `cargo test -p infigraph-cli install:: -- --nocapture`
+Expected: both new tests pass. `write_claude_md_instructions`/`write_editor_rules`/`write_reindex_command` still exist in the file at this point (Task 20 deletes them) but are no longer called by anything — this compiles fine, just with `dead_code` warnings, which is expected and temporary; `cargo fmt`/`clippy -D warnings` aren't run again until Task 20 Step 5, by which point they're gone.
+
+- [ ] **Step 5: Commit**
+
+```bash
+git add crates/infigraph-cli/src/install.rs
+git commit -m "feat(cli): rewire cmd_install onto the artifact engine"
+```
+
+---
+
+## Task 19: Rewire `cmd_uninstall` onto the artifact engine
+
+**Files:**
+- Modify: `crates/infigraph-cli/src/install.rs`
+
+**Interfaces:**
+- Consumes: `artifacts::{discover_artifacts, remove_resolved_artifact, BUNDLED_INTEGRATIONS}` (Tasks 1-17).
+- Produces: `pub(crate) fn cmd_uninstall() -> Result<()>`, same external behavior, engine-driven.
+
+- [ ] **Step 1: Write the failing test**
+
+Add to `crates/infigraph-cli/src/install.rs`'s `#[cfg(test)] mod tests { ... }` block (from Task 18):
+
+```rust
+    #[test]
+    fn cmd_uninstall_removes_everything_cmd_install_wrote() {
+        let home_dir = tempfile::tempdir().unwrap();
+        let mcp_path = "/opt/infigraph/bin/infigraph-mcp";
+
+        run_install(&std::path::PathBuf::from(mcp_path), home_dir.path()).unwrap();
+        assert!(home_dir.path().join(".claude.json").exists());
+
+        run_uninstall(&std::path::PathBuf::from(mcp_path), home_dir.path()).unwrap();
+
+        let claude_json: serde_json::Value = serde_json::from_str(
+            &std::fs::read_to_string(home_dir.path().join(".claude.json")).unwrap(),
+        )
+        .unwrap();
+        assert!(claude_json["mcpServers"]["infigraph"].is_null());
+        assert!(!home_dir.path().join(".claude/hooks/infigraph-enforce.sh").exists());
+
+        let codex_toml =
+            std::fs::read_to_string(home_dir.path().join(".codex/config.toml")).unwrap();
+        assert!(!codex_toml.contains("[mcp_servers.infigraph]"));
+    }
+```
+
+- [ ] **Step 2: Run the test to verify it fails**
+
+Run: `cargo test -p infigraph-cli install::tests::cmd_uninstall -- --nocapture`
+Expected: compile error (`run_uninstall` doesn't exist yet).
+
+- [ ] **Step 3: Implement `run_uninstall` and rewire `cmd_uninstall`**
+
+Replace the body of `cmd_uninstall` (currently lines 305-418, from `pub(crate) fn cmd_uninstall() -> Result<()> {` through its closing `Ok(())\n}`) with:
+
+```rust
+pub(crate) fn cmd_uninstall() -> Result<()> {
+    let home = dirs::home_dir().context("Could not determine home directory")?;
+    let mcp_path = find_mcp_binary().unwrap_or_else(|_| PathBuf::from("infigraph-mcp"));
+
+    let removed = run_uninstall(&mcp_path, &home)?;
+
+    if removed.is_empty() {
+        println!("No agents had infigraph configured.");
+    } else {
+        println!(
+            "\nUninstalled infigraph MCP server artifacts: {}",
+            removed.join(", ")
+        );
+    }
+
+    // Remove hooks and Claude Code allowlist -- outside the artifact mechanism.
+    crate::hooks::uninstall_hooks(&home)?;
+    crate::hooks::uninstall_claude_allowlist(&home)?;
+
+    // Remove binaries from ~/.local/bin/
+    for bin in &["infigraph", "infigraph-mcp"] {
+        let bin_path = home.join(".local").join("bin").join(bin);
+        if bin_path.exists() {
+            std::fs::remove_file(&bin_path)?;
+            println!("  Removed binary: {}", bin_path.display());
+        }
+    }
+
+    // Remove project-level CLAUDE.md managed blocks from all registered projects
+    if let Ok(registry) = infigraph_core::multi::Registry::load() {
+        for (name, entry) in &registry.repos {
+            match infigraph_core::claude_md::remove_project_claude_md(&entry.path) {
+                Ok(true) => println!("  Removed CLAUDE.md block from {}", name),
+                Ok(false) => {}
+                Err(e) => eprintln!("  warning: failed to clean CLAUDE.md for {}: {e}", name),
+            }
+        }
+    }
+
+    // Remove model cache ~/.infigraph/
+    let model_cache = home.join(".infigraph");
+    if model_cache.exists() {
+        std::fs::remove_dir_all(&model_cache)?;
+        println!("  Removed model cache: {}", model_cache.display());
+    }
+
+    Ok(())
+}
+
+/// The actual artifact-engine uninstall logic, factored out from
+/// `cmd_uninstall` so it's testable against a fake `$HOME`. Returns the list
+/// of artifact labels that were actually removed (mirrors `run_install`'s
+/// `InstallReport.written` shape, one label per artifact whose `remove_*`
+/// call reported `true`).
+pub(crate) fn run_uninstall(mcp_path: &Path, home: &Path) -> Result<Vec<String>> {
+    let mcp_path_str = mcp_path.to_string_lossy().to_string();
+    let user_override_dir = home.join(".infigraph").join("integrations");
+
+    let artifacts = crate::artifacts::discover_artifacts(
+        crate::artifacts::BUNDLED_INTEGRATIONS,
+        &user_override_dir,
+        &mcp_path_str,
+    )?;
+
+    let mut removed = Vec::new();
+    for artifact in &artifacts {
+        let was_removed =
+            crate::artifacts::remove_resolved_artifact(artifact, home, &mcp_path_str)
+                .with_context(|| format!("removing {} artifact", artifact.integration_label))?;
+        if was_removed {
+            removed.push(artifact.integration_label.clone());
+        }
+    }
+    removed.sort();
+    removed.dedup();
+    Ok(removed)
+}
+```
+
+(`remove_resolved_artifact` is `pub(crate)` from Task 11/12 in `crates/infigraph-cli/src/artifacts/mod.rs` — confirm it's still exported there; no change needed if so.)
+
+- [ ] **Step 4: Run the tests to verify they pass**
+
+Run: `cargo test -p infigraph-cli install:: -- --nocapture`
+Expected: all `install::tests` pass, including the new uninstall test. Same as Task 18 Step 4 — this compiles fine with `dead_code` warnings for the not-yet-deleted old functions, which Task 20 removes.
+
+- [ ] **Step 5: Commit**
+
+```bash
+git add crates/infigraph-cli/src/install.rs
+git commit -m "feat(cli): rewire cmd_uninstall onto the artifact engine"
+```
+
+---
+
+## Task 20: Delete the superseded code
+
+**Files:**
+- Delete: `crates/infigraph-cli/src/config_targets.rs`
+- Modify: `crates/infigraph-cli/src/main.rs` (remove `mod config_targets;`)
+- Modify: `crates/infigraph-cli/src/hooks.rs` (remove the 10 hook-script constants and their `install_*_hook` functions, plus `uninstall_hooks`' now-hardcoded hook-file list — see Step 2)
+- Modify: `crates/infigraph-cli/src/install.rs` (remove `write_claude_md_instructions`, `write_editor_rules`, `write_reindex_command`, and their call sites — already unused after Tasks 18-19's rewiring)
+
+This task removes dead code only — no behavior change beyond what Tasks 18-19 already introduced. It's a separate task (not folded into 18/19) so a reviewer can verify "nothing here is still referenced" as its own gate, per this plan's Task Right-Sizing.
+
+**Interfaces:**
+- Consumes: nothing new.
+- Produces: nothing new — pure deletion.
+
+- [ ] **Step 1: Delete `config_targets.rs` and its module declaration**
+
+```bash
+git rm crates/infigraph-cli/src/config_targets.rs
+```
+
+In `crates/infigraph-cli/src/main.rs`, delete the line `mod config_targets;`.
+
+- [ ] **Step 2: Remove the superseded hook functions and constants from `hooks.rs`**
+
+In `crates/infigraph-cli/src/hooks.rs`, delete:
+- The 10 script constants: `ENFORCE_HOOK_SCRIPT`, `SESSION_SAVE_HOOK_SCRIPT`, `SESSION_RESET_HOOK_SCRIPT`, `SESSION_START_HOOK_SCRIPT`, `SESSION_END_SAVE_HOOK_SCRIPT`, `CLEAR_SUGGEST_HOOK_SCRIPT`, `CLEAR_GUARD_HOOK_SCRIPT`, `TEST_CONTEXT_SENTINEL_HOOK_SCRIPT`, `SEARCH_FALLBACK_SENTINEL_HOOK_SCRIPT`, `EDIT_TRACKER_HOOK_SCRIPT` (their content now lives at `crates/infigraph-cli/resources/integrations/claude-code/.claude/hooks/infigraph-*.sh`, copied verbatim in Task 14, so nothing is lost).
+- The corresponding install functions: `install_enforcement_hook`, `install_edit_tracker_hook`, `install_session_save_hook`, `install_clear_suggest_hook`, `install_clear_guard_hook`, `install_session_end_hook`, `install_test_context_sentinel_hook`, `install_search_fallback_sentinel_hook` (superseded by the `settings.json` convention-based artifact from Task 14).
+- Every `#[cfg(test)] mod tests { ... }` test in `hooks.rs` that references any of the deleted constants/functions (`install_enforcement_hook_creates_file_and_settings`, `install_enforcement_hook_idempotent`, `install_edit_tracker_hook_creates_file`, `install_test_context_sentinel`, `install_search_fallback_sentinel`, `install_session_hooks`, `install_session_end_hook_creates_file`, `install_clear_suggest_hook_creates_file`, `install_clear_guard_hook_creates_file`, `enforce_script_covers_all_tool_cases`, `search_fallback_sentinel_covers_all_search_tools`, `session_start_resets_sentinels_on_clear`) — their coverage is superseded by Task 14's `bundled_settings_json_multi_event_test` and `bundled_hook_scripts_have_expected_content`.
+
+Keep `uninstall_hooks`, but simplify its hardcoded `hook_file` list — it no longer needs a fixed list of exactly 10 filenames, since the artifact engine's uninstall path (Task 19) already handles removing hook script *files* via each hook's convention-based `overwrite` artifact's `remove_overwrite` (deletes the file) and the `settings.json` entries via `remove_json_deep_merge`. Delete the `for hook_file in &[...]` loop's file-removal half entirely (lines that currently do `std::fs::remove_file(&hook_path)` for each named file); keep the rest of the function (the `settings.json` cleanup loop over `PreToolUse`/`UserPromptSubmit`/etc., which still legitimately handles hooks a *user* hand-added outside the artifact system, e.g. via `~/.infigraph/integrations/` overrides that don't map to a known convention file). Also keep `allowed_tools`, `install_claude_allowlist`, and `uninstall_claude_allowlist` — untouched, per the design spec ("stays outside the artifact mechanism").
+
+- [ ] **Step 3: Remove the superseded docs/rules/reindex functions from `install.rs`**
+
+In `crates/infigraph-cli/src/install.rs`, delete the three now-unreferenced functions: `write_claude_md_instructions`, `write_editor_rules`, `write_reindex_command` (Tasks 18-19's rewritten `cmd_install`/`cmd_uninstall` never call them).
+
+- [ ] **Step 4: Run the full crate test suite**
+
+Run: `cargo test -p infigraph-cli`
+Expected: all tests pass — this is the first point at which Tasks 18-19's `install::tests` module actually compiles cleanly (no leftover references to the deleted `config_targets`/hook functions).
+
+- [ ] **Step 5: Run fmt and clippy**
+
+Run: `cargo fmt --all -- --check`
+Expected: no diff.
+
+Run: `cargo clippy -p infigraph-cli --all-targets -- -D warnings`
+Expected: no warnings — in particular, no unused-import or dead-code warnings for anything this task was supposed to delete.
+
+- [ ] **Step 6: Commit**
+
+```bash
+git add -A crates/infigraph-cli
+git commit -m "chore(cli): delete config_targets.rs and the hardcoded hook/docs functions it replaces"
+```
+
+---
+
+## Task 21: Full-workspace verification
+
+**Files:**
+- None (verification only).
+
+- [ ] **Step 1: Full workspace build**
+
+Run: `cargo build --release -p infigraph-cli -p infigraph-mcp`
+Expected: builds cleanly.
+
+- [ ] **Step 2: Full workspace test suite**
+
+Run: `cargo test --all`
+Expected: all tests pass across every crate (per this repo's CLAUDE.md, `--all` matters here — this repo has real process-level integration tests under `infigraph-mcp/tests/`, not just unit tests). If disk space is tight, batch per-crate instead (`cargo test -p infigraph-cli`, `cargo test -p infigraph-mcp`, etc.) per this repo's known disk-constrained workflow.
+
+- [ ] **Step 3: fmt and clippy across the whole workspace**
+
+Run: `cargo fmt --all -- --check`
+Expected: no diff.
+
+Run: `cargo clippy --all-targets -- -D warnings`
+Expected: no warnings anywhere in the workspace, not just `infigraph-cli`.
+
+- [ ] **Step 4: Manual smoke test against a real (but disposable) `$HOME`**
+
+```bash
+export SMOKE_HOME=$(mktemp -d)
+HOME="$SMOKE_HOME" cargo run -p infigraph-cli --bin infigraph -- install
+ls -la "$SMOKE_HOME/.claude.json" "$SMOKE_HOME/.claude/settings.json" "$SMOKE_HOME/.claude/hooks/" "$SMOKE_HOME/.codex/config.toml"
+cat "$SMOKE_HOME/.claude.json"
+HOME="$SMOKE_HOME" cargo run -p infigraph-cli --bin infigraph -- uninstall
+ls "$SMOKE_HOME/.claude.json" 2>&1 || echo "correctly removed or emptied"
+rm -rf "$SMOKE_HOME"
+```
+
+Expected: `install` reports every integration configured with no unexpected skips (an empty `$HOME` has no pre-existing JSONC/comment files to trip the parse-safety bail path); the listed files exist with real, substituted `infigraph-mcp` paths (not literal `{{mcp_path}}`); `uninstall` removes/empties them.
+
+- [ ] **Step 5: No commit needed**
+
+This task is pure verification — if any step fails, fix the specific regression in the task that introduced it and re-run this task's steps from the top; nothing new to commit here once everything is green.
+
+---
+
 ## Self-Review Notes (for the implementer to re-check before declaring this plan done)
 
-- **Spec coverage:** every strategy in the design spec (`json_deep_merge`, `overwrite`, `marker_delimited`, `toml_section`, `json_key_path`/resolver) has an `apply_*`/`remove_*` pair and dedicated tests (Tasks 4-8). Two-tier discovery with bundled+user-override and manifest-vs-convention classification is covered (Task 9). `InstallStep` groundwork is covered (Task 10). Template substitution — a gap not explicitly detailed in the design spec but required for any of this to produce a real, installable MCP entry — is covered (Task 3) and flagged as a spec-doc addendum in the accompanying commit/PR description once Plan 2 lands. Resolver-driven artifacts genuinely resolving to a real, dynamically-computed path and content (not just parsing a resolver command from TOML) is covered by Task 12, added after Tasks 9/11's first pass turned out to assume every artifact has a static `path` — which is false for exactly the two integrations (VS Code, Zed) the resolver escape hatch exists for.
-- **Known deliberate deviations from the design spec's literal text:**
-  1. The array-ownership rule gains an exact-match fallback beyond the spec's substring-only wording (Global Constraints, bullet 3; proven by the regression test in Task 4 Step 1).
-  2. `ArtifactEntry.path` is optional, not required — the spec's own Zed example manifest omits `path` entirely, which the spec's prose doesn't call out explicitly as "path is optional." Task 12 makes the schema match the spec's own example.
-  Both are worth a one-line mention in the eventual PR description alongside the other "deliberate behavior changes."
-- **Tasks 1-12 cover the engine only.** Populating `resources/integrations/` with real content, wiring `cmd_install`/`cmd_uninstall` onto the engine, deleting `config_targets.rs`/the `install_*_hook` functions/`write_claude_md_instructions`/`write_editor_rules`/`write_reindex_command`, and the reindex-as-shared-skill conversion are Task 13 onward, below — each depends on every function Tasks 1-12 produce, including Task 12's `mcp_path`-taking `apply_resolved_artifact`/`remove_resolved_artifact` signatures.
+- **Spec coverage:** every strategy in the design spec (`json_deep_merge`, `overwrite`, `marker_delimited`, `toml_section`, `json_key_path`/resolver) has an `apply_*`/`remove_*` pair and dedicated tests (Tasks 4-8). Two-tier discovery with bundled+user-override and manifest-vs-convention classification is covered (Task 9). `InstallStep` groundwork is covered (Task 10). Template substitution — a gap not explicitly detailed in the design spec but required for any of this to produce a real, installable MCP entry — is covered (Task 3). Resolver-driven artifacts genuinely resolving to a real, dynamically-computed path and content is covered by Task 12. All 13 integrations get real bundled content with fixture tests (Tasks 13-17), matching the design spec's per-agent research table and layout. `cmd_install`/`cmd_uninstall` are rewired onto the engine (Tasks 18-19) and the superseded code is deleted (Task 20). The reindex-as-shared-skill conversion ships as part of Task 14/16 (Claude Code, Codex) rather than a separate follow-on, per the "fold it into the migration, skip ever building a `commands/` convention path" decision.
+- **Known deliberate deviations from the design spec's literal text**, each worth a one-line mention in the eventual PR description alongside the other "deliberate behavior changes":
+  1. The array-ownership rule gains an exact-match fallback beyond the spec's substring-only wording (proven necessary by the `args: ["--mcp"]` duplication-bug regression test in Task 4 Step 1).
+  2. `ArtifactEntry.path` is optional, not required — the spec's own Zed example manifest omits `path` entirely; Task 12 makes the schema match the spec's own example.
+  3. The spec's Claude Code directory-layout diagram was corrected (this session, before Task 14 was written) to nest `settings.json`/`hooks/` under `.claude/`, matching every other integration's own diagram entry, and hook script filenames keep the `infigraph-` prefix so the array-ownership marker still matches them.
+  4. `content_file` is allowed on a resolver-driven artifact with no static `path` (needed for VS Code, whose resolver determines only the path); template-format inference for a manifest artifact's `content_file` is strategy-based, not path-based, to support this.
+- **Real behavior changes from the current shipped tool** (distinct from spec deviations above — these are user-visible differences from what `infigraph install`/`uninstall` do today, also worth their own PR-description callout): per-agent path/shape fixes for issue #29 (Windsurf, Kiro, GitHub Copilot CLI, OpenCode, VS Code, Zed — see the spec's research table); universal hook matcher self-healing and the dropped edit-tracker merge-into-existing-entry special case (both already documented in the spec's "Deliberate behavior changes" section); Cursor and Windsurf's rules now get the fuller instructional text CLAUDE.md already had (Subagents guidance, Verbose tools guidance, the reindex mention) instead of the shorter text `agent::infigraph_instructions()` previously gave them — that function and its callers (`cmd_init`'s project-level `AGENTS.md`/`GEMINI.md`/etc. writers) are untouched, out of scope, and keep using their own separate text.
