@@ -1,21 +1,24 @@
-# Artifact Engine Core Implementation Plan
+# Data-Driven Integration Artifacts Implementation Plan
 
 > **For agentic workers:** REQUIRED SUB-SKILL: Use superpowers:subagent-driven-development (recommended) or superpowers:executing-plans to implement this plan task-by-task. Steps use checkbox (`- [ ]`) syntax for tracking.
 
-**Goal:** Build a new, fully self-contained `artifacts` engine in `infigraph-cli` that can discover, template, and apply "integration artifacts" (bundled config fragments, hook scripts, docs) using five strategies (`json_deep_merge`, `overwrite`, `marker_delimited`, `toml_section`, `json_key_path`), plus their inverses for uninstall. This plan touches no existing code — it is purely additive, fully unit-tested, and unused by `cmd_install`/`cmd_uninstall` until the follow-up plan (`2026-08-09-migrate-integrations.md`) wires it in.
+**Goal:** Replace `infigraph-cli`'s hardcoded per-agent MCP config writers (`config_targets.rs`), hardcoded hook-install functions (`hooks.rs`), and hardcoded docs/rules/reindex writers (`install.rs`) with one data-driven artifact engine, bundled content for all 13 supported integrations, and `cmd_install`/`cmd_uninstall` rewired onto it — fixing upstream issue #29 (wrong MCP config shape/path for several agents) and laying groundwork for #50 (install modes), per `docs/superpowers/specs/2026-08-09-agent-target-templates-design.md`.
 
-**Architecture:** A new `crates/infigraph-cli/src/artifacts/` module with one file per responsibility (manifest parsing, template substitution, per-strategy apply/remove logic, convention-based classification, resolver subprocess IPC, bundled+user-override discovery, `InstallStep` classification). A new `crates/infigraph-cli/build.rs` walks `resources/integrations/` at compile time and generates a `&[(&str, &[u8])]` registry embedded in the binary via `include_bytes!`.
+**Architecture:** Tasks 1-12 build a new, fully self-contained `crates/infigraph-cli/src/artifacts/` engine (manifest parsing, template substitution, five artifact strategies plus their uninstall inverses, convention-based classification, resolver subprocess IPC, `build.rs` bundled-resource embedding, two-tier discovery, `InstallStep` classification) — purely additive, touching no existing code. Tasks 13 onward populate `crates/infigraph-cli/resources/integrations/` with real content for every integration, then rewire `cmd_install`/`cmd_uninstall` onto the engine and delete the code it replaces.
 
 **Tech Stack:** Rust, `serde`/`serde_json` (already a dependency), `toml` and `tempfile` (both promoted from dev-dependency to a real dependency — `tempfile` is needed at runtime, not just in tests, to materialize a bundled resolver script to a real file before spawning it), `anyhow` for error handling.
 
 ## Global Constraints
 
-- Every source file this plan creates lives under `crates/infigraph-cli/src/artifacts/` or `crates/infigraph-cli/build.rs` — no existing file is modified except `crates/infigraph-cli/Cargo.toml` (promote `toml` dependency) and `crates/infigraph-cli/src/main.rs` (one new `mod artifacts;` line).
+- Tasks 1-12 create only new files under `crates/infigraph-cli/src/artifacts/` or `crates/infigraph-cli/build.rs`, plus two small edits to existing files (`Cargo.toml` dependency promotion, one `mod artifacts;` line in `main.rs`) — no other existing code changes until Task 13.
 - `.toml` destination files are **never** convention-based — `infer_strategy` (Task 7) must return `None` for any `.toml` path, forcing a manifest entry.
 - The array-entry ownership rule for `json_deep_merge`/`json_key_path` is: an existing array entry is "ours" (subject to replacement) if **either** its serialized JSON contains the substring `infigraph`, **or** it exactly equals one of the fragment's own entries. (The substring-only rule from the design spec has a duplication bug for scalar-ish owned arrays like `args: ["--mcp"]`, which never contains the substring "infigraph" — see Task 4's step 1 for the failing-test proof. The exact-match fallback closes it without weakening self-healing for path-bearing entries.)
-- Every `apply_*` function returns `Result<ApplyOutcome>` (`Written` or `Skipped { reason, manual_snippet }`) — never a bare `Result<()>` — so callers (Plan 2's `cmd_install`) can report skips instead of silently swallowing them.
+- Every `apply_*` function returns `Result<ApplyOutcome>` (`Written` or `Skipped { reason, manual_snippet }`) — never a bare `Result<()>` — so `cmd_install` (Task 19) can report skips instead of silently swallowing them.
 - Bundled content embedded via `build.rs` must be re-derivable from `crates/infigraph-cli/resources/integrations/` alone — no hand-maintained duplicate list of filenames anywhere else in the crate.
+- Every bundled MCP-registration fragment (`.json` or `.toml`) uses the literal placeholder `{{mcp_path}}` for the `infigraph-mcp` binary path — never a hardcoded path — substituted at discovery/apply time via `template::substitute_mcp_path` (Task 3).
+- Hook scripts (Task 14) are copied byte-for-byte from their current `hooks.rs` string constants — no behavioral changes to any hook's logic in this plan; only *how* they reach `~/.claude/hooks/` changes (bundled file + `overwrite` convention, not a Rust `std::fs::write` call).
 - Run `cargo fmt --all` and `cargo clippy --all-targets -- -D warnings` before every commit in this plan (per this repo's CI gate) — fix any warning the new code introduces before moving to the next task.
+- This work is destined for **upstream** (`intuit/infigraph`), not the fork — do not push or open a PR without explicit user approval, regardless of how complete the plan is.
 
 ---
 
@@ -41,7 +44,7 @@ mkdir -p /Users/pmouli/GitHub.nosync/active/rust/infigraph/crates/infigraph-cli/
 touch /Users/pmouli/GitHub.nosync/active/rust/infigraph/crates/infigraph-cli/resources/integrations/.gitkeep
 ```
 
-This plan does not populate real integration content (that's Plan 2) — the directory only needs to exist so `build.rs` (Task 9) has something to walk without erroring, and so `git` tracks the empty directory via `.gitkeep`.
+Tasks 1-12 do not populate real integration content (that starts at Task 13) — the directory only needs to exist so `build.rs` (Task 9) has something to walk without erroring, and so `git` tracks the empty directory via `.gitkeep`.
 
 - [ ] **Step 3: Create the `artifacts` module skeleton**
 
@@ -1879,7 +1882,11 @@ mod tests {
 
         assert_eq!(artifacts.len(), 1);
         let a = &artifacts[0];
-        assert_eq!(a.target_relative_path, "claude-code/.claude.json");
+        assert_eq!(
+            a.target_relative_path, ".claude.json",
+            "the leading \"claude-code/\" integration-directory segment must be stripped -- \
+             the bundled subtree already mirrors the real path below $HOME"
+        );
         assert_eq!(a.strategy, Strategy::JsonDeepMerge);
         let content = String::from_utf8(a.content.clone().unwrap()).unwrap();
         assert!(content.contains("/bin/infigraph-mcp"), "mcp_path should be substituted: {content}");
@@ -1989,7 +1996,7 @@ content_file = "../shared/agents.md"
         assert_eq!(artifacts.len(), 2);
         assert!(artifacts
             .iter()
-            .any(|a| a.target_relative_path == "claude-code/hooks/new-hook.sh"));
+            .any(|a| a.target_relative_path == "hooks/new-hook.sh"));
     }
 
     #[test]
@@ -2005,7 +2012,7 @@ content_file = "../shared/agents.md"
         let artifacts = discover_artifacts(bundled, user_dir.path(), "/bin/infigraph-mcp").unwrap();
 
         assert_eq!(artifacts.len(), 1);
-        assert_eq!(artifacts[0].target_relative_path, "my-custom-agent/.custom/mcp.json");
+        assert_eq!(artifacts[0].target_relative_path, ".custom/mcp.json");
     }
 
     #[test]
@@ -2125,6 +2132,21 @@ fn is_manifest_path(relative_path: &str) -> bool {
 
 fn integration_dir_of(relative_path: &str) -> &str {
     relative_path.split('/').next().unwrap_or(relative_path)
+}
+
+/// Strips the leading `<integration_dir>/` segment from a bundled/user-override
+/// relative path, leaving the path relative to `$HOME`. Every convention-based
+/// file's location below its integration directory is authored to already
+/// mirror the real destination structure (e.g. `claude-code/.claude/hooks/x.sh`
+/// strips to `.claude/hooks/x.sh`; `claude-code/.claude.json` strips to
+/// `.claude.json`, since that file's real destination has no further nesting)
+/// -- so a plain prefix strip is always correct, never a special case per integration.
+fn strip_integration_prefix(relative_path: &str, integration_dir: &str) -> String {
+    relative_path
+        .strip_prefix(integration_dir)
+        .and_then(|s| s.strip_prefix('/'))
+        .unwrap_or(relative_path)
+        .to_string()
 }
 
 /// Merges the bundled registry with the user-override directory into one
@@ -2305,9 +2327,17 @@ pub(crate) fn discover_artifacts(
         };
 
         let integration_dir = integration_dir_of(relative_path);
+        // The bundled subtree below <integration>/ already mirrors the real
+        // destination path exactly (e.g. "claude-code/.claude/hooks/x.sh" is
+        // authored that way specifically so stripping the leading
+        // "claude-code/" leaves ".claude/hooks/x.sh", the correct path
+        // relative to $HOME) -- except ".claude.json" itself, which sits
+        // at the integration root because its real destination has no
+        // further nesting. Both cases are handled by the same strip.
+        let target_relative_path = strip_integration_prefix(relative_path, integration_dir);
         artifacts.push(ResolvedArtifact {
             integration_label: integration_dir.to_string(),
-            target_relative_path: relative_path.clone(),
+            target_relative_path,
             strategy,
             content: Some(text_for_template),
             start: None,
@@ -2604,13 +2634,13 @@ Add one new test inside `crates/infigraph-cli/src/artifacts/discovery.rs`'s exis
 
         let hook = artifacts
             .iter()
-            .find(|a| a.target_relative_path == "claude-code/hooks/enforce.sh")
+            .find(|a| a.target_relative_path == "hooks/enforce.sh")
             .unwrap();
         assert_eq!(hook.step, super::super::step::InstallStep::Hooks);
 
         let mcp = artifacts
             .iter()
-            .find(|a| a.target_relative_path == "claude-code/.claude.json")
+            .find(|a| a.target_relative_path == ".claude.json")
             .unwrap();
         assert_eq!(mcp.step, super::super::step::InstallStep::McpRegistration);
     }
@@ -2676,7 +2706,10 @@ mod integration_tests {
                 "claude-code/.claude.json",
                 br#"{"mcpServers":{"infigraph":{"command":"{{mcp_path}}","args":["--mcp"]}}}"#,
             ),
-            ("claude-code/hooks/enforce.sh", b"#!/usr/bin/env bash\necho enforce\n"),
+            (
+                "claude-code/.claude/hooks/infigraph-enforce.sh",
+                b"#!/usr/bin/env bash\necho enforce\n",
+            ),
             (
                 "claude-code/config.toml",
                 br#"label = "Claude Code"
@@ -2717,14 +2750,18 @@ content_file = "mcp-section.toml"
             assert!(matches!(outcome, ApplyOutcome::Written), "{:?} failed to apply", artifact.target_relative_path);
         }
 
-        // Verify each landed at the expected real path with expected content.
+        // Verify each landed at the expected real path with expected content --
+        // .claude.json at $HOME directly (no .claude/ nesting, matching the
+        // CLAUDE_CODE_SPECIAL destination it replaces), hooks nested under
+        // .claude/hooks/ (stripped from the bundled claude-code/.claude/hooks/ tree).
         let claude_json: serde_json::Value = serde_json::from_str(
-            &std::fs::read_to_string(home.join(".claude/.claude.json")).unwrap(),
+            &std::fs::read_to_string(home.join(".claude.json")).unwrap(),
         )
         .unwrap();
         assert_eq!(claude_json["mcpServers"]["infigraph"]["command"], mcp_path);
 
-        let hook = std::fs::read_to_string(home.join(".claude/hooks/enforce.sh")).unwrap();
+        let hook =
+            std::fs::read_to_string(home.join(".claude/hooks/infigraph-enforce.sh")).unwrap();
         assert!(hook.contains("echo enforce"));
 
         let claude_md = std::fs::read_to_string(home.join(".claude/CLAUDE.md")).unwrap();
@@ -2740,7 +2777,7 @@ content_file = "mcp-section.toml"
             apply_resolved_artifact(artifact, home).unwrap();
         }
         let claude_json_again: serde_json::Value = serde_json::from_str(
-            &std::fs::read_to_string(home.join(".claude/.claude.json")).unwrap(),
+            &std::fs::read_to_string(home.join(".claude.json")).unwrap(),
         )
         .unwrap();
         assert_eq!(
@@ -2758,11 +2795,11 @@ content_file = "mcp-section.toml"
         }
 
         let claude_json_after: serde_json::Value = serde_json::from_str(
-            &std::fs::read_to_string(home.join(".claude/.claude.json")).unwrap(),
+            &std::fs::read_to_string(home.join(".claude.json")).unwrap(),
         )
         .unwrap();
         assert!(claude_json_after["mcpServers"]["infigraph"].is_null());
-        assert!(!home.join(".claude/hooks/enforce.sh").exists());
+        assert!(!home.join(".claude/hooks/infigraph-enforce.sh").exists());
         assert!(!std::fs::read_to_string(home.join(".claude/CLAUDE.md"))
             .unwrap()
             .contains("Use infigraph tools first."));
@@ -2773,24 +2810,29 @@ content_file = "mcp-section.toml"
 
     #[test]
     fn user_override_end_to_end_replaces_bundled_content() {
-        let bundled: &[(&str, &[u8])] =
-            &[("claude-code/hooks/enforce.sh", b"#!/usr/bin/env bash\necho bundled\n")];
+        let bundled: &[(&str, &[u8])] = &[(
+            "claude-code/.claude/hooks/infigraph-enforce.sh",
+            b"#!/usr/bin/env bash\necho bundled\n",
+        )];
         let user_dir = tempfile::tempdir().unwrap();
-        std::fs::create_dir_all(user_dir.path().join("claude-code/hooks")).unwrap();
+        std::fs::create_dir_all(user_dir.path().join("claude-code/.claude/hooks")).unwrap();
         std::fs::write(
-            user_dir.path().join("claude-code/hooks/enforce.sh"),
+            user_dir.path().join("claude-code/.claude/hooks/infigraph-enforce.sh"),
             "#!/usr/bin/env bash\necho overridden\n",
         )
         .unwrap();
         let home_dir = tempfile::tempdir().unwrap();
+        let mcp_path = "/bin/infigraph-mcp";
 
-        let artifacts = discover_artifacts(bundled, user_dir.path(), "/bin/infigraph-mcp").unwrap();
+        let artifacts = discover_artifacts(bundled, user_dir.path(), mcp_path).unwrap();
         for artifact in &artifacts {
             apply_resolved_artifact(artifact, home_dir.path()).unwrap();
         }
 
-        let content =
-            std::fs::read_to_string(home_dir.path().join(".claude/hooks/enforce.sh")).unwrap();
+        let content = std::fs::read_to_string(
+            home_dir.path().join(".claude/hooks/infigraph-enforce.sh"),
+        )
+        .unwrap();
         assert!(content.contains("echo overridden"));
     }
 }
@@ -3031,12 +3073,12 @@ strategy = "overwrite"
     }
 ```
 
-Also fix every existing assertion in `discovery.rs` that compares `target_relative_path` to a bare `&str` (a compile error once the field becomes `Option<String>`):
-- `discovers_convention_based_json_artifact_from_bundled`: `assert_eq!(a.target_relative_path, "claude-code/.claude.json");` → `assert_eq!(a.target_relative_path.as_deref(), Some("claude-code/.claude.json"));`
+Also fix every existing assertion in `discovery.rs` that compares `target_relative_path` to a bare `&str` (a compile error once the field becomes `Option<String>`) — these now use the corrected, prefix-stripped values already fixed in Task 9:
+- `discovers_convention_based_json_artifact_from_bundled`: `assert_eq!(a.target_relative_path, ".claude.json", ...);` → `assert_eq!(a.target_relative_path.as_deref(), Some(".claude.json"), ...);`
 - `manifest_entry_produces_explicit_artifact_with_all_fields`: `assert_eq!(a.target_relative_path, ".codex/config.toml");` → `assert_eq!(a.target_relative_path.as_deref(), Some(".codex/config.toml"));`
-- `user_override_adds_a_new_convention_based_file_with_zero_manifest_changes`: `.any(|a| a.target_relative_path == "claude-code/hooks/new-hook.sh")` → `.any(|a| a.target_relative_path.as_deref() == Some("claude-code/hooks/new-hook.sh"))`
-- `user_override_adds_a_wholly_new_integration_directory`: `assert_eq!(artifacts[0].target_relative_path, "my-custom-agent/.custom/mcp.json");` → `assert_eq!(artifacts[0].target_relative_path.as_deref(), Some("my-custom-agent/.custom/mcp.json"));`
-- `discovered_artifacts_get_correct_install_step` (added in Task 10): both `.find(|a| a.target_relative_path == "...")` closures → `.find(|a| a.target_relative_path.as_deref() == Some("..."))`
+- `user_override_adds_a_new_convention_based_file_with_zero_manifest_changes`: `.any(|a| a.target_relative_path == "hooks/new-hook.sh")` → `.any(|a| a.target_relative_path.as_deref() == Some("hooks/new-hook.sh"))`
+- `user_override_adds_a_wholly_new_integration_directory`: `assert_eq!(artifacts[0].target_relative_path, ".custom/mcp.json");` → `assert_eq!(artifacts[0].target_relative_path.as_deref(), Some(".custom/mcp.json"));`
+- `discovered_artifacts_get_correct_install_step` (added in Task 10): both `.find(|a| a.target_relative_path == "...")` closures (now `"hooks/enforce.sh"` and `".claude.json"`) → `.find(|a| a.target_relative_path.as_deref() == Some("..."))`
 
 Add to the `#[cfg(test)] mod tests { ... }` block in `crates/infigraph-cli/src/artifacts/resolver.rs`:
 
@@ -3115,7 +3157,21 @@ pub(crate) struct ResolverSpec {
 }
 ```
 
-3. Replace the Pass 1 manifest loop's artifact-construction body (from `for entry in &manifest.artifacts {` through the closing `artifacts.push(ResolvedArtifact { ... });` for that loop, as written in Tasks 9-10) with:
+3. Add a strategy-based template-format helper, just above `resolve_content_file`:
+
+```rust
+fn template_format_for_strategy(strategy: Strategy) -> Option<TemplateFormat> {
+    match strategy {
+        Strategy::JsonDeepMerge | Strategy::JsonKeyPath => Some(TemplateFormat::Json),
+        Strategy::TomlSection => Some(TemplateFormat::Toml),
+        Strategy::Overwrite | Strategy::MarkerDelimited => None,
+    }
+}
+```
+
+(The existing `template_format_for(relative_path)`, extension-based, stays as-is and keeps being used by Pass 2's convention-based files below, which always have a real path.)
+
+4. Replace the Pass 1 manifest loop's artifact-construction body (from `for entry in &manifest.artifacts {` through the closing `artifacts.push(ResolvedArtifact { ... });` for that loop, as written in Tasks 9-10) with:
 
 ```rust
         for entry in &manifest.artifacts {
@@ -3125,11 +3181,6 @@ pub(crate) struct ResolverSpec {
             anyhow::ensure!(
                 entry.path.is_some() || entry.resolver.is_some(),
                 "in manifest {relative_path}: artifact must declare either \"path\" or \"resolver\""
-            );
-            anyhow::ensure!(
-                entry.path.is_some() || entry.content_file.is_none(),
-                "in manifest {relative_path}: artifact has content_file but no static path -- \
-                 resolver-driven content must come from the resolver's own response, not content_file"
             );
 
             let resolver_spec = match &entry.resolver {
@@ -3161,23 +3212,24 @@ pub(crate) struct ResolverSpec {
                 None => None,
             };
 
-            let content = match &entry.path {
-                Some(path) => match &entry.content_file {
-                    Some(content_file) => {
-                        let raw = resolve_content_file(&files, integration_dir, content_file)?;
-                        let normalized_content_file =
-                            normalize_relative_path(&format!("{integration_dir}/{content_file}"));
-                        manifest_claimed.insert(normalized_content_file);
-                        let text = String::from_utf8(raw)
-                            .with_context(|| format!("content_file \"{content_file}\" is not valid UTF-8"))?;
-                        let substituted = match template_format_for(path) {
-                            Some(format) => substitute_mcp_path(&text, mcp_path, format),
-                            None => text,
-                        };
-                        Some(substituted.into_bytes())
-                    }
-                    None => None,
-                },
+            let content = match &entry.content_file {
+                Some(content_file) => {
+                    let raw = resolve_content_file(&files, integration_dir, content_file)?;
+                    let normalized_content_file =
+                        normalize_relative_path(&format!("{integration_dir}/{content_file}"));
+                    manifest_claimed.insert(normalized_content_file);
+                    let text = String::from_utf8(raw)
+                        .with_context(|| format!("content_file \"{content_file}\" is not valid UTF-8"))?;
+                    // Format is derived from the artifact's *strategy*, not its
+                    // (possibly absent) path -- a resolver-only artifact like
+                    // VS Code's has no static path but still needs a JSON
+                    // template substitution for its local content_file.
+                    let substituted = match template_format_for_strategy(strategy) {
+                        Some(format) => substitute_mcp_path(&text, mcp_path, format),
+                        None => text,
+                    };
+                    Some(substituted.into_bytes())
+                }
                 None => None,
             };
 
@@ -3203,7 +3255,7 @@ pub(crate) struct ResolverSpec {
         }
 ```
 
-4. Add `use super::step::InstallStep;` to the top of `discovery.rs` if not already present from Task 10.
+5. Add `use super::step::InstallStep;` to the top of `discovery.rs` if not already present from Task 10.
 
 - [ ] **Step 5: Implement `run_resolver_from_script`**
 
@@ -3502,4 +3554,4 @@ git commit -m "fix(cli): make resolver-driven artifacts (VS Code, Zed) actually 
   1. The array-ownership rule gains an exact-match fallback beyond the spec's substring-only wording (Global Constraints, bullet 3; proven by the regression test in Task 4 Step 1).
   2. `ArtifactEntry.path` is optional, not required — the spec's own Zed example manifest omits `path` entirely, which the spec's prose doesn't call out explicitly as "path is optional." Task 12 makes the schema match the spec's own example.
   Both are worth a one-line mention in the eventual PR description alongside the other "deliberate behavior changes."
-- **Not in this plan:** populating `resources/integrations/` with real content for any agent, wiring `cmd_install`/`cmd_uninstall` to use this engine, deleting `config_targets.rs`/the `install_*_hook` functions/`write_claude_md_instructions`/`write_editor_rules`/`write_reindex_command`, and the reindex-as-shared-skill conversion. All of that is `2026-08-09-migrate-integrations.md` (Plan 2), which depends on every function this plan produces, including Task 12's `mcp_path`-taking `apply_resolved_artifact`/`remove_resolved_artifact` signatures.
+- **Tasks 1-12 cover the engine only.** Populating `resources/integrations/` with real content, wiring `cmd_install`/`cmd_uninstall` onto the engine, deleting `config_targets.rs`/the `install_*_hook` functions/`write_claude_md_instructions`/`write_editor_rules`/`write_reindex_command`, and the reindex-as-shared-skill conversion are Task 13 onward, below — each depends on every function Tasks 1-12 produce, including Task 12's `mcp_path`-taking `apply_resolved_artifact`/`remove_resolved_artifact` signatures.

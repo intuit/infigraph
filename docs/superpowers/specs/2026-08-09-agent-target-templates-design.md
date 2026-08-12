@@ -80,19 +80,20 @@ crates/infigraph-cli/resources/integrations/     (bundled, compiled in)
 
   claude-code/
     config.toml                 # CLAUDE.md's marker-delimited entry, plus the shared reindex skill (both pull from shared/)
-    .claude.json                # convention: JSON deep-merge, no manifest entry -- {"mcpServers":{"infigraph":{...}}}
-    settings.json                # convention: JSON deep-merge -- literally the {"hooks": {...}} structure, in full
-    hooks/
-      enforce.sh                 # convention: overwrite (mirrors ~/.claude/hooks/) -- referenced BY PATH from settings.json
-      edit-tracker.sh
-      session-save.sh
-      session-reset.sh
-      session-start.sh
-      session-end-save.sh
-      clear-suggest.sh
-      clear-guard.sh
-      test-context-sentinel.sh
-      search-fallback-sentinel.sh
+    .claude.json                # convention: JSON deep-merge, no manifest entry -- {"mcpServers":{"infigraph":{...}}} (real destination has no .claude/ nesting, same exception CLAUDE_CODE_SPECIAL used to hardcode)
+    .claude/
+      settings.json               # convention: JSON deep-merge -- literally the {"hooks": {...}} structure, in full (mirrors ~/.claude/settings.json, like every other integration's nested real path below)
+      hooks/
+        infigraph-enforce.sh        # convention: overwrite (mirrors ~/.claude/hooks/) -- referenced BY PATH from settings.json; keeps the infigraph- prefix so the array-ownership substring marker still matches
+        infigraph-edit-tracker.sh
+        infigraph-session-save.sh
+        infigraph-session-reset.sh
+        infigraph-session-start.sh
+        infigraph-session-end-save.sh
+        infigraph-clear-suggest.sh
+        infigraph-clear-guard.sh
+        infigraph-test-context-sentinel.sh
+        infigraph-search-fallback-sentinel.sh
 
   cursor/
     config.toml                   # rules content is shared -- see "Shared content" below
