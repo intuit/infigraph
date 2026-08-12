@@ -812,4 +812,67 @@ resolver = ["./resolve-zed-path.sh"]
             "## Overridden instructions"
         );
     }
+
+    #[test]
+    fn bundled_codex_mcp_and_skill_apply_correctly() {
+        let user_dir = tempfile::tempdir().unwrap();
+        let home_dir = tempfile::tempdir().unwrap();
+        let mcp_path = "/opt/infigraph/bin/infigraph-mcp";
+
+        let artifacts =
+            discover_artifacts(BUNDLED_INTEGRATIONS, user_dir.path(), mcp_path).unwrap();
+
+        let mcp = artifacts
+            .iter()
+            .find(|a| a.target_relative_path.as_deref() == Some(".codex/config.toml"))
+            .expect("codex toml_section MCP artifact should be discovered");
+        assert_eq!(mcp.strategy, Strategy::TomlSection);
+        assert_eq!(
+            mcp.key_path,
+            Some(vec!["mcp_servers".to_string(), "infigraph".to_string()])
+        );
+        apply_resolved_artifact(mcp, home_dir.path(), mcp_path).unwrap();
+        let toml_content =
+            std::fs::read_to_string(home_dir.path().join(".codex/config.toml")).unwrap();
+        assert!(toml_content.contains("[mcp_servers.infigraph]"));
+        assert!(toml_content.contains(mcp_path));
+
+        let skill = artifacts
+            .iter()
+            .find(|a| {
+                a.target_relative_path.as_deref()
+                    == Some(".codex/skills/infigraph-reindex/SKILL.md")
+            })
+            .expect("codex reindex skill artifact should be discovered");
+        assert_eq!(skill.strategy, Strategy::Overwrite);
+        apply_resolved_artifact(skill, home_dir.path(), mcp_path).unwrap();
+        let skill_content = std::fs::read_to_string(
+            home_dir
+                .path()
+                .join(".codex/skills/infigraph-reindex/SKILL.md"),
+        )
+        .unwrap();
+        assert!(skill_content.starts_with("---\nname: infigraph-reindex"));
+    }
+
+    #[test]
+    fn bundled_codex_toml_reapply_does_not_duplicate_section() {
+        let user_dir = tempfile::tempdir().unwrap();
+        let home_dir = tempfile::tempdir().unwrap();
+        let mcp_path = "/opt/infigraph/bin/infigraph-mcp";
+
+        let artifacts =
+            discover_artifacts(BUNDLED_INTEGRATIONS, user_dir.path(), mcp_path).unwrap();
+        let mcp = artifacts
+            .iter()
+            .find(|a| a.target_relative_path.as_deref() == Some(".codex/config.toml"))
+            .unwrap();
+
+        apply_resolved_artifact(mcp, home_dir.path(), mcp_path).unwrap();
+        apply_resolved_artifact(mcp, home_dir.path(), mcp_path).unwrap();
+
+        let toml_content =
+            std::fs::read_to_string(home_dir.path().join(".codex/config.toml")).unwrap();
+        assert_eq!(toml_content.matches("[mcp_servers.infigraph]").count(), 1);
+    }
 }
