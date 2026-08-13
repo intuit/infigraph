@@ -175,6 +175,20 @@ pub fn extract_relations_with_custom_edges(
                             receiver_text = Some(cls);
                         }
                     }
+                } else if let Some(site) = site_node {
+                    // C++: `ctField->GetType()` / `ctx.GetType()` — receiver_text
+                    // is the raw variable name ("ctField"), which never matches a
+                    // real class name in the resolver's class_method_map lookup.
+                    // If it's a member field of the enclosing class, or a parameter
+                    // of the enclosing function, resolve it to its declared type
+                    // so receiver-aware resolution (resolve_calls.rs Strategy 1)
+                    // has a real class name to match against, instead of silently
+                    // dangling.
+                    if let Some(field_type) = find_field_type_in_enclosing_class(site, source, recv)
+                        .or_else(|| find_param_type_in_enclosing_function(site, source, recv))
+                    {
+                        receiver_text = Some(field_type);
+                    }
                 }
             }
         }
@@ -342,6 +356,204 @@ fn find_enclosing_class(node: Node, source: &[u8]) -> Option<String> {
         current = n.parent();
     }
     None
+}
+
+/// C++ only: walk up to the enclosing `class_specifier`/`struct_specifier`, scan its
+/// `field_declaration_list` for a `field_declaration` whose declarator matches `field_name`,
+/// and return the declared type's base identifier (pointer/reference wrappers and
+/// `const`/`*`/`&` stripped) — e.g. for `IBase* field;`, `find_field_type_in_enclosing_class`
+/// on `"field"` returns `"IBase"`. This lets a call like `field->GetType()` resolve `field`
+/// to its real class name instead of leaving the raw variable name as the receiver, which
+/// never matches anything in the resolver's class-name-keyed lookup table.
+fn find_field_type_in_enclosing_class(
+    node: Node,
+    source: &[u8],
+    field_name: &str,
+) -> Option<String> {
+    let class_kinds = ["class_specifier", "struct_specifier"];
+    let mut current = node.parent();
+    while let Some(n) = current {
+        if class_kinds.contains(&n.kind()) {
+            if let Some(body) = n.child_by_field_name("body") {
+                let mut cursor = body.walk();
+                for child in body.children(&mut cursor) {
+                    if child.kind() != "field_declaration" {
+                        continue;
+                    }
+                    let Some(type_node) = child.child_by_field_name("type") else {
+                        continue;
+                    };
+                    // A field_declaration can list multiple declarators
+                    // (`IBase *a, *b;`); check each one against field_name.
+                    let mut decl_cursor = child.walk();
+                    for decl in child.children_by_field_name("declarator", &mut decl_cursor) {
+                        if declarator_name(decl, source).as_deref() == Some(field_name) {
+                            return Some(strip_type_qualifiers(node_text(type_node, source)));
+                        }
+                    }
+                }
+            }
+            return None;
+        }
+        current = n.parent();
+    }
+    None
+}
+
+/// C++ only: walk up to the enclosing `function_definition` and try to resolve
+/// `name` to a declared type from either its parameter list or a local variable
+/// declaration in its body — same idea as `find_field_type_in_enclosing_class`
+/// but for names that aren't class members. Covers two shapes:
+///
+///   - parameter:    `void UseContext(const IBase& ctx) { ctx.GetType(); }`
+///   - local var:    `const zctField* f = Get(...); f->GetType();`
+///
+/// Both resolve to `"IBase"`/`"zctField"` instead of leaving the raw
+/// parameter/variable name as the receiver, which never matches anything in
+/// the resolver's class-name-keyed lookup table.
+fn find_param_type_in_enclosing_function(node: Node, source: &[u8], name: &str) -> Option<String> {
+    let mut current = node.parent();
+    while let Some(n) = current {
+        if n.kind() == "function_definition" {
+            if let Some(declarator) = n.child_by_field_name("declarator") {
+                if let Some(func_decl) = find_function_declarator(declarator) {
+                    if let Some(params) = func_decl.child_by_field_name("parameters") {
+                        let mut cursor = params.walk();
+                        for param in params.children(&mut cursor) {
+                            if param.kind() != "parameter_declaration" {
+                                continue;
+                            }
+                            let Some(type_node) = param.child_by_field_name("type") else {
+                                continue;
+                            };
+                            let Some(decl) = param.child_by_field_name("declarator") else {
+                                continue;
+                            };
+                            if declarator_name(decl, source).as_deref() == Some(name) {
+                                return Some(strip_type_qualifiers(node_text(type_node, source)));
+                            }
+                        }
+                    }
+                }
+            }
+            if let Some(body) = n.child_by_field_name("body") {
+                if let Some(found) = find_local_var_type(body, source, name) {
+                    return Some(found);
+                }
+            }
+            return None;
+        }
+        current = n.parent();
+    }
+    None
+}
+
+/// Recursively scan a function body (or nested block) for a local `declaration`
+/// statement whose declarator matches `name`, returning its declared type.
+/// Does not track scoping precision (shadowing across nested blocks is not
+/// disambiguated) — a best-effort match is far better than the pre-fix
+/// behavior of never resolving local-variable receivers at all.
+fn find_local_var_type(body: Node, source: &[u8], name: &str) -> Option<String> {
+    let mut cursor = body.walk();
+    for child in body.children(&mut cursor) {
+        if child.kind() == "declaration" {
+            let Some(type_node) = child.child_by_field_name("type") else {
+                continue;
+            };
+            let mut decl_cursor = child.walk();
+            for decl in child.children_by_field_name("declarator", &mut decl_cursor) {
+                // `const zctField* ctField = init;` wraps the identifier in an
+                // init_declarator before the pointer/reference declarator.
+                let inner = if decl.kind() == "init_declarator" {
+                    decl.child_by_field_name("declarator").unwrap_or(decl)
+                } else {
+                    decl
+                };
+                if declarator_name(inner, source).as_deref() == Some(name) {
+                    return Some(strip_type_qualifiers(node_text(type_node, source)));
+                }
+            }
+        }
+        // `else_clause` wraps an else-branch's compound_statement (or a bare
+        // statement, for `else if (...)`/single-statement else) — without
+        // recursing into it, every local variable declared inside an `else`
+        // block is invisible to this scan. `case_statement`/`for_statement`/
+        // `while_statement` cover the other common nesting shapes real C++
+        // uses around a "get pointer, null-check, then call through it"
+        // pattern (see Src/High/TKE/MetaData/FieldAttributesHandler.cpp).
+        const RECURSABLE_KINDS: &[&str] = &[
+            "compound_statement",
+            "if_statement",
+            "else_clause",
+            "for_statement",
+            "while_statement",
+            "do_statement",
+            "switch_statement",
+            "case_statement",
+        ];
+        if RECURSABLE_KINDS.contains(&child.kind()) {
+            if let Some(found) = find_local_var_type(child, source, name) {
+                return Some(found);
+            }
+        }
+    }
+    None
+}
+
+/// Descend through declarator wrappers to find the innermost `function_declarator`
+/// (the node whose `parameters` field holds the parameter list).
+fn find_function_declarator(node: Node) -> Option<Node> {
+    if node.kind() == "function_declarator" {
+        return Some(node);
+    }
+    node.child_by_field_name("declarator")
+        .and_then(find_function_declarator)
+}
+
+/// Unwrap a declarator (`*field`, `&field`, `field`) down to its plain identifier text.
+fn declarator_name(node: Node, source: &[u8]) -> Option<String> {
+    match node.kind() {
+        "identifier" | "field_identifier" => Some(node_text(node, source)),
+        "pointer_declarator" | "reference_declarator" => {
+            // `pointer_declarator` exposes its inner declarator via the
+            // "declarator" field, but `reference_declarator`'s `&`/identifier
+            // children are unnamed in this grammar — fall back to scanning
+            // named children by kind so `const IBase& ctx` still resolves.
+            if let Some(found) = node
+                .child_by_field_name("declarator")
+                .and_then(|d| declarator_name(d, source))
+            {
+                return Some(found);
+            }
+            let mut cursor = node.walk();
+            let children: Vec<Node> = node.named_children(&mut cursor).collect();
+            children
+                .into_iter()
+                .find_map(|c| declarator_name(c, source))
+        }
+        _ => None,
+    }
+}
+
+/// Strip `const`/`volatile` qualifiers, trailing `*`/`&`, and a namespace
+/// prefix from a raw type-node's text, leaving just the base type name
+/// (e.g. `"const tke::MappingMgr&"` -> `"MappingMgr"`). Without the
+/// namespace strip, a receiver declared as `const ns::Class& x` resolves to
+/// `"ns::Class"`, which never matches class_method_map's bare-class-name
+/// keys — same failure mode as an unresolved raw variable name, just one
+/// layer further in.
+fn strip_type_qualifiers(raw: String) -> String {
+    let cleaned = raw
+        .replace("const", "")
+        .replace("volatile", "")
+        .trim_matches(|c: char| c == '*' || c == '&' || c.is_whitespace())
+        .to_string();
+    cleaned
+        .rsplit("::")
+        .next()
+        .unwrap_or(&cleaned)
+        .trim()
+        .to_string()
 }
 
 /// Resolve a captured `@inherit.parent`/`@inherit.child` node down to its base identifier

@@ -395,6 +395,292 @@ fn test_extract_receiver_on_method_call() {
     );
 }
 
+// C++ virtual-dispatch / pointer-and-reference-to-base call resolution
+// (the ITpsContext/EntityTpsContext bug class): a call through a member
+// field or a function parameter typed as a base/interface class must
+// resolve `receiver` to the declared *type*, not the raw variable name —
+// otherwise resolve_calls.rs's class_method_map lookup can never match.
+
+#[test]
+fn test_extract_receiver_resolves_member_field_to_declared_type() {
+    let src = br#"
+class IBase {
+public:
+    virtual int GetType() const = 0;
+};
+
+class Caller {
+public:
+    void CheckField() {
+        int t = field->GetType();
+    }
+    IBase* field;
+};
+"#;
+    let registry = infigraph_languages::bundled_registry().unwrap();
+    let pack = registry.for_extension(".cpp").unwrap();
+    let ext = extract_file("caller.cpp", src, pack).unwrap();
+
+    let call = ext
+        .relations
+        .iter()
+        .find(|r| r.kind == RelationKind::Calls && r.target_id.ends_with("::GetType"))
+        .expect("GetType call site should be extracted");
+
+    assert_eq!(
+        call.receiver.as_deref(),
+        Some("IBase"),
+        "receiver for `field->GetType()` should resolve to the field's declared \
+         type (IBase), not the raw variable name (field)"
+    );
+}
+
+#[test]
+fn test_extract_receiver_resolves_param_reference_to_declared_type() {
+    let src = br#"
+class IBase {
+public:
+    virtual int GetType() const = 0;
+};
+
+void UseContext(const IBase& ctx) {
+    int t = ctx.GetType();
+}
+"#;
+    let registry = infigraph_languages::bundled_registry().unwrap();
+    let pack = registry.for_extension(".cpp").unwrap();
+    let ext = extract_file("caller.cpp", src, pack).unwrap();
+
+    let call = ext
+        .relations
+        .iter()
+        .find(|r| r.kind == RelationKind::Calls && r.target_id.ends_with("::GetType"))
+        .expect("GetType call site should be extracted");
+
+    assert_eq!(
+        call.receiver.as_deref(),
+        Some("IBase"),
+        "receiver for `ctx.GetType()` should resolve to the parameter's declared \
+         type (IBase), not the raw parameter name (ctx)"
+    );
+}
+
+#[test]
+fn test_extract_receiver_resolves_local_var_pointer_to_declared_type() {
+    // Mirrors the real HVT bug: `const zctField* ctField = Get(...); ctField->GetType();`
+    // in Src/High/SS/Misc/zssSanitizer.cpp — ctField is a local variable, not a
+    // member field or a parameter.
+    let src = br#"
+class IBase {
+public:
+    virtual int GetType() const = 0;
+};
+
+void SanitizeField() {
+    const IBase* field = GetField();
+    int t = field->GetType();
+}
+"#;
+    let registry = infigraph_languages::bundled_registry().unwrap();
+    let pack = registry.for_extension(".cpp").unwrap();
+    let ext = extract_file("caller.cpp", src, pack).unwrap();
+
+    let call = ext
+        .relations
+        .iter()
+        .find(|r| r.kind == RelationKind::Calls && r.target_id.ends_with("::GetType"))
+        .expect("GetType call site should be extracted");
+
+    assert_eq!(
+        call.receiver.as_deref(),
+        Some("IBase"),
+        "receiver for a local-variable call (`field->GetType()`) should resolve \
+         to the variable's declared type (IBase), not the raw variable name (field)"
+    );
+}
+
+#[test]
+fn test_extract_receiver_resolves_local_var_declared_inside_else_clause() {
+    // Mirrors the real HVT bug: Src/High/TKE/MetaData/FieldAttributesHandler.cpp
+    // declares `const ITpsContext* tpsContext = model->GetTpsContext();` inside a
+    // nested else-branch, then calls `tpsContext->GetEntity()` inside a further
+    // nested else-branch. `else_clause` is a distinct node kind from
+    // `compound_statement` in the grammar — a scan that only recurses into
+    // `if_statement`/`compound_statement` silently skips every local variable
+    // declared inside any `else { ... }` block.
+    let src = br#"
+class IBase {
+public:
+    int GetEntity() const;
+};
+
+void HandlePut(IBase* model) {
+    if (model == nullptr) {
+        LogError();
+    } else {
+        const IBase* tpsContext = model;
+        if (tpsContext == nullptr) {
+            LogError();
+        } else {
+            int entity = tpsContext->GetEntity();
+        }
+    }
+}
+"#;
+    let registry = infigraph_languages::bundled_registry().unwrap();
+    let pack = registry.for_extension(".cpp").unwrap();
+    let ext = extract_file("caller.cpp", src, pack).unwrap();
+
+    let call = ext
+        .relations
+        .iter()
+        .find(|r| r.kind == RelationKind::Calls && r.target_id.ends_with("::GetEntity"))
+        .expect("GetEntity call site should be extracted");
+
+    assert_eq!(
+        call.receiver.as_deref(),
+        Some("IBase"),
+        "receiver for a local variable declared inside an else-branch should \
+         resolve to its declared type (IBase), not the raw variable name \
+         (tpsContext) — else_clause must be recursed into, not skipped"
+    );
+}
+
+#[test]
+fn test_extract_method_symbol_id_is_class_scoped_for_cpp() {
+    let src = br#"
+class IBase {
+public:
+    virtual int GetType() const = 0;
+};
+"#;
+    let registry = infigraph_languages::bundled_registry().unwrap();
+    let pack = registry.for_file_with_content("ibase.h", src).unwrap();
+    let ext = extract_file("ibase.h", src, pack).unwrap();
+
+    let method = ext
+        .symbols
+        .iter()
+        .find(|s| s.name == "GetType")
+        .expect("GetType method should be extracted");
+
+    assert_eq!(
+        method.id, "ibase.h::IBase::GetType",
+        "method symbol id must be class-scoped (file::Class::method), not just \
+         file-scoped (file::method) — otherwise resolve_calls.rs's \
+         class_method_map lookup can never match a resolved receiver type"
+    );
+}
+
+#[test]
+fn test_extract_pure_virtual_method_with_pointer_return_type() {
+    // Mirrors the real HVT bug: Src/High/TKE/_h/ITpsContext.h declares
+    // `virtual zccEntity* GetEntity() const = 0;` — a pure-virtual prototype
+    // (no body) whose return type is a pointer. Every sibling pure-virtual
+    // method with a non-pointer return type (bool, std::string, etc.)
+    // extracted fine; only the pointer-returning one silently vanished,
+    // because field_declaration's bodyless-prototype pattern had no wrapped
+    // variant for a pointer_declarator between it and function_declarator.
+    let src = br#"
+class IBase {
+public:
+    virtual bool HasThing() const = 0;
+    virtual Entity* GetEntity() const = 0;
+};
+"#;
+    let registry = infigraph_languages::bundled_registry().unwrap();
+    let pack = registry.for_extension(".cpp").unwrap();
+    let ext = extract_file("ibase.cpp", src, pack).unwrap();
+
+    assert!(
+        ext.symbols.iter().any(|s| s.name == "GetEntity"),
+        "pure-virtual method with a pointer return type must be extracted \
+         as a symbol, same as any other pure-virtual method"
+    );
+}
+
+#[test]
+fn test_extract_receiver_resolves_namespace_qualified_reference_type() {
+    // Mirrors a real HVT bug found by cross-checking grep against the graph:
+    // Src/High/SS/FormCalc/TKEMetaDataDependencies.cpp::GetCCFormInstances declares
+    // `const tke::MappingMgr& mappingMgr = model->GetMappingMgr();` then calls
+    // `mappingMgr.GetTpsInstanceValuesForInstanceXPath(...)`. The declared type is
+    // namespace-qualified (tke::MappingMgr) — strip_type_qualifiers only stripped
+    // const/volatile/*/&, so the resolved receiver stayed "tke::MappingMgr" and
+    // never matched class_method_map's bare "MappingMgr" key.
+    let src = br#"
+namespace tke {
+class MappingMgr {
+public:
+    int GetTpsInstanceValuesForInstanceXPath(int x);
+};
+}
+
+void GetCCFormInstances() {
+    const tke::MappingMgr& mappingMgr = GetMgr();
+    int t = mappingMgr.GetTpsInstanceValuesForInstanceXPath(1);
+}
+"#;
+    let registry = infigraph_languages::bundled_registry().unwrap();
+    let pack = registry.for_extension(".cpp").unwrap();
+    let ext = extract_file("caller.cpp", src, pack).unwrap();
+
+    let call = ext
+        .relations
+        .iter()
+        .find(|r| {
+            r.kind == RelationKind::Calls
+                && r.target_id
+                    .ends_with("::GetTpsInstanceValuesForInstanceXPath")
+        })
+        .expect("GetTpsInstanceValuesForInstanceXPath call site should be extracted");
+
+    assert_eq!(
+        call.receiver.as_deref(),
+        Some("MappingMgr"),
+        "receiver for a namespace-qualified reference type (`const tke::MappingMgr&`) \
+         should resolve to the bare class name (MappingMgr), not the fully-qualified \
+         name (tke::MappingMgr) which never matches class_method_map's bare-name keys"
+    );
+}
+
+#[test]
+fn test_extract_receiver_captures_qualifier_on_static_qualified_call() {
+    // Mirrors the real HVT bug: Test/Low/CT/ctTest.cpp:385 calls
+    // `zctField::IsAcceptable(in, type, subType, &tainted)` — a static-qualified
+    // call (Class::method(), no object/pointer receiver at all). The qualified
+    // call pattern only captured @call.func (the method name), never the
+    // qualifier, so the receiver was silently None and the call could only
+    // ever resolve via a bare-name lookup — never via the (correct, unambiguous)
+    // class name sitting right there in the qualifier.
+    let src = br#"
+class zctField {
+public:
+    static int IsAcceptable(const char* in);
+};
+
+int TestIsAcceptable(const char* in) {
+    return zctField::IsAcceptable(in);
+}
+"#;
+    let registry = infigraph_languages::bundled_registry().unwrap();
+    let pack = registry.for_extension(".cpp").unwrap();
+    let ext = extract_file("caller.cpp", src, pack).unwrap();
+
+    let call = ext
+        .relations
+        .iter()
+        .find(|r| r.kind == RelationKind::Calls && r.target_id.ends_with("::IsAcceptable"))
+        .expect("IsAcceptable call site should be extracted");
+
+    assert_eq!(
+        call.receiver.as_deref(),
+        Some("zctField"),
+        "receiver for a static-qualified call (`zctField::IsAcceptable(...)`) \
+         should capture the qualifier as the receiver, not leave it None"
+    );
+}
+
 // ---------- Full pipeline: extract → graph → query ----------
 
 #[test]

@@ -62,6 +62,18 @@
   declarator: (function_declarator
     declarator: (field_identifier) @method.name)) @method.def
 
+; Bodyless prototypes (pure-virtual `= 0`, plain declarations) with a
+; pointer/reference return type (`virtual zccEntity* GetEntity() const = 0;`)
+; put a pointer_declarator/reference_declarator between field_declaration and
+; function_declarator — same wrapping issue the function_definition patterns
+; above already handle, but this field_declaration pattern was never given
+; the wrapped equivalent, so every pointer/reference-returning pure-virtual
+; method silently failed to extract as a symbol at all.
+(field_declaration
+  declarator: (_
+    (function_declarator
+      declarator: (field_identifier) @method.name))) @method.def
+
 ; Class definitions
 (class_specifier
   name: (type_identifier) @class.name) @class.def

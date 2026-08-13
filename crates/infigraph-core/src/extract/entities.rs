@@ -339,6 +339,27 @@ fn find_parent_class(node: Node, source: &[u8]) -> Option<String> {
                 .child_by_field_name("name")
                 .map(|name_node| node_text(name_node, source));
         }
+        // C/C++: in-class method bodies (class_specifier/struct_specifier)
+        // and out-of-line `Class::method` definitions (function_definition
+        // whose declarator is a qualified_identifier) both need the class
+        // name so method symbol IDs come out class-scoped ("file::Class::method")
+        // instead of collapsing to file-scoped ("file::method") — the latter
+        // silently breaks class_method_map lookups in resolve_calls.rs's
+        // receiver-aware resolution, since that map is keyed by real class name.
+        if n.kind() == "class_specifier" || n.kind() == "struct_specifier" {
+            if let Some(name_node) = n.child_by_field_name("name") {
+                return Some(node_text(name_node, source));
+            }
+        }
+        if n.kind() == "function_definition" {
+            if let Some(declarator) = n.child_by_field_name("declarator") {
+                if let Some(qualified) = find_qualified_identifier(declarator) {
+                    if let Some(scope) = qualified.child_by_field_name("scope") {
+                        return Some(node_text(scope, source));
+                    }
+                }
+            }
+        }
         // Protobuf: an `rpc` lives inside a `service` node. The service name has
         // no "name" field — it's a `service_name` child. Without this, proto RPC
         // methods get an empty parent, so gRPC contract extraction (which groups
@@ -356,6 +377,22 @@ fn find_parent_class(node: Node, source: &[u8]) -> Option<String> {
         current = n.parent();
     }
     None
+}
+
+/// Descend through declarator wrappers (pointer/reference return types, e.g.
+/// `const char* Class::method()`) to find a `qualified_identifier` — the
+/// `Class::method` name node in an out-of-line C++ method definition.
+fn find_qualified_identifier(node: Node) -> Option<Node> {
+    if node.kind() == "qualified_identifier" {
+        return Some(node);
+    }
+    if node.kind() == "function_declarator" {
+        return node
+            .child_by_field_name("declarator")
+            .and_then(find_qualified_identifier);
+    }
+    node.child_by_field_name("declarator")
+        .and_then(find_qualified_identifier)
 }
 
 /// Look at preceding siblings for attribute/decorator nodes.
