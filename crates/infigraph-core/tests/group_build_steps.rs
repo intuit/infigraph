@@ -379,6 +379,85 @@ fn test_local_step3_links_cross_service_call() {
     );
 }
 
+const TPS_BRIDGE_CPP: &str = r#"
+namespace tps
+{
+    void SetFormML(int entity, const char* formML)
+    {
+        DoWork(entity, formML);
+    }
+}
+"#;
+
+const TTO_ENGINE_CPP: &str = r#"
+void SetFormMLHandler(int entity, const char* formML) {
+    tps::SetFormML(entity, formML);
+}
+"#;
+
+fn namespace_link_group(producer_dir: &Path, consumer_dir: &Path) -> Registry {
+    let mut registry = Registry {
+        repos: HashMap::new(),
+        groups: HashMap::new(),
+    };
+    registry.repos.insert(
+        "tps-bridge".to_string(),
+        repo_entry("tps-bridge", producer_dir),
+    );
+    registry.repos.insert(
+        "tto-engine".to_string(),
+        repo_entry("tto-engine", consumer_dir),
+    );
+    registry.groups.insert(
+        "local-namespace-test-group".to_string(),
+        Group {
+            name: "local-namespace-test-group".to_string(),
+            org: String::new(),
+            repos: vec!["tps-bridge".to_string(), "tto-engine".to_string()],
+            contracts: vec![],
+        },
+    );
+    registry
+}
+
+/// Step 3b: tto-engine calls tps::SetFormML, a namespace-qualified C++ symbol
+/// defined only in tps-bridge's own repo. Proves
+/// `link_cross_repo_namespace_calls_for_group` works end-to-end through the
+/// real Registry/Group machinery (index -> link), the same way
+/// `test_local_step3_links_cross_service_call` above proves the HTTP
+/// cross-service linker's wrapper works — not just the lower-level
+/// `link_cross_repo_namespace_calls` primitive, which is covered separately
+/// by `tests/namespace_link.rs`'s unit tests against raw backends.
+#[test]
+fn test_local_step3b_links_cross_repo_namespace_call() {
+    let producer_dir = make_repo(&[("Src/High/HAPI/FormML/zhaSetFormML.cpp", TPS_BRIDGE_CPP)]);
+    let consumer_dir = make_repo(&[(
+        "Src/TaxApp/Server/grpc/service/TaxReturnService.cpp",
+        TTO_ENGINE_CPP,
+    )]);
+    let mut registry = namespace_link_group(producer_dir.path(), consumer_dir.path());
+
+    multi::index_group(
+        &mut registry,
+        "local-namespace-test-group",
+        true,
+        infigraph_languages::bundled_registry,
+    )
+    .expect("index_group should succeed");
+
+    let linked = multi::namespace_link::link_cross_repo_namespace_calls_for_group(
+        &registry,
+        "local-namespace-test-group",
+        infigraph_languages::bundled_registry,
+    )
+    .expect("link_cross_repo_namespace_calls_for_group should succeed");
+
+    assert!(
+        linked > 0,
+        "expected at least one static_lib CALLS_SERVICE edge from tto-engine into tps-bridge"
+    );
+}
+
 /// SharedPackage dependency kind: consumer-svc's manifest (pyproject.toml)
 /// depends on publisher-svc's published package name. This exercises the
 /// non-HTTP contract path in sync_group_contracts (publisher map + Dependency
