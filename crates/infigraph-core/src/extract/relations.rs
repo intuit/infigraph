@@ -272,6 +272,30 @@ fn find_enclosing_function(node: Node, source: &[u8]) -> Option<String> {
                 return Some(node_text(name_node, source));
             }
         }
+        // C#: a call inside a property accessor body (get/set, or a lambda
+        // nested inside one — e.g. `myCmd = new RelayCommand(() => this.Foo())`
+        // inside a getter) has no method_declaration/constructor_declaration
+        // ancestor at all, only accessor_declaration -> property_declaration.
+        // accessor_declaration itself carries no "name" field (the name lives
+        // on the parent property_declaration), so without this the walk fell
+        // through to the file-level fallback below, producing a CALLS edge
+        // attributed to the file itself rather than any real symbol — which
+        // never matches a node id and the edge silently vanished. Attribute to
+        // the property's own symbol, matching entities.scm's `@var.def` id for
+        // property_declaration (`file::Class::PropertyName`).
+        if n.kind() == "accessor_declaration" {
+            // accessor_declaration's parent is accessor_list, not
+            // property_declaration directly — property_declaration is one
+            // level further up (class_decl -> property_declaration ->
+            // accessor_list -> accessor_declaration).
+            if let Some(prop) = n.parent().and_then(|list| list.parent()) {
+                if prop.kind() == "property_declaration" {
+                    if let Some(name_node) = prop.child_by_field_name("name") {
+                        return Some(node_text(name_node, source));
+                    }
+                }
+            }
+        }
         // C/C++: function_definition has no "name" field — the name is nested
         // inside its "declarator" field, itself possibly wrapped in
         // pointer_declarator/reference_declarator (e.g. `T* foo()`) before

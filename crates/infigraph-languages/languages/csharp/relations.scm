@@ -1,9 +1,18 @@
 ; C# relationship extraction queries
 
 ; Method invocations: obj.Method()
+; `this`/`base` are anonymous keyword tokens in this grammar (not a named
+; identifier the way Python's `self` is just a regular parameter) — is_named
+; is false for them, and tree-sitter's `(_)` wildcard only matches named
+; nodes. Without the literal-token alternatives below, every `this.Method()`
+; / `base.Method()` call in the entire codebase silently produced zero
+; matches for this pattern (verified: not even the file-level fallback fired,
+; the whole invocation was dropped) — despite relations.rs already having
+; dedicated "self"/"this" receiver-resolution logic downstream that never
+; had a chance to run.
 (invocation_expression
   function: (member_access_expression
-    expression: (_) @call.receiver
+    expression: [(_) "this" "base"] @call.receiver
     name: (identifier) @call.func)) @call.site
 
 ; Simple invocations
