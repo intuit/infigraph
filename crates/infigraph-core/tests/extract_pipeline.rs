@@ -709,6 +709,104 @@ public:
 }
 
 #[test]
+fn test_extract_receiver_resolves_csharp_field_to_declared_type() {
+    // Real WinEngine gap: MainWin.xaml.cs declares a private field
+    // `MainViewModel myMainViewModel;` then calls
+    // `myMainViewModel.Initialize(...)` — an ordinary same-class method
+    // call, not reflection or XAML binding magic. csharp/entities.scm had
+    // a property_declaration capture but no field_declaration capture at
+    // all, so the field itself was never a symbol and the call's receiver
+    // stayed the raw field name ("myBar"), never resolving to its real
+    // declared type ("Bar") the way find_field_type_in_enclosing_class
+    // already did for C++ member fields.
+    let src = br#"
+class Foo {
+    private Bar myBar;
+    public void Baz() {
+        myBar.Initialize();
+    }
+}
+"#;
+    let registry = infigraph_languages::bundled_registry().unwrap();
+    let pack = registry.for_extension(".cs").unwrap();
+    let ext = extract_file("Foo.cs", src, pack).unwrap();
+
+    assert!(
+        ext.symbols
+            .iter()
+            .any(|s| s.name == "myBar" && s.id == "Foo.cs::Foo::myBar"),
+        "myBar field must be extracted as a class-scoped symbol"
+    );
+
+    let call = ext
+        .relations
+        .iter()
+        .find(|r| r.kind == RelationKind::Calls && r.target_id.ends_with("::Initialize"))
+        .expect("Initialize call site should be extracted");
+
+    assert_eq!(
+        call.receiver.as_deref(),
+        Some("Bar"),
+        "receiver for `myBar.Initialize()` should resolve to the field's \
+         declared type (Bar), not the raw field name (myBar)"
+    );
+}
+
+#[test]
+fn test_extract_csharp_constructor_body_calls_attribute_to_constructor_symbol() {
+    // Real WinEngine gap: MainWin.xaml.cs's constructor calls
+    // `myMainViewModel.Initialize(...)` directly in its body — ordinary
+    // WPF/MVVM init wiring, ubiquitous in this codebase. csharp/entities.scm
+    // had no constructor_declaration capture at all, so the constructor body
+    // was never extracted as a symbol; even after adding the capture,
+    // find_enclosing_function still needed constructor_declaration added to
+    // its own func_kinds list, or every call inside a constructor attributed
+    // to a corrupted file-scoped source_id (observed: "MainWin.cs::MainWin.cs")
+    // instead of the real constructor symbol.
+    let src = br#"
+class MainWin {
+    private MainViewModel myMainViewModel;
+    public MainWin() {
+        myMainViewModel = new MainViewModel();
+        myMainViewModel.Initialize();
+    }
+}
+"#;
+    let registry = infigraph_languages::bundled_registry().unwrap();
+    let pack = registry.for_extension(".cs").unwrap();
+    let ext = extract_file("MainWin.cs", src, pack).unwrap();
+
+    assert!(
+        ext.symbols
+            .iter()
+            .any(|s| s.id == "MainWin.cs::MainWin::MainWin" && s.kind == SymbolKind::Method),
+        "constructor must be extracted as a class-scoped Method symbol"
+    );
+
+    let call = ext
+        .relations
+        .iter()
+        .find(|r| r.kind == RelationKind::Calls && r.target_id.ends_with("::Initialize"))
+        .expect("Initialize call site should be extracted");
+
+    // find_enclosing_function returns the raw constructor name ("MainWin"),
+    // combined with the file as "{file}::{name}" — this is the pre-class-
+    // scoping shape relations use for source attribution (resolve_calls.rs's
+    // fixed_pairs step reconciles it against the real class-scoped symbol id
+    // at resolution time). The bug this test guards against produced a
+    // corrupted "MainWin.cs::MainWin.cs" (the whole filename duplicated as
+    // the "name"), not this — confirming the constructor body is now a real,
+    // distinct enclosing scope instead of falling through to a file-level
+    // catch-all.
+    assert_eq!(
+        call.source_id, "MainWin.cs::MainWin",
+        "a call inside a constructor body must be attributed to the \
+         constructor itself, not a corrupted file-scoped fallback"
+    );
+    assert_eq!(call.receiver.as_deref(), Some("MainViewModel"));
+}
+
+#[test]
 fn test_extract_receiver_resolves_namespace_qualified_reference_type() {
     // Mirrors a real HVT bug found by cross-checking grep against the graph:
     // Src/High/SS/FormCalc/TKEMetaDataDependencies.cpp::GetCCFormInstances declares

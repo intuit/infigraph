@@ -251,14 +251,15 @@ fn rightmost_identifier(node: Node) -> Node {
 
 fn find_enclosing_function(node: Node, source: &[u8]) -> Option<String> {
     let func_kinds = [
-        "function_definition",  // Python, JS, Lua, VB6 Function
-        "function_item",        // Rust
-        "function_declaration", // Go, JS, TS, Java
-        "method_declaration",   // Go, Java
-        "method_definition",    // JS/TS class methods
-        "func_literal",         // Go anonymous
-        "sub_definition",       // VB6 Sub
-        "property_definition",  // VB6 Property Get/Let/Set
+        "function_definition",     // Python, JS, Lua, VB6 Function
+        "function_item",           // Rust
+        "function_declaration",    // Go, JS, TS, Java
+        "method_declaration",      // Go, Java
+        "method_definition",       // JS/TS class methods
+        "constructor_declaration", // C#
+        "func_literal",            // Go anonymous
+        "sub_definition",          // VB6 Sub
+        "property_definition",     // VB6 Property Get/Let/Set
     ];
     let sql_container_kinds = [
         "create_table", // SQL: CREATE TABLE ... AS SELECT
@@ -358,19 +359,26 @@ fn find_enclosing_class(node: Node, source: &[u8]) -> Option<String> {
     None
 }
 
-/// C++ only: walk up to the enclosing `class_specifier`/`struct_specifier`, scan its
-/// `field_declaration_list` for a `field_declaration` whose declarator matches `field_name`,
-/// and return the declared type's base identifier (pointer/reference wrappers and
-/// `const`/`*`/`&` stripped) — e.g. for `IBase* field;`, `find_field_type_in_enclosing_class`
-/// on `"field"` returns `"IBase"`. This lets a call like `field->GetType()` resolve `field`
-/// to its real class name instead of leaving the raw variable name as the receiver, which
-/// never matches anything in the resolver's class-name-keyed lookup table.
+/// Walk up to the enclosing class/struct body, scan its field declarations
+/// for one whose declarator matches `field_name`, and return the declared
+/// type's base identifier (pointer/reference wrappers and `const`/`*`/`&`
+/// stripped) — e.g. for `IBase* field;`, `find_field_type_in_enclosing_class`
+/// on `"field"` returns `"IBase"`. This lets a call like `field->GetType()`
+/// (C++) or `field.Initialize()` (C#) resolve `field` to its real class name
+/// instead of leaving the raw variable name as the receiver, which never
+/// matches anything in the resolver's class-name-keyed lookup table.
+///
+/// Covers two grammar shapes since C++ and C# structure a field declaration
+/// differently: C++'s `field_declaration` exposes `type`/`declarator` fields
+/// directly; C#'s wraps them one level deeper in a `variable_declaration` ->
+/// `variable_declarator` (see csharp/entities.scm's field_declaration
+/// pattern, added alongside this).
 fn find_field_type_in_enclosing_class(
     node: Node,
     source: &[u8],
     field_name: &str,
 ) -> Option<String> {
-    let class_kinds = ["class_specifier", "struct_specifier"];
+    let class_kinds = ["class_specifier", "struct_specifier", "class_declaration"];
     let mut current = node.parent();
     while let Some(n) = current {
         if class_kinds.contains(&n.kind()) {
@@ -380,15 +388,36 @@ fn find_field_type_in_enclosing_class(
                     if child.kind() != "field_declaration" {
                         continue;
                     }
-                    let Some(type_node) = child.child_by_field_name("type") else {
-                        continue;
-                    };
-                    // A field_declaration can list multiple declarators
-                    // (`IBase *a, *b;`); check each one against field_name.
-                    let mut decl_cursor = child.walk();
-                    for decl in child.children_by_field_name("declarator", &mut decl_cursor) {
-                        if declarator_name(decl, source).as_deref() == Some(field_name) {
-                            return Some(strip_type_qualifiers(node_text(type_node, source)));
+                    // C++ shape: type/declarator are direct fields on field_declaration.
+                    if let Some(type_node) = child.child_by_field_name("type") {
+                        let mut decl_cursor = child.walk();
+                        for decl in child.children_by_field_name("declarator", &mut decl_cursor) {
+                            if declarator_name(decl, source).as_deref() == Some(field_name) {
+                                return Some(strip_type_qualifiers(node_text(type_node, source)));
+                            }
+                        }
+                    }
+                    // C# shape: field_declaration -> variable_declaration -> (type, variable_declarator+).
+                    let mut vd_cursor = child.walk();
+                    for vd in child.children(&mut vd_cursor) {
+                        if vd.kind() != "variable_declaration" {
+                            continue;
+                        }
+                        let Some(type_node) = vd.child_by_field_name("type") else {
+                            continue;
+                        };
+                        let mut declarator_cursor = vd.walk();
+                        for declarator in vd.children(&mut declarator_cursor) {
+                            if declarator.kind() != "variable_declarator" {
+                                continue;
+                            }
+                            if let Some(name_node) = declarator.child_by_field_name("name") {
+                                if node_text(name_node, source) == field_name {
+                                    return Some(strip_type_qualifiers(node_text(
+                                        type_node, source,
+                                    )));
+                                }
+                            }
                         }
                     }
                 }
