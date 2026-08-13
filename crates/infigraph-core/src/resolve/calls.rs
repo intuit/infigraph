@@ -329,7 +329,28 @@ fn resolve_with_map(
 
                 let target_name = rel.target_id.rsplit("::").next().unwrap_or(&rel.target_id);
 
-                if local_symbols.contains_key(target_name) {
+                if let Some(&target_id) = local_symbols.get(target_name) {
+                    // Target resolves locally by bare name, but rel.source_id
+                    // is also bare (extraction's find_enclosing_function only
+                    // ever returns an unqualified name — see relations.rs) —
+                    // e.g. "DebugViewModel.cs::ExecuteCrashManagedBackground"
+                    // rather than the real "...::DebugViewModel::ExecuteCrashManagedBackground".
+                    // The initial bulk write (store_bulk.rs) uses rel.source_id
+                    // verbatim with no such fixup, so its MATCH never finds a
+                    // node and the edge silently never gets created — this was
+                    // dropping every local same-class call (e.g. a WPF event
+                    // handler's body calling another method on the same class).
+                    // Resolve the source the same way cross-file pairs already
+                    // get fixed up downstream (see `fixed_pairs` below), but do
+                    // it here so local calls actually get a pair pushed at all.
+                    let source_name = rel.source_id.rsplit("::").next().unwrap_or(&rel.source_id);
+                    let source_id = local_symbols
+                        .get(source_name)
+                        .copied()
+                        .unwrap_or(rel.source_id.as_str());
+                    res.pairs
+                        .push((source_id.to_string(), target_id.to_string()));
+                    res.resolved += 1;
                     continue;
                 }
 
