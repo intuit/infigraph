@@ -573,6 +573,40 @@ public:
 }
 
 #[test]
+fn test_extract_method_symbol_id_is_class_scoped_for_java() {
+    // Mirrors a real gap found in tto-engine-master: find_parent_class only
+    // checked "class_definition" (Python's node kind), never "class_declaration"
+    // (Java's actual node kind) — every Java method extracted file-scoped
+    // ("BlobController.java::saveBlob") instead of class-scoped
+    // ("BlobController.java::BlobController::saveBlob"), silently breaking
+    // class_method_map-based receiver resolution and interface-sibling
+    // lookups for every Java project, not just this one class.
+    let src = br#"
+public class BlobController {
+    public void saveBlob() {
+    }
+}
+"#;
+    let registry = infigraph_languages::bundled_registry().unwrap();
+    let pack = registry.for_extension(".java").unwrap();
+    let ext = extract_file("BlobController.java", src, pack).unwrap();
+
+    let method = ext
+        .symbols
+        .iter()
+        .find(|s| s.name == "saveBlob")
+        .expect("saveBlob method should be extracted");
+
+    assert_eq!(
+        method.id, "BlobController.java::BlobController::saveBlob",
+        "Java method symbol id must be class-scoped (file::Class::method), \
+         not file-scoped (file::method) — find_parent_class must recognize \
+         Java's \"class_declaration\" node kind, not just Python's \
+         \"class_definition\""
+    );
+}
+
+#[test]
 fn test_extract_pure_virtual_method_with_pointer_return_type() {
     // Mirrors the real HVT bug: Src/High/TKE/_h/ITpsContext.h declares
     // `virtual zccEntity* GetEntity() const = 0;` — a pure-virtual prototype

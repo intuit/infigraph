@@ -96,6 +96,42 @@ pub trait GraphBackend: Send + Sync {
     fn find_all_references(&self, id: &str) -> Result<Vec<ReferenceRow>>;
     fn cross_cutting_for(&self, id: &str) -> Result<Vec<(String, String)>>;
 
+    /// Other Method symbols declared on the same class/interface as `symbol_id`
+    /// (siblings), excluding `symbol_id` itself. Method ids are class-scoped
+    /// (`file::Class::method`, see extract/entities.rs's find_parent_class) —
+    /// this derives the `file::Class::` prefix from `symbol_id` and matches
+    /// other Method ids sharing it, entirely from the id string, no extra
+    /// Symbol.parent lookup needed. Returns an empty vec (not an error) when
+    /// `symbol_id` isn't class-scoped (only one `::`, e.g. a free function) —
+    /// there is no "interface" to expand in that case.
+    ///
+    /// Used to warn callers of `transitive_impact`/`trace_callers` when a
+    /// single-method query would silently under-report the true blast radius
+    /// of changing the whole interface: querying one method's callers misses
+    /// every caller that goes through a sibling method on the same
+    /// class/interface (see docs/DESIGN-interface-blast-radius.md).
+    fn sibling_methods_of(&self, symbol_id: &str) -> Result<Vec<String>> {
+        let Some(prefix_end) = symbol_id.rfind("::") else {
+            return Ok(Vec::new());
+        };
+        let prefix = &symbol_id[..=prefix_end + 1]; // include trailing "::"
+        if prefix.matches("::").count() < 2 {
+            // Only "file::method" — not class-scoped, nothing to expand.
+            return Ok(Vec::new());
+        }
+        let query = format!(
+            "MATCH (m:Symbol) WHERE m.id STARTS WITH '{}' AND m.kind = 'Method' \
+             AND m.id <> '{}' RETURN m.id",
+            prefix.replace('\'', "\\'"),
+            symbol_id.replace('\'', "\\'")
+        );
+        Ok(self
+            .raw_query(&query)?
+            .into_iter()
+            .filter_map(|row| row.into_iter().next())
+            .collect())
+    }
+
     // ── Read: aggregate queries ──────────────────────────────────────
 
     fn get_api_surface(&self) -> Result<Vec<ApiSymbol>>;

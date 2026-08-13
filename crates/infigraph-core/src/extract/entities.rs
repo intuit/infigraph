@@ -331,22 +331,26 @@ pub fn extract_entities(
 
 /// Walk up the AST to find the enclosing class_definition and return its name.
 fn find_parent_class(node: Node, source: &[u8]) -> Option<String> {
+    // Same node-kind set as relations.rs's find_enclosing_class — that
+    // function already covered Java/TS/JS/C#/Kotlin/Swift/Ruby/Rust/Elixir
+    // correctly, but this one (which actually builds the class-scoped
+    // Symbol.id "file::Class::method") only ever checked "class_definition"
+    // (Python). Every other language's methods were silently staying
+    // file-scoped ("file::method") instead of class-scoped — the same
+    // failure mode the C++-specific class_specifier/struct_specifier fix
+    // addressed, just never generalized to the rest of these languages.
+    const CLASS_KINDS: &[&str] = &[
+        "class_definition",  // Python
+        "class_declaration", // Java, TS, JS, C#, Kotlin, Swift
+        "class",             // Ruby
+        "class_specifier",   // C/C++
+        "struct_specifier",  // C/C++ struct
+        "impl_item",         // Rust
+        "struct_item",       // Rust
+    ];
     let mut current = node.parent();
     while let Some(n) = current {
-        if n.kind() == "class_definition" {
-            // The name child of a class_definition is the class name
-            return n
-                .child_by_field_name("name")
-                .map(|name_node| node_text(name_node, source));
-        }
-        // C/C++: in-class method bodies (class_specifier/struct_specifier)
-        // and out-of-line `Class::method` definitions (function_definition
-        // whose declarator is a qualified_identifier) both need the class
-        // name so method symbol IDs come out class-scoped ("file::Class::method")
-        // instead of collapsing to file-scoped ("file::method") — the latter
-        // silently breaks class_method_map lookups in resolve_calls.rs's
-        // receiver-aware resolution, since that map is keyed by real class name.
-        if n.kind() == "class_specifier" || n.kind() == "struct_specifier" {
+        if CLASS_KINDS.contains(&n.kind()) {
             if let Some(name_node) = n.child_by_field_name("name") {
                 return Some(node_text(name_node, source));
             }
