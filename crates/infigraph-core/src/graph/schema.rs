@@ -21,6 +21,22 @@ pub const MIGRATIONS: &[&str] = &[
     // table of the same name would clash with that existing table's schema).
     "CREATE REL TABLE IF NOT EXISTS INJECTS_DEPENDENCY(FROM Symbol TO Symbol)",
     "CREATE REL TABLE IF NOT EXISTS REGISTERS_MIDDLEWARE(FROM Symbol TO Symbol)",
+    // A call whose receiver resolves to a real class/type name but that type
+    // has no local Symbol (its source isn't indexed — a statically-linked
+    // lib, a vendored dependency, an un-group-linked sibling repo) previously
+    // vanished with zero trace at write time: not even counted as
+    // "unresolved", since resolve_with_map's dangling-call bookkeeping only
+    // tracks calls it *tried* to match against symbol_map, and a
+    // receiver-qualified call with no symbol_map hit for target_name skips
+    // straight past that path. ExternalRef is a lightweight node — never a
+    // real Symbol, just a resolved qualifier+method string pair — so
+    // `MATCH (a:Symbol)-[:EXTERNAL_CALL]->(e:ExternalRef) WHERE e.qualifier =
+    // 'ITpsContext'` answers "what touches TPS" with zero cross-repo setup.
+    // If the same repos later get group-linked and the real symbol becomes
+    // resolvable, resolve_with_map's normal strategies take priority and this
+    // fallback simply stops firing for that call site — the two coexist.
+    "CREATE NODE TABLE IF NOT EXISTS ExternalRef(id STRING, qualifier STRING, method STRING, PRIMARY KEY(id))",
+    "CREATE REL TABLE IF NOT EXISTS EXTERNAL_CALL(FROM Symbol TO ExternalRef)",
 ];
 
 /// Kuzu schema DDL for the infigraph graph.
