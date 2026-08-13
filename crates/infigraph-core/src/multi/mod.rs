@@ -2,6 +2,7 @@ mod bridge;
 pub mod combined;
 mod cross_service;
 pub mod grpc;
+pub mod namespace_link;
 
 pub use bridge::*;
 pub use cross_service::*;

@@ -1720,7 +1720,7 @@ const COZO_SCHEMA: &[&str] = &[
     ":create contains_file {folder_id: String, file_id: String}",
     ":create contains_folder {parent_id: String, child_id: String}",
     ":create defines {file_id: String, symbol_id: String}",
-    ":create calls_service {caller: String, target: String, method: String default \"\", path: String default \"\", target_service: String default \"\"}",
+    ":create calls_service {caller: String, target: String, method: String default \"\", path: String default \"\", target_service: String default \"\", protocol: String default \"\", qualifier: String default \"\"}",
     ":create has_statement {symbol_id: String, statement_id: String}",
     ":create concern {id: String => kind: String, detail: String default \"\"}",
     ":create has_concern {symbol_id: String, concern_id: String}",

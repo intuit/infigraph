@@ -37,6 +37,14 @@ pub const MIGRATIONS: &[&str] = &[
     // fallback simply stops firing for that call site — the two coexist.
     "CREATE NODE TABLE IF NOT EXISTS ExternalRef(id STRING, qualifier STRING, method STRING, PRIMARY KEY(id))",
     "CREATE REL TABLE IF NOT EXISTS EXTERNAL_CALL(FROM Symbol TO ExternalRef)",
+    // Cross-repo namespace-qualified C++ linking (multi::namespace_link) needs
+    // to distinguish its static-lib edges from the pre-existing HTTP/gRPC
+    // CALLS_SERVICE edges (method/path/target_service columns above), and to
+    // carry the matched namespace qualifier (e.g. "tps") for traceability.
+    // CALLS_SERVICE is a fixed-column Kuzu rel table, not a dynamic-property
+    // one, so both columns must be added via ALTER rather than assumed.
+    "ALTER TABLE CALLS_SERVICE ADD protocol STRING DEFAULT ''",
+    "ALTER TABLE CALLS_SERVICE ADD qualifier STRING DEFAULT ''",
 ];
 
 /// Kuzu schema DDL for the infigraph graph.
@@ -122,7 +130,7 @@ pub const CREATE_SCHEMA: &[&str] = &[
     "CREATE REL TABLE IF NOT EXISTS CONTAINS_FILE(FROM Folder TO File)",
     "CREATE REL TABLE IF NOT EXISTS CONTAINS_FOLDER(FROM Folder TO Folder)",
     "CREATE REL TABLE IF NOT EXISTS DEFINES(FROM File TO Symbol)",
-    "CREATE REL TABLE IF NOT EXISTS CALLS_SERVICE(FROM Symbol TO Symbol, method STRING, path STRING, target_service STRING)",
+    "CREATE REL TABLE IF NOT EXISTS CALLS_SERVICE(FROM Symbol TO Symbol, method STRING, path STRING, target_service STRING, protocol STRING DEFAULT '', qualifier STRING DEFAULT '')",
     "CREATE REL TABLE IF NOT EXISTS HAS_STATEMENT(FROM Symbol TO Statement)",
     "CREATE NODE TABLE IF NOT EXISTS Concern(id STRING, kind STRING, detail STRING, PRIMARY KEY(id))",
     "CREATE REL TABLE IF NOT EXISTS HAS_CONCERN(FROM Symbol TO Concern)",

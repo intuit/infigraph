@@ -204,7 +204,7 @@ pub fn build_combined_graph(registry: &Registry, group_name: &str) -> Result<(us
             let cs_export = tmp.join(format!("{}_calls_service.parquet", repo_name));
             let cs_out = tmp.join(format!("{}_calls_service_prefixed.parquet", repo_name));
             let export_ok = repo_conn.query(&format!(
-                "COPY (MATCH (a)-[r:CALLS_SERVICE]->(b) RETURN a.id, b.id, r.method, r.path, r.target_service) TO '{}'",
+                "COPY (MATCH (a)-[r:CALLS_SERVICE]->(b) RETURN a.id, b.id, r.method, r.path, r.target_service, r.protocol, r.qualifier) TO '{}'",
                 fwd(&cs_export)
             ));
             if export_ok.is_ok() {
