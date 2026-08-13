@@ -304,6 +304,23 @@ fn resolve_with_map(
                 .map(|s| (s.name.as_str(), s.id.as_str()))
                 .collect();
 
+            // Callable-only view of local_symbols, keyed the same way, used to
+            // gate the same-class fast path below: a call target must resolve
+            // to something invocable (Method/Function), never a field/variable
+            // that happens to share the name (e.g. a `builder` field beside a
+            // `builder()` method).
+            let local_callables: HashMap<&str, &str> = ext
+                .symbols
+                .iter()
+                .filter(|s| {
+                    matches!(
+                        s.kind,
+                        crate::model::SymbolKind::Method | crate::model::SymbolKind::Function
+                    )
+                })
+                .map(|s| (s.name.as_str(), s.id.as_str()))
+                .collect();
+
             let imported_stems: std::collections::HashSet<String> = ext
                 .relations
                 .iter()
@@ -329,33 +346,48 @@ fn resolve_with_map(
 
                 let target_name = rel.target_id.rsplit("::").next().unwrap_or(&rel.target_id);
 
-                if let Some(&target_id) = local_symbols.get(target_name) {
-                    // Target resolves locally by bare name. Normally the
-                    // initial bulk write (store_bulk.rs) already created this
-                    // edge using rel.source_id/rel.target_id verbatim, so the
-                    // common case is a no-op continue. But when rel.source_id
-                    // is itself bare — extraction's find_enclosing_function
-                    // only ever returns an unqualified name (see relations.rs),
-                    // e.g. "DebugViewModel.cs::ExecuteCrashManagedBackground"
-                    // rather than the real qualified
-                    // "...::DebugViewModel::ExecuteCrashManagedBackground" —
-                    // that bulk write's MATCH never finds a node and the edge
-                    // silently never gets created (dropping every local
-                    // same-class call, e.g. a WPF event handler's body calling
-                    // another method on the same class). Detect that case by
-                    // checking whether fixing up the source actually changes
-                    // it; only then push a pair, so an already-correct
-                    // source_id (the common case) stays a plain continue with
-                    // no double-counted resolution.
-                    let source_name = rel.source_id.rsplit("::").next().unwrap_or(&rel.source_id);
-                    if let Some(&fixed_source_id) = local_symbols.get(source_name) {
-                        if fixed_source_id != rel.source_id {
-                            res.pairs
-                                .push((fixed_source_id.to_string(), target_id.to_string()));
-                            res.resolved += 1;
+                // Same-class fast path only applies when the call is unqualified
+                // (`method()`) or explicitly self-referential (`this.method()`,
+                // `self.method()`) — a receiver like `chain` or `exchange` means
+                // the name match is coincidental (e.g. an override calling the
+                // delegate's same-named method, `chain.filter(x)` inside a
+                // `filter()` override) and must fall through to the
+                // receiver-aware strategies below instead of self-looping.
+                let is_self_receiver = matches!(
+                    rel.receiver.as_deref().map(str::trim),
+                    None | Some("this") | Some("self")
+                );
+
+                if is_self_receiver {
+                    if let Some(&target_id) = local_callables.get(target_name) {
+                        // Target resolves locally by bare name. Normally the
+                        // initial bulk write (store_bulk.rs) already created this
+                        // edge using rel.source_id/rel.target_id verbatim, so the
+                        // common case is a no-op continue. But when rel.source_id
+                        // is itself bare — extraction's find_enclosing_function
+                        // only ever returns an unqualified name (see relations.rs),
+                        // e.g. "DebugViewModel.cs::ExecuteCrashManagedBackground"
+                        // rather than the real qualified
+                        // "...::DebugViewModel::ExecuteCrashManagedBackground" —
+                        // that bulk write's MATCH never finds a node and the edge
+                        // silently never gets created (dropping every local
+                        // same-class call, e.g. a WPF event handler's body calling
+                        // another method on the same class). Detect that case by
+                        // checking whether fixing up the source actually changes
+                        // it; only then push a pair, so an already-correct
+                        // source_id (the common case) stays a plain continue with
+                        // no double-counted resolution.
+                        let source_name =
+                            rel.source_id.rsplit("::").next().unwrap_or(&rel.source_id);
+                        if let Some(&fixed_source_id) = local_symbols.get(source_name) {
+                            if fixed_source_id != rel.source_id {
+                                res.pairs
+                                    .push((fixed_source_id.to_string(), target_id.to_string()));
+                                res.resolved += 1;
+                            }
                         }
+                        continue;
                     }
-                    continue;
                 }
 
                 res.dangling += 1;
@@ -416,6 +448,13 @@ fn resolve_with_map(
                                 return false;
                             }
                             if source_is_sql && f.ends_with(".sql") && kind == "Function" {
+                                return false;
+                            }
+                            // A call target must be invocable — never resolve
+                            // `builder()` to a same-named field/variable
+                            // (e.g. a builder-chain argument mis-resolving to
+                            // an unrelated same-named field).
+                            if kind != "Method" && kind != "Function" {
                                 return false;
                             }
                             true
