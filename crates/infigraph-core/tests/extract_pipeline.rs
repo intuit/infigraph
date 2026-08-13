@@ -634,6 +634,81 @@ public:
 }
 
 #[test]
+fn test_extract_module_scope_const_declaration_for_cpp() {
+    // Real HVT gap: Src/High/SS/_h/efStaMgr.h declares
+    // `const UINT16 kMaxEFEntities = 5;` at file scope, wrapped like nearly
+    // every real C++ header in an #ifndef/#define/#endif include guard.
+    // cpp's entities.scm had zero @var.def/@var.name captures at all, so
+    // this constant — and every other module/namespace-scope const or
+    // variable in any C++ file — was completely invisible to
+    // search/trace_callers/query_graph, with no error, just silently absent
+    // from the symbol list. The include-guard wrapping matters: an earlier,
+    // unguarded version of this exact test passed even before the
+    // preproc_ifdef fix below, masking the real bug — tree-sitter-cpp nests
+    // guarded content under a preproc_ifdef node, not a direct child of
+    // translation_unit, so the fix needed both a var.def pattern AND a
+    // preproc_ifdef-wrapped variant of it to match real-world headers.
+    let src = br#"
+#ifndef __EFSTAMGR__
+#define __EFSTAMGR__
+
+class zefStateAssignmentTableAccessor;
+const UINT16 kMaxEFEntities = 5; // maximum number of entities that is allowed
+
+class zefStatusManager {
+public:
+    void Foo();
+};
+
+#endif
+"#;
+    let registry = infigraph_languages::bundled_registry().unwrap();
+    let pack = registry.for_file_with_content("efStaMgr.h", src).unwrap();
+    let ext = extract_file("efStaMgr.h", src, pack).unwrap();
+
+    let konst = ext
+        .symbols
+        .iter()
+        .find(|s| s.name == "kMaxEFEntities")
+        .expect("kMaxEFEntities should be extracted as a Variable symbol");
+
+    assert_eq!(konst.kind, SymbolKind::Variable);
+    assert_eq!(konst.id, "efStaMgr.h::kMaxEFEntities");
+}
+
+#[test]
+fn test_extract_guarded_function_prototype_for_cpp() {
+    // Same preproc_ifdef gap, but for the pre-existing bodyless-prototype
+    // function pattern (not just the new var.def pattern above): a plain
+    // function prototype at file scope inside a real #ifndef include guard
+    // was silently missing, same as every other translation_unit-scoped
+    // pattern in this file, because tree-sitter-cpp nests guarded content
+    // one level deeper than an unguarded file.
+    let src = br#"
+#ifndef __FOO_H__
+#define __FOO_H__
+
+void TopLevelPrototype(int x);
+
+class Bar {
+public:
+    void Method1();
+};
+
+#endif
+"#;
+    let registry = infigraph_languages::bundled_registry().unwrap();
+    let pack = registry.for_file_with_content("foo.h", src).unwrap();
+    let ext = extract_file("foo.h", src, pack).unwrap();
+
+    assert!(
+        ext.symbols.iter().any(|s| s.name == "TopLevelPrototype"),
+        "a bodyless function prototype inside a real #ifndef include guard \
+         must be extracted as a symbol, same as an unguarded one"
+    );
+}
+
+#[test]
 fn test_extract_receiver_resolves_namespace_qualified_reference_type() {
     // Mirrors a real HVT bug found by cross-checking grep against the graph:
     // Src/High/SS/FormCalc/TKEMetaDataDependencies.cpp::GetCCFormInstances declares
