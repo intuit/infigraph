@@ -1,6 +1,7 @@
 use std::path::Path;
 
 use anyhow::{Context, Result};
+use infigraph_core::graph::filter_dead_code_candidates;
 use infigraph_core::Infigraph;
 use infigraph_languages::bundled_registry;
 
@@ -106,13 +107,15 @@ pub(crate) fn cmd_dead_code(root: &Path) -> Result<()> {
     }
 
     let entry_points = ["main", "__init__", "setUp", "tearDown"];
-    let dead: Vec<_> = rows
-        .iter()
+    let rows: Vec<_> = rows
+        .into_iter()
         .filter(|r| !entry_points.contains(&r.name.as_str()))
         .collect();
 
+    let dead = filter_dead_code_candidates(backend, rows);
+
     if dead.is_empty() {
-        println!("No dead code found (all non-entry-point functions have callers).");
+        println!("No dead code found (all non-entry-point, non-vendored functions have callers).");
         return Ok(());
     }
 

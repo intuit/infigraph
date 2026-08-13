@@ -280,3 +280,82 @@ pub trait GraphBackend: Send + Sync {
 
     fn ingest_structured_directory(&self, schema: &SchemaMeta, dir: &Path) -> Result<IngestResult>;
 }
+
+/// File-path/name fragments that mark a symbol as vendored/third-party
+/// rather than app code the user actually owns. `find_uncalled_symbols`
+/// has no concept of "vendored" — a minified library or a checked-in
+/// diagnostic tool subtree lights up as 100% dead code simply because
+/// nothing in the app calls into it, drowning out real findings (observed:
+/// 700+ of 12.8k WinEngine candidates were jQuery/d3/modernizr/TraceEvent).
+/// Matched case-insensitively against the row's `file` path.
+const VENDOR_PATH_FRAGMENTS: &[&str] = &[
+    "node_modules/",
+    "/vendor/",
+    "/vendored/",
+    "/third_party/",
+    "/thirdparty/",
+    "/packages/",
+    ".min.js",
+    "jquery",
+    "modernizr",
+    "microsoftajax",
+    "d3.v3",
+    "d3.min",
+    "/traceevent/",
+    "/perfview/",
+];
+
+fn is_vendor_path(file: &str) -> bool {
+    let lower = file.to_ascii_lowercase();
+    VENDOR_PATH_FRAGMENTS
+        .iter()
+        .any(|frag| lower.contains(frag))
+}
+
+/// Filter raw `find_uncalled_symbols` output down to candidates that are
+/// actually worth a human's attention:
+///
+/// 1. Drops vendored/third-party paths (see `VENDOR_PATH_FRAGMENTS`) — dead
+///    by definition, never something the user should "clean up".
+/// 2. Collapses interface/implementation splits — when a dead `Method` has
+///    sibling methods on the same class (via `sibling_methods_of`) and at
+///    least one sibling is NOT in the dead set, this row is the classic
+///    "interface declaration + every impl flagged separately, 0 callers
+///    each" false positive (each individual symbol looks dead but the
+///    *behavior* is reachable through a sibling — most commonly an
+///    interface member whose callers only ever go through the concrete
+///    type). Dropped rather than merged into one entry: the surviving
+///    sibling already represents the reachable behavior in the graph, so
+///    keeping a placeholder for the dropped ones would just re-introduce
+///    noise under a different name.
+///
+/// Does NOT attempt markup/XAML reachability or any other language-specific
+/// reachability signal — that needs project-root filesystem access this
+/// backend-agnostic helper doesn't have, and lives at the tool-call layer
+/// instead (see `tool_detect_dead_code`).
+pub fn filter_dead_code_candidates(
+    backend: &dyn GraphBackend,
+    rows: Vec<DeadCodeRow>,
+) -> Vec<DeadCodeRow> {
+    let non_vendor: Vec<DeadCodeRow> = rows
+        .into_iter()
+        .filter(|r| !is_vendor_path(&r.file))
+        .collect();
+
+    let dead_ids: std::collections::HashSet<String> =
+        non_vendor.iter().map(|r| r.id.clone()).collect();
+
+    non_vendor
+        .into_iter()
+        .filter(|row| {
+            if row.kind != "Method" {
+                return true;
+            }
+            let siblings = backend.sibling_methods_of(&row.id).unwrap_or_default();
+            // Keep only if every sibling is also dead (or there are none) —
+            // a live sibling means this row is an interface/impl split, not
+            // real dead code.
+            siblings.iter().all(|s| dead_ids.contains(s))
+        })
+        .collect()
+}

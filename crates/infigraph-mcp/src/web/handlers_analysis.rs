@@ -3,6 +3,7 @@ use std::path::PathBuf;
 use serde_json::{json, Value};
 
 use infigraph_core::embed;
+use infigraph_core::graph::filter_dead_code_candidates;
 
 use super::open_prism;
 
@@ -71,9 +72,12 @@ pub(crate) fn api_dead_code(params: &Value) -> Value {
             };
 
             let entry_points = ["main", "__init__", "setUp", "tearDown"];
-            let dead: Vec<Value> = rows
-                .iter()
+            let rows: Vec<_> = rows
+                .into_iter()
                 .filter(|r| !entry_points.contains(&r.name.as_str()))
+                .collect();
+            let dead: Vec<Value> = filter_dead_code_candidates(backend, rows)
+                .iter()
                 .map(|r| json!({"name": r.name, "kind": r.kind, "file": r.file}))
                 .collect();
 
