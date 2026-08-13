@@ -303,6 +303,16 @@ pub(crate) fn cmd_group(root: &Path, action: GroupAction) -> Result<()> {
                 "Linked {} cross-service CALLS_SERVICE edges in group '{}'.",
                 count, group
             );
+            let ns_count =
+                infigraph_core::multi::namespace_link::link_cross_repo_namespace_calls_for_group(
+                    &registry,
+                    &group,
+                    bundled_registry,
+                )?;
+            println!(
+                "Linked {} cross-repo namespace-qualified CALLS_SERVICE edges in group '{}'.",
+                ns_count, group
+            );
         }
         GroupAction::Query {
             group,
@@ -353,6 +363,19 @@ pub(crate) fn cmd_group(root: &Path, action: GroupAction) -> Result<()> {
                 bundled_registry,
             )?;
             println!("  {} CALLS_SERVICE edges", edge_count);
+
+            // Step 3b: Link cross-repo namespace-qualified (e.g. C++ static-lib) calls
+            println!("=== Step 3b/5: Linking cross-repo namespace calls ===");
+            let ns_edge_count =
+                infigraph_core::multi::namespace_link::link_cross_repo_namespace_calls_for_group(
+                    &registry,
+                    &group,
+                    bundled_registry,
+                )?;
+            println!(
+                "  {} namespace-qualified CALLS_SERVICE edges",
+                ns_edge_count
+            );
 
             // Step 4: Build combined graph (skip on Neo4j — shared instance already namespaced)
             let is_remote = {
