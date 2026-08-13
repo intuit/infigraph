@@ -355,6 +355,11 @@ fn find_parent_class(node: Node, source: &[u8]) -> Option<String> {
                 return Some(node_text(name_node, source));
             }
         }
+        if n.kind() == "namespace_definition" {
+            if let Some(name_node) = n.child_by_field_name("name") {
+                return Some(node_text(name_node, source));
+            }
+        }
         if n.kind() == "function_definition" {
             if let Some(declarator) = n.child_by_field_name("declarator") {
                 if let Some(qualified) = find_qualified_identifier(declarator) {

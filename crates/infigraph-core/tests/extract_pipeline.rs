@@ -920,3 +920,25 @@ fn test_extract_to_graph_roundtrip() {
         "validate should have branches (if statement)"
     );
 }
+
+#[test]
+fn cpp_namespace_scoped_function_gets_namespace_qualified_id() {
+    let registry = infigraph_languages::bundled_registry().unwrap();
+    let pack = registry.for_extension(".cpp").unwrap();
+    let src = br#"
+namespace tps
+{
+    void SetFormML(int entity, const char* formML)
+    {
+        DoWork(entity, formML);
+    }
+}
+"#;
+    let ext = extract_file("zhaSetFormML.cpp", src, pack).unwrap();
+    let set_form_ml = ext
+        .symbols
+        .iter()
+        .find(|s| s.name == "SetFormML")
+        .expect("SetFormML symbol not extracted");
+    assert_eq!(set_form_ml.id, "zhaSetFormML.cpp::tps::SetFormML");
+}
