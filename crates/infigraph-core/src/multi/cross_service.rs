@@ -1550,6 +1550,10 @@ fn scan_source_for_grpc_stubs(root: &Path, services: &[String]) -> Vec<(String, 
             format!("{lc}futurestub"),
             // Rust (tonic): {snake}_client module + {Svc}Client type. #34
             format!("{snake}_client"),
+            // C++ (grpc C++ codegen): {Svc}::NewStub(channel) factory call —
+            // the C++ generator doesn't produce a {Svc}Client type name like
+            // Go/TS, it's a static factory method on the service class itself.
+            format!("{lc}::newstub"),
             // Python server registration (a service reference, not a client, but
             // still a cross-service coupling worth surfacing). The generated
             // helper uses the PascalCase service name verbatim

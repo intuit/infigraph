@@ -350,6 +350,19 @@ fn test_client_connect_es_requires_service_on_same_line() {
     );
 }
 
+/// C++ (grpc C++ codegen): {Svc}::NewStub(channel) factory call. #34
+#[test]
+fn test_client_cpp_newstub_constructor() {
+    let deps = grpc_deps_for(
+        "client.cc",
+        "#include \"user_service.grpc.pb.h\"\n\nvoid Connect(std::shared_ptr<grpc::Channel> channel) {\n  std::unique_ptr<UserService::Stub> stub = UserService::NewStub(channel);\n}\n",
+    );
+    assert!(
+        deps.iter().any(|d| d.target_service == "user-service"),
+        "C++ {{Svc}}::NewStub(channel) constructor must link: {deps:?}"
+    );
+}
+
 // ── Layer 3: end-to-end local group build ────────────────────────────────────
 
 const PROTO_PRODUCER: &str =
