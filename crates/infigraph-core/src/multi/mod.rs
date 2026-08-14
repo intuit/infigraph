@@ -868,7 +868,7 @@ pub fn index_group(
     Ok(results)
 }
 
-fn registry_path() -> Result<PathBuf> {
+pub fn registry_path() -> Result<PathBuf> {
     if let Some(override_dir) = std::env::var_os("INFIGRAPH_REGISTRY_HOME") {
         return Ok(PathBuf::from(override_dir)
             .join(".infigraph")

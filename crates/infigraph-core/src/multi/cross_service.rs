@@ -727,10 +727,15 @@ pub fn link_cross_service_calls(
                 continue;
             }
 
+            let protocol = if target_method.eq_ignore_ascii_case("grpc") {
+                "grpc"
+            } else {
+                "http"
+            };
             let create_edge = format!(
                 "MATCH (caller:Symbol {{id: '{}'}}), (target:Symbol {{id: '{}'}}) \
-                 CREATE (caller)-[:CALLS_SERVICE {{method: '{}', path: '{}', target_service: '{}'}}]->(target)",
-                caller_sym, target_id, target_method, target_path, target_svc,
+                 CREATE (caller)-[:CALLS_SERVICE {{method: '{}', path: '{}', target_service: '{}', protocol: '{}'}}]->(target)",
+                caller_sym, target_id, target_method, target_path, target_svc, protocol,
             );
             if backend.raw_query(&create_edge).is_ok() {
                 total += 1;
@@ -828,7 +833,7 @@ pub fn link_cross_service_calls(
 
                 let create_edge = format!(
                     "MATCH (a:Symbol {{id: '{}'}}), (b:Symbol {{id: '{}'}}) \
-                     CREATE (a)-[:CALLS_SERVICE {{method: 'package', path: '{}', target_service: '{}'}}]->(b)",
+                     CREATE (a)-[:CALLS_SERVICE {{method: 'package', path: '{}', target_service: '{}', protocol: 'package'}}]->(b)",
                     caller_sym, target_id, pkg_name, publisher,
                 );
                 if backend.raw_query(&create_edge).is_ok() {

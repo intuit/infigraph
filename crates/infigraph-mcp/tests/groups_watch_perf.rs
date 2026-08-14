@@ -444,4 +444,5 @@ fn test_groups_watch_perf() {
 
     // Restore HOME
     std::env::set_var("HOME", &fix.orig_home);
+    std::env::remove_var("INFIGRAPH_REGISTRY_HOME");
 }
