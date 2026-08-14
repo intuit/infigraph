@@ -352,4 +352,111 @@ fn build_edges_json(edges: &[VizEdge]) -> String {
     entries.join(",\n")
 }
 
+/// Generate a repo-overview HTML visualization for a multi-repo group: one
+/// node per member repo, edges = aggregated cross-repo CALLS_SERVICE calls
+/// (HTTP/gRPC via `link_cross_service_calls` and static-lib/namespace calls
+/// via `link_cross_repo_namespace_calls`) between repos, labeled with a
+/// count and method/protocol.
+///
+/// Target-repo resolution mirrors the two proxy-id conventions those linking
+/// passes use:
+/// - HTTP/gRPC edges: `r.target_service` names the target repo directly.
+/// - Static-lib/namespace edges: the target proxy node's id is prefixed
+///   `xlib::{repo}::{original_id}` — parse the repo out of that prefix.
+pub fn generate_group_html(
+    repo_backends: &[(&str, &dyn GraphBackend)],
+    output_path: &Path,
+) -> Result<String> {
+    let repo_names: std::collections::HashSet<&str> =
+        repo_backends.iter().map(|(name, _)| *name).collect();
+
+    let nodes: Vec<VizNode> = repo_backends
+        .iter()
+        .map(|(name, _)| VizNode {
+            id: name.to_string(),
+            label: name.to_string(),
+            kind: "Repo".to_string(),
+            file: String::new(),
+            start_line: String::new(),
+            end_line: String::new(),
+        })
+        .collect();
+
+    // Aggregate cross-repo CALLS_SERVICE edges by (source_repo, target_repo, method/protocol).
+    use std::collections::HashMap;
+    let mut agg: HashMap<(String, String, String), usize> = HashMap::new();
+
+    for (repo_name, backend) in repo_backends {
+        let rows = backend
+            .raw_query(
+                "MATCH (a:Symbol)-[r:CALLS_SERVICE]->(b:Symbol) \
+                 RETURN r.method, r.target_service, b.id, r.protocol",
+            )
+            .unwrap_or_default();
+        for row in rows {
+            if row.len() < 3 {
+                continue;
+            }
+            let method = &row[0];
+            let target_service = &row[1];
+            let target_id = &row[2];
+            let protocol = row.get(3).map(|s| s.as_str()).unwrap_or("");
+
+            let target_repo =
+                if !target_service.is_empty() && repo_names.contains(target_service.as_str()) {
+                    target_service.clone()
+                } else if let Some(repo) = target_id
+                    .strip_prefix("xlib::")
+                    .and_then(|rest| rest.split("::").next())
+                {
+                    repo.to_string()
+                } else {
+                    continue; // can't resolve target repo — skip rather than guess
+                };
+
+            if target_repo == *repo_name {
+                continue; // not actually cross-repo
+            }
+
+            // Prefer the HTTP/gRPC `method` property; fall back to
+            // `protocol` (e.g. "static_lib") for namespace-linked edges,
+            // which carry no `method` property at all.
+            let label = if !method.is_empty() {
+                method.clone()
+            } else if !protocol.is_empty() {
+                protocol.to_string()
+            } else {
+                "CALL".to_string()
+            };
+
+            *agg.entry((repo_name.to_string(), target_repo, label))
+                .or_insert(0) += 1;
+        }
+    }
+
+    let edges: Vec<VizEdge> = agg
+        .into_iter()
+        .map(|((from, to, method), count)| VizEdge {
+            from,
+            to,
+            rel_type: format!("{count} {method}"),
+        })
+        .collect();
+
+    let nodes_json = build_nodes_json(&nodes);
+    let edges_json = build_edges_json(&edges);
+
+    let html = HTML_TEMPLATE
+        .replace("/*__NODES_DATA__*/", &nodes_json)
+        .replace("/*__EDGES_DATA__*/", &edges_json);
+
+    if let Some(parent) = output_path.parent() {
+        std::fs::create_dir_all(parent)?;
+    }
+    std::fs::write(output_path, html.as_bytes())
+        .with_context(|| format!("failed to write {}", output_path.display()))?;
+
+    Ok(output_path.to_string_lossy().to_string())
+}
+
 const HTML_TEMPLATE: &str = include_str!("template.html");
