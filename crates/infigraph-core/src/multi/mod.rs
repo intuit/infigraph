@@ -869,6 +869,11 @@ pub fn index_group(
 }
 
 fn registry_path() -> Result<PathBuf> {
+    if let Some(override_dir) = std::env::var_os("INFIGRAPH_REGISTRY_HOME") {
+        return Ok(PathBuf::from(override_dir)
+            .join(".infigraph")
+            .join("registry.json"));
+    }
     let home = std::env::var_os("HOME")
         .map(PathBuf::from)
         .or_else(dirs_next::home_dir)
