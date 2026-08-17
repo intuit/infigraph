@@ -78,7 +78,13 @@ pub(crate) fn apply_resolved_artifact(
         Strategy::Overwrite => {
             let content = resolved_content
                 .ok_or_else(|| anyhow::anyhow!("overwrite artifact has no content"))?;
-            strategy::apply_overwrite(&target_path, &content)
+            let outcome = strategy::apply_overwrite(&target_path, &content)?;
+            if matches!(outcome, ApplyOutcome::Written)
+                && target_path.components().any(|c| c.as_os_str() == "hooks")
+            {
+                make_executable(&target_path)?;
+            }
+            Ok(outcome)
         }
         Strategy::MarkerDelimited => {
             let content = resolved_content
@@ -115,6 +121,22 @@ pub(crate) fn apply_resolved_artifact(
             strategy::apply_json_key_path(&target_path, key_path, text)
         }
     }
+}
+
+/// Hook scripts run via a shebang through the user's shell, which requires
+/// the executable bit -- unlike every other overwrite-strategy artifact
+/// (settings.json fragments, docs), a non-executable hook script silently
+/// never fires. No-op on non-Unix; Windows hook scripts aren't shipped.
+#[cfg(unix)]
+fn make_executable(path: &std::path::Path) -> anyhow::Result<()> {
+    use std::os::unix::fs::PermissionsExt;
+    std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o755))
+        .with_context(|| format!("failed to make {} executable", path.display()))
+}
+
+#[cfg(not(unix))]
+fn make_executable(_path: &std::path::Path) -> anyhow::Result<()> {
+    Ok(())
 }
 
 pub(crate) fn remove_resolved_artifact(
@@ -612,6 +634,37 @@ resolver = ["./resolve-zed-path.sh"]
             .as_str()
             .unwrap();
         assert!(enforce_command.contains("infigraph-enforce.sh"));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn installed_hook_scripts_are_executable() {
+        // Hook scripts run via a shebang through the user's shell -- unlike
+        // every other overwrite-strategy artifact (settings.json fragments,
+        // docs), a non-executable hook script silently never fires.
+        use std::os::unix::fs::PermissionsExt;
+
+        let user_dir = tempfile::tempdir().unwrap();
+        let home_dir = tempfile::tempdir().unwrap();
+        let mcp_path = "/opt/infigraph/bin/infigraph-mcp";
+
+        let artifacts =
+            discover_artifacts(BUNDLED_INTEGRATIONS, user_dir.path(), mcp_path).unwrap();
+        let enforce = artifacts
+            .iter()
+            .find(|a| {
+                a.target_relative_path.as_deref() == Some(".claude/hooks/infigraph-enforce.sh")
+            })
+            .unwrap();
+        apply_resolved_artifact(enforce, home_dir.path(), mcp_path).unwrap();
+
+        let installed = home_dir.path().join(".claude/hooks/infigraph-enforce.sh");
+        let mode = std::fs::metadata(&installed).unwrap().permissions().mode();
+        assert_eq!(
+            mode & 0o111,
+            0o111,
+            "installed hook script must be executable (mode {mode:o})"
+        );
     }
 
     #[test]
