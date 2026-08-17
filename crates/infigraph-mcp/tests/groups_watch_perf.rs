@@ -25,6 +25,7 @@ fn group_fixture() -> &'static GroupFixture {
         let home_dir = tempfile::TempDir::new().expect("tmpdir for home");
         let orig_home = std::env::var("HOME").unwrap_or_default();
         std::env::set_var("HOME", home_dir.path());
+        std::env::set_var("INFIGRAPH_REGISTRY_HOME", home_dir.path());
 
         // Service A: a Flask-like Python API
         let svc_a_dir = tempfile::TempDir::new().expect("svc_a");
@@ -443,4 +444,5 @@ fn test_groups_watch_perf() {
 
     // Restore HOME
     std::env::set_var("HOME", &fix.orig_home);
+    std::env::remove_var("INFIGRAPH_REGISTRY_HOME");
 }

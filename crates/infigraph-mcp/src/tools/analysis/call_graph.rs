@@ -1,19 +1,74 @@
 use anyhow::{Context, Result};
-use infigraph_core::graph::GraphBackend;
+use infigraph_core::graph::{filter_dead_code_candidates, GraphBackend};
 use serde_json::Value;
+use std::path::Path;
 
 use super::super::helpers::{open_prism, save_analysis};
+
+/// Names referenced anywhere in a `.xaml` file's markup — command bindings
+/// (`Command="{x:Static ...}"`, `{Binding SomeCommand}`) and event-sink
+/// method names dispatched by name, not a resolvable code-behind call site.
+/// `find_uncalled_symbols` has no visibility into markup, so any symbol only
+/// ever invoked this way looks permanently dead (a known, accepted blind
+/// spot — see #17 in project history: real fix needs markup-binding
+/// extraction, not attempted here). This is a best-effort text-containment
+/// check, not real markup parsing: it errs toward marking things reachable
+/// (fewer false "dead") rather than missing a real markup reference.
+fn xaml_referenced_names(project_root: &str) -> std::collections::HashSet<String> {
+    let mut names = std::collections::HashSet::new();
+    let root = Path::new(project_root);
+    let mut stack = vec![root.to_path_buf()];
+    while let Some(dir) = stack.pop() {
+        let Ok(entries) = std::fs::read_dir(&dir) else {
+            continue;
+        };
+        for entry in entries.flatten() {
+            let path = entry.path();
+            if path.is_dir() {
+                let name = entry.file_name().to_string_lossy().to_string();
+                if !name.starts_with('.') && name != "bin" && name != "obj" {
+                    stack.push(path);
+                }
+                continue;
+            }
+            if path.extension().and_then(|e| e.to_str()) != Some("xaml") {
+                continue;
+            }
+            if let Ok(content) = std::fs::read_to_string(&path) {
+                names.insert(content);
+            }
+        }
+    }
+    // Collapse into a single searchable blob check happens at call site;
+    // this function returns per-file contents so callers can do substring
+    // matches against symbol names without re-reading the filesystem.
+    names
+}
+
+fn is_xaml_referenced(name: &str, xaml_blobs: &std::collections::HashSet<String>) -> bool {
+    xaml_blobs.iter().any(|blob| blob.contains(name))
+}
 
 pub fn tool_detect_dead_code(args: &Value) -> Result<String> {
     let prism = open_prism(args)?;
     let backend = prism.backend().context("not initialized")?;
 
     let rows = backend.find_uncalled_symbols()?;
-
     let entry_points = ["main", "__init__", "setUp", "tearDown"];
-    let dead: Vec<_> = rows
-        .iter()
+    let rows: Vec<_> = rows
+        .into_iter()
         .filter(|row| !entry_points.contains(&row.name.as_str()))
+        .collect();
+
+    // Vendor-path suppression + interface/impl-split collapse (backend-agnostic).
+    let filtered = filter_dead_code_candidates(backend, rows);
+
+    // XAML markup reachability (filesystem-dependent, MCP-layer only).
+    let path = args.get("path").and_then(|p| p.as_str()).unwrap_or(".");
+    let xaml_blobs = xaml_referenced_names(path);
+    let dead: Vec<_> = filtered
+        .into_iter()
+        .filter(|row| xaml_blobs.is_empty() || !is_xaml_referenced(&row.name, &xaml_blobs))
         .collect();
 
     if dead.is_empty() {
@@ -25,7 +80,6 @@ pub fn tool_detect_dead_code(args: &Value) -> Result<String> {
         out.push_str(&format!("  {} {} ({})\n", row.kind, row.name, row.file));
     }
 
-    let path = args.get("path").and_then(|p| p.as_str()).unwrap_or(".");
     match save_analysis(path, "dead_code", &out) {
         Ok(receipt) => Ok(receipt),
         Err(_) => Ok(out),
@@ -43,18 +97,57 @@ pub fn tool_trace_callers(args: &Value) -> Result<String> {
         .get("include_tests")
         .and_then(|v| v.as_bool())
         .unwrap_or(true);
+    // When true, aggregate callers across every sibling method on the same
+    // class/interface instead of just symbol_id — see sibling_methods_of's
+    // doc comment for why a single method's callers can badly undercount
+    // the true blast radius of changing a multi-method interface.
+    let expand_interface = args
+        .get("expand_interface")
+        .and_then(|v| v.as_bool())
+        .unwrap_or(false);
 
     let backend = prism.backend().context("not initialized")?;
-    let callers = backend.callers_of_filtered(symbol_id, include_tests)?;
+    let siblings = backend.sibling_methods_of(symbol_id).unwrap_or_default();
+
+    let mut ids_to_query = vec![symbol_id.to_string()];
+    if expand_interface {
+        ids_to_query.extend(siblings.iter().cloned());
+    }
+
+    let mut callers: Vec<String> = Vec::new();
+    for id in &ids_to_query {
+        callers.extend(backend.callers_of_filtered(id, include_tests)?);
+    }
+    callers.sort();
+    callers.dedup();
+
+    let suffix = if include_tests {
+        String::new()
+    } else {
+        " (excluding tests)".to_string()
+    };
+
     if callers.is_empty() {
-        let suffix = if include_tests {
-            String::new()
-        } else {
-            " (excluding tests)".to_string()
-        };
         return Ok(format!("No callers found for '{}'{}", symbol_id, suffix));
     }
-    Ok(callers.join("\n"))
+
+    let mut out = String::new();
+    if expand_interface && !siblings.is_empty() {
+        out.push_str(&format!(
+            "Interface-wide: aggregated callers across {} sibling method(s) on the same class.\n\n",
+            siblings.len()
+        ));
+    } else if !siblings.is_empty() {
+        out.push_str(&format!(
+            "Note: '{}' has {} sibling method(s) on the same class/interface whose \
+             callers are NOT included below. If changing the interface (not just this \
+             one method), re-run with expand_interface=true for the full blast radius.\n\n",
+            symbol_id,
+            siblings.len()
+        ));
+    }
+    out.push_str(&callers.join("\n"));
+    Ok(out)
 }
 
 pub fn tool_trace_callees(args: &Value) -> Result<String> {
@@ -89,14 +182,52 @@ pub fn tool_transitive_impact(args: &Value) -> Result<String> {
         .and_then(|s| s.as_str())
         .context("missing 'symbol_id'")?;
     let depth = args.get("depth").and_then(|d| d.as_u64()).unwrap_or(5) as u32;
+    // See tool_trace_callers for why this exists: a single method's
+    // transitive impact can badly undercount the true blast radius of
+    // changing a multi-method interface, since it misses every caller that
+    // only goes through a sibling method.
+    let expand_interface = args
+        .get("expand_interface")
+        .and_then(|v| v.as_bool())
+        .unwrap_or(false);
 
     let backend = prism.backend().context("not initialized")?;
-    let impacted = backend.transitive_impact(symbol_id, depth)?;
+    let siblings = backend.sibling_methods_of(symbol_id).unwrap_or_default();
+
+    let mut ids_to_query = vec![symbol_id.to_string()];
+    if expand_interface {
+        ids_to_query.extend(siblings.iter().cloned());
+    }
+
+    let mut impacted = Vec::new();
+    let mut seen_ids = std::collections::HashSet::new();
+    for id in &ids_to_query {
+        for row in backend.transitive_impact(id, depth)? {
+            if seen_ids.insert(row.id.clone()) {
+                impacted.push(row);
+            }
+        }
+    }
+
     if impacted.is_empty() {
         return Ok(format!("No symbols affected by changes to '{}'", symbol_id));
     }
 
     let mut out = String::new();
+    if expand_interface && !siblings.is_empty() {
+        out.push_str(&format!(
+            "Interface-wide: aggregated impact across {} sibling method(s) on the same class.\n\n",
+            siblings.len()
+        ));
+    } else if !siblings.is_empty() {
+        out.push_str(&format!(
+            "Note: '{}' has {} sibling method(s) on the same class/interface whose \
+             impact is NOT included below. If changing the interface (not just this \
+             one method), re-run with expand_interface=true for the full blast radius.\n\n",
+            symbol_id,
+            siblings.len()
+        ));
+    }
     for row in &impacted {
         out.push_str(&format!("{} {} ({})\n", row.kind, row.name, row.file));
     }

@@ -304,6 +304,34 @@ mod tests {
         assert!(route.is_none());
     }
 
+    #[test]
+    fn test_doxygen_comment_opening_token_is_not_a_route() {
+        // Real false positive found in tto-engine-master: a plain C++ header
+        // method with an ordinary Doxygen/Javadoc doc comment —
+        //   /**
+        //    * Post a calc eventMessage
+        //    * @param[in] eventMessage - the message describing the event
+        //    */
+        //   void PostDataChangeEvent(const EventMessage& eventMessage);
+        // — has its comment captured verbatim as the docstring. The comment's
+        // opening "/**" token reads as an unquoted "/path"-shaped word to a
+        // naive starts_with('/') check, and "Post" matches the HTTP-verb
+        // keyword scan as a whole word, together fabricating
+        // "POST /**" for nearly every documented function in a C++/Java
+        // codebase (124 false positives observed in one real repo).
+        let route = detect_route_from_symbol(
+            "EventProxy.h::EventProxy::PostDataChangeEvent",
+            "PostDataChangeEvent",
+            "EventProxy.h",
+            "/**\n * post a calc eventmessage\n *\n * @param[in] eventmessage - the message describing the event\n */",
+        );
+        assert!(
+            route.is_none(),
+            "a Doxygen comment's opening \"/**\" token must not be extracted \
+             as a URL path, got: {route:?}"
+        );
+    }
+
     // ── Helpers still in use by the Go path / docstring parser ──
 
     #[test]

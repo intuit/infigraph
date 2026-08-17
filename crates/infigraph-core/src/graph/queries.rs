@@ -918,6 +918,7 @@ pub struct ComplexityRow {
 
 #[derive(Debug, Serialize)]
 pub struct DeadCodeRow {
+    pub id: String,
     pub name: String,
     pub kind: String,
     pub file: String,

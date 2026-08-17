@@ -303,6 +303,63 @@ pub(crate) fn cmd_group(root: &Path, action: GroupAction) -> Result<()> {
                 "Linked {} cross-service CALLS_SERVICE edges in group '{}'.",
                 count, group
             );
+            let ns_count =
+                infigraph_core::multi::namespace_link::link_cross_repo_namespace_calls_for_group(
+                    &registry,
+                    &group,
+                    bundled_registry,
+                )?;
+            println!(
+                "Linked {} cross-repo namespace-qualified CALLS_SERVICE edges in group '{}'.",
+                ns_count, group
+            );
+        }
+        GroupAction::Visualize { group } => {
+            let group = registry.resolve_group_key(&group);
+            let g = registry
+                .groups
+                .get(&group)
+                .context(format!("group '{}' not found", group))?
+                .clone();
+
+            if g.repos.is_empty() {
+                println!("Group '{}' has no repos.", group);
+                return Ok(());
+            }
+
+            // Open every member repo's backend, same approach as
+            // link_cross_repo_namespace_calls_for_group: build Infigraph
+            // handles first (so they outlive the borrow), then collect
+            // (&str, &dyn GraphBackend) refs.
+            let mut opened: Vec<(String, Infigraph)> = Vec::new();
+            for repo_name in &g.repos {
+                let entry = match registry.repos.get(repo_name) {
+                    Some(e) => e.clone(),
+                    None => continue,
+                };
+                let reg = bundled_registry()?;
+                let mut prism = Infigraph::open(&entry.path, reg)?;
+                prism.init()?;
+                opened.push((repo_name.clone(), prism));
+            }
+
+            let backends: Vec<(&str, &dyn infigraph_core::graph::GraphBackend)> = opened
+                .iter()
+                .filter_map(|(name, prism)| prism.backend().map(|b| (name.as_str(), b)))
+                .collect();
+
+            let output_path = infigraph_core::multi::combined::combined_graph_path(&group)
+                .ok()
+                .and_then(|p| p.parent().map(|d| d.join("group.html")))
+                .unwrap_or_else(|| std::path::PathBuf::from(format!("{}-group.html", group)));
+
+            let path = infigraph_core::viz::generate_group_html(&backends, &output_path)?;
+            println!(
+                "Group visualization for '{}' ({} repos) written to: {}",
+                group,
+                backends.len(),
+                path
+            );
         }
         GroupAction::Query {
             group,
@@ -353,6 +410,19 @@ pub(crate) fn cmd_group(root: &Path, action: GroupAction) -> Result<()> {
                 bundled_registry,
             )?;
             println!("  {} CALLS_SERVICE edges", edge_count);
+
+            // Step 3b: Link cross-repo namespace-qualified (e.g. C++ static-lib) calls
+            println!("=== Step 3b/5: Linking cross-repo namespace calls ===");
+            let ns_edge_count =
+                infigraph_core::multi::namespace_link::link_cross_repo_namespace_calls_for_group(
+                    &registry,
+                    &group,
+                    bundled_registry,
+                )?;
+            println!(
+                "  {} namespace-qualified CALLS_SERVICE edges",
+                ns_edge_count
+            );
 
             // Step 4: Build combined graph (skip on Neo4j — shared instance already namespaced)
             let is_remote = {

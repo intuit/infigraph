@@ -170,6 +170,64 @@ fn resolve_custom_edges(
     Ok(())
 }
 
+/// Write ExternalRef nodes + EXTERNAL_CALL edges for calls whose receiver
+/// resolved to a real class/type name but that type has no local Symbol
+/// (see graph/schema.rs's ExternalRef comment for why this exists). Caller
+/// must hold WriteLock.
+fn write_external_calls(
+    conn: &kuzu::Connection<'_>,
+    external_calls: &[(String, String, String)],
+    symbol_map: &HashMap<String, Vec<(String, String, String)>>,
+    extractions: &[FileExtraction],
+) {
+    let mut known_ids: std::collections::HashSet<&str> = symbol_map
+        .values()
+        .flat_map(|v| v.iter().map(|(id, _, _)| id.as_str()))
+        .collect();
+    for ext in extractions {
+        for sym in &ext.symbols {
+            known_ids.insert(&sym.id);
+        }
+    }
+
+    let mut seen: std::collections::HashSet<&(String, String, String)> =
+        std::collections::HashSet::new();
+    let valid: Vec<&(String, String, String)> = external_calls
+        .iter()
+        .filter(|(caller, _, _)| known_ids.contains(caller.as_str()))
+        .filter(|triple| seen.insert(triple))
+        .collect();
+    if valid.is_empty() {
+        return;
+    }
+
+    const CHUNK_SIZE: usize = 500;
+    for chunk in valid.chunks(CHUNK_SIZE) {
+        let rows: Vec<String> = chunk
+            .iter()
+            .map(|(caller, receiver, method)| {
+                let ref_id = format!("{}::{}", receiver, method);
+                format!(
+                    "{{caller: '{}', ref_id: '{}', qualifier: '{}', method: '{}'}}",
+                    escape(caller),
+                    escape(&ref_id),
+                    escape(receiver),
+                    escape(method)
+                )
+            })
+            .collect();
+        let _ = conn.query(&format!(
+            "UNWIND [{}] AS r \
+             MERGE (e:ExternalRef {{id: r.ref_id}}) \
+             ON CREATE SET e.qualifier = r.qualifier, e.method = r.method \
+             WITH r, e \
+             MATCH (a:Symbol) WHERE a.id = r.caller \
+             CREATE (a)-[:EXTERNAL_CALL]->(e)",
+            rows.join(", ")
+        ));
+    }
+}
+
 /// Caller must hold WriteLock.
 fn resolve_with_map(
     conn: &kuzu::Connection<'_>,
@@ -219,6 +277,13 @@ fn resolve_with_map(
         dangling: usize,
         learned: usize,
         pairs: Vec<(String, String)>,
+        // (caller_id, receiver_type, method_name) for calls whose receiver
+        // resolved to a real class/type name but that type has no local
+        // Symbol — e.g. a statically-linked lib whose source isn't indexed.
+        // See ExternalRef/EXTERNAL_CALL in graph/schema.rs for why this
+        // exists instead of letting these vanish into `unresolved` with no
+        // trace.
+        external_calls: Vec<(String, String, String)>,
     }
 
     let file_results: Vec<FileResolveResult> = extractions
@@ -230,11 +295,29 @@ fn resolve_with_map(
                 dangling: 0,
                 learned: 0,
                 pairs: Vec::new(),
+                external_calls: Vec::new(),
             };
 
             let local_symbols: HashMap<&str, &str> = ext
                 .symbols
                 .iter()
+                .map(|s| (s.name.as_str(), s.id.as_str()))
+                .collect();
+
+            // Callable-only view of local_symbols, keyed the same way, used to
+            // gate the same-class fast path below: a call target must resolve
+            // to something invocable (Method/Function), never a field/variable
+            // that happens to share the name (e.g. a `builder` field beside a
+            // `builder()` method).
+            let local_callables: HashMap<&str, &str> = ext
+                .symbols
+                .iter()
+                .filter(|s| {
+                    matches!(
+                        s.kind,
+                        crate::model::SymbolKind::Method | crate::model::SymbolKind::Function
+                    )
+                })
                 .map(|s| (s.name.as_str(), s.id.as_str()))
                 .collect();
 
@@ -263,8 +346,48 @@ fn resolve_with_map(
 
                 let target_name = rel.target_id.rsplit("::").next().unwrap_or(&rel.target_id);
 
-                if local_symbols.contains_key(target_name) {
-                    continue;
+                // Same-class fast path only applies when the call is unqualified
+                // (`method()`) or explicitly self-referential (`this.method()`,
+                // `self.method()`) — a receiver like `chain` or `exchange` means
+                // the name match is coincidental (e.g. an override calling the
+                // delegate's same-named method, `chain.filter(x)` inside a
+                // `filter()` override) and must fall through to the
+                // receiver-aware strategies below instead of self-looping.
+                let is_self_receiver = matches!(
+                    rel.receiver.as_deref().map(str::trim),
+                    None | Some("this") | Some("self")
+                );
+
+                if is_self_receiver {
+                    if let Some(&target_id) = local_callables.get(target_name) {
+                        // Target resolves locally by bare name. Normally the
+                        // initial bulk write (store_bulk.rs) already created this
+                        // edge using rel.source_id/rel.target_id verbatim, so the
+                        // common case is a no-op continue. But when rel.source_id
+                        // is itself bare — extraction's find_enclosing_function
+                        // only ever returns an unqualified name (see relations.rs),
+                        // e.g. "DebugViewModel.cs::ExecuteCrashManagedBackground"
+                        // rather than the real qualified
+                        // "...::DebugViewModel::ExecuteCrashManagedBackground" —
+                        // that bulk write's MATCH never finds a node and the edge
+                        // silently never gets created (dropping every local
+                        // same-class call, e.g. a WPF event handler's body calling
+                        // another method on the same class). Detect that case by
+                        // checking whether fixing up the source actually changes
+                        // it; only then push a pair, so an already-correct
+                        // source_id (the common case) stays a plain continue with
+                        // no double-counted resolution.
+                        let source_name =
+                            rel.source_id.rsplit("::").next().unwrap_or(&rel.source_id);
+                        if let Some(&fixed_source_id) = local_symbols.get(source_name) {
+                            if fixed_source_id != rel.source_id {
+                                res.pairs
+                                    .push((fixed_source_id.to_string(), target_id.to_string()));
+                                res.resolved += 1;
+                            }
+                        }
+                        continue;
+                    }
                 }
 
                 res.dangling += 1;
@@ -327,6 +450,13 @@ fn resolve_with_map(
                             if source_is_sql && f.ends_with(".sql") && kind == "Function" {
                                 return false;
                             }
+                            // A call target must be invocable — never resolve
+                            // `builder()` to a same-named field/variable
+                            // (e.g. a builder-chain argument mis-resolving to
+                            // an unrelated same-named field).
+                            if kind != "Method" && kind != "Function" {
+                                return false;
+                            }
                             true
                         })
                         .collect();
@@ -364,9 +494,23 @@ fn resolve_with_map(
                     if let Some(target_id) = resolved_id {
                         res.pairs.push((rel.source_id.clone(), target_id));
                         res.resolved += 1;
+                    } else if let Some(ref receiver) = rel.receiver {
+                        res.external_calls.push((
+                            rel.source_id.clone(),
+                            receiver.clone(),
+                            target_name.to_string(),
+                        ));
+                        res.unresolved += 1;
                     } else {
                         res.unresolved += 1;
                     }
+                } else if let Some(ref receiver) = rel.receiver {
+                    res.external_calls.push((
+                        rel.source_id.clone(),
+                        receiver.clone(),
+                        target_name.to_string(),
+                    ));
+                    res.unresolved += 1;
                 } else {
                     res.unresolved += 1;
                 }
@@ -385,8 +529,10 @@ fn resolve_with_map(
     }
     let total_pairs: usize = file_results.iter().map(|fr| fr.pairs.len()).sum();
     resolved_pairs.reserve(total_pairs);
+    let mut external_calls: Vec<(String, String, String)> = Vec::new();
     for fr in file_results {
         resolved_pairs.extend(fr.pairs);
+        external_calls.extend(fr.external_calls);
     }
 
     // Batch insert resolved CALLS edges via COPY FROM parquet
@@ -462,6 +608,10 @@ fn resolve_with_map(
             .collect();
         let pq_path = std::env::temp_dir().join("infigraph_resolve_calls.parquet");
         copy_edges_with_bad_record_retry(conn, "CALLS", pairs, "Symbol", "Symbol", &pq_path);
+    }
+
+    if !external_calls.is_empty() {
+        write_external_calls(conn, &external_calls, symbol_map, extractions);
     }
 
     Ok(ResolveStats {

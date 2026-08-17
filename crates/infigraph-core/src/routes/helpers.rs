@@ -175,6 +175,20 @@ pub(crate) fn detect_framework_from_docstring(doc_lower: &str) -> String {
     }
 }
 
+/// A real URL path segment needs at least one alphanumeric/`_`/`-`/`{`
+/// character after the leading slash(es) — otherwise it's comment-syntax
+/// noise, not a path. Without this, a Javadoc/Doxygen block comment's
+/// opening token ("/**", captured verbatim as the symbol's docstring) reads
+/// as an unquoted "/path"-shaped word to the naive `starts_with('/')` check
+/// below, fabricating a route for any function with a plain `/** ... */`
+/// doc comment — which is nearly every function in a C++/Java codebase.
+fn looks_like_real_path(candidate: &str) -> bool {
+    candidate
+        .trim_start_matches('/')
+        .chars()
+        .any(|c| c.is_alphanumeric() || c == '_' || c == '-' || c == '{')
+}
+
 /// Try to extract a URL path (e.g., /users/{id}) from text.
 pub(crate) fn extract_path_from_text(text: &str) -> Option<String> {
     // Look for patterns like "/something" or '/something'
@@ -183,7 +197,7 @@ pub(crate) fn extract_path_from_text(text: &str) -> Option<String> {
             let path_start = start + 1; // skip the delimiter
             if let Some(end) = text[path_start..].find(delim) {
                 let path = &text[path_start..path_start + end];
-                if path.starts_with('/') && path.len() > 1 {
+                if path.starts_with('/') && path.len() > 1 && looks_like_real_path(path) {
                     return Some(path.to_string());
                 }
             }
@@ -192,7 +206,11 @@ pub(crate) fn extract_path_from_text(text: &str) -> Option<String> {
 
     // Look for unquoted /path patterns (e.g., in docstrings: "GET /users")
     for word in text.split_whitespace() {
-        if word.starts_with('/') && word.len() > 1 && !word.starts_with("//") {
+        if word.starts_with('/')
+            && word.len() > 1
+            && !word.starts_with("//")
+            && looks_like_real_path(word)
+        {
             return Some(word.to_string());
         }
     }

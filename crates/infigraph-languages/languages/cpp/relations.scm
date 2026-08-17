@@ -10,9 +10,15 @@
     argument: (_) @call.receiver
     field: (field_identifier) @call.func)) @call.site
 
-; Qualified calls: ns::func()
+; Qualified calls: ns::func() or Class::method() (static-qualified method call)
+; scope captures the qualifier text as @call.receiver so resolve_with_map's
+; receiver-aware Strategy 1 can match it directly against a real class name —
+; without this, `zctField::IsAcceptable(...)` had no receiver at all, so the
+; qualifier was silently discarded and the call could only ever resolve via
+; a bare-name lookup, same failure mode as an unresolved variable receiver.
 (call_expression
   function: (qualified_identifier
+    scope: (_) @call.receiver
     name: (identifier) @call.func)) @call.site
 
 ; Template calls: func<T>() or ns::func<T>()

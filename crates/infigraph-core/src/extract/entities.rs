@@ -331,13 +331,43 @@ pub fn extract_entities(
 
 /// Walk up the AST to find the enclosing class_definition and return its name.
 fn find_parent_class(node: Node, source: &[u8]) -> Option<String> {
+    // Same node-kind set as relations.rs's find_enclosing_class — that
+    // function already covered Java/TS/JS/C#/Kotlin/Swift/Ruby/Rust/Elixir
+    // correctly, but this one (which actually builds the class-scoped
+    // Symbol.id "file::Class::method") only ever checked "class_definition"
+    // (Python). Every other language's methods were silently staying
+    // file-scoped ("file::method") instead of class-scoped — the same
+    // failure mode the C++-specific class_specifier/struct_specifier fix
+    // addressed, just never generalized to the rest of these languages.
+    const CLASS_KINDS: &[&str] = &[
+        "class_definition",  // Python
+        "class_declaration", // Java, TS, JS, C#, Kotlin, Swift
+        "class",             // Ruby
+        "class_specifier",   // C/C++
+        "struct_specifier",  // C/C++ struct
+        "impl_item",         // Rust
+        "struct_item",       // Rust
+    ];
     let mut current = node.parent();
     while let Some(n) = current {
-        if n.kind() == "class_definition" {
-            // The name child of a class_definition is the class name
-            return n
-                .child_by_field_name("name")
-                .map(|name_node| node_text(name_node, source));
+        if CLASS_KINDS.contains(&n.kind()) {
+            if let Some(name_node) = n.child_by_field_name("name") {
+                return Some(node_text(name_node, source));
+            }
+        }
+        if n.kind() == "namespace_definition" {
+            if let Some(name_node) = n.child_by_field_name("name") {
+                return Some(node_text(name_node, source));
+            }
+        }
+        if n.kind() == "function_definition" {
+            if let Some(declarator) = n.child_by_field_name("declarator") {
+                if let Some(qualified) = find_qualified_identifier(declarator) {
+                    if let Some(scope) = qualified.child_by_field_name("scope") {
+                        return Some(node_text(scope, source));
+                    }
+                }
+            }
         }
         // Protobuf: an `rpc` lives inside a `service` node. The service name has
         // no "name" field — it's a `service_name` child. Without this, proto RPC
@@ -356,6 +386,22 @@ fn find_parent_class(node: Node, source: &[u8]) -> Option<String> {
         current = n.parent();
     }
     None
+}
+
+/// Descend through declarator wrappers (pointer/reference return types, e.g.
+/// `const char* Class::method()`) to find a `qualified_identifier` — the
+/// `Class::method` name node in an out-of-line C++ method definition.
+fn find_qualified_identifier(node: Node) -> Option<Node> {
+    if node.kind() == "qualified_identifier" {
+        return Some(node);
+    }
+    if node.kind() == "function_declarator" {
+        return node
+            .child_by_field_name("declarator")
+            .and_then(find_qualified_identifier);
+    }
+    node.child_by_field_name("declarator")
+        .and_then(find_qualified_identifier)
 }
 
 /// Look at preceding siblings for attribute/decorator nodes.

@@ -727,10 +727,15 @@ pub fn link_cross_service_calls(
                 continue;
             }
 
+            let protocol = if target_method.eq_ignore_ascii_case("grpc") {
+                "grpc"
+            } else {
+                "http"
+            };
             let create_edge = format!(
                 "MATCH (caller:Symbol {{id: '{}'}}), (target:Symbol {{id: '{}'}}) \
-                 CREATE (caller)-[:CALLS_SERVICE {{method: '{}', path: '{}', target_service: '{}'}}]->(target)",
-                caller_sym, target_id, target_method, target_path, target_svc,
+                 CREATE (caller)-[:CALLS_SERVICE {{method: '{}', path: '{}', target_service: '{}', protocol: '{}'}}]->(target)",
+                caller_sym, target_id, target_method, target_path, target_svc, protocol,
             );
             if backend.raw_query(&create_edge).is_ok() {
                 total += 1;
@@ -828,7 +833,7 @@ pub fn link_cross_service_calls(
 
                 let create_edge = format!(
                     "MATCH (a:Symbol {{id: '{}'}}), (b:Symbol {{id: '{}'}}) \
-                     CREATE (a)-[:CALLS_SERVICE {{method: 'package', path: '{}', target_service: '{}'}}]->(b)",
+                     CREATE (a)-[:CALLS_SERVICE {{method: 'package', path: '{}', target_service: '{}', protocol: 'package'}}]->(b)",
                     caller_sym, target_id, pkg_name, publisher,
                 );
                 if backend.raw_query(&create_edge).is_ok() {
@@ -1550,6 +1555,10 @@ fn scan_source_for_grpc_stubs(root: &Path, services: &[String]) -> Vec<(String, 
             format!("{lc}futurestub"),
             // Rust (tonic): {snake}_client module + {Svc}Client type. #34
             format!("{snake}_client"),
+            // C++ (grpc C++ codegen): {Svc}::NewStub(channel) factory call —
+            // the C++ generator doesn't produce a {Svc}Client type name like
+            // Go/TS, it's a static factory method on the service class itself.
+            format!("{lc}::newstub"),
             // Python server registration (a service reference, not a client, but
             // still a cross-service coupling worth surfacing). The generated
             // helper uses the PascalCase service name verbatim

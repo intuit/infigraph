@@ -1720,7 +1720,7 @@ const COZO_SCHEMA: &[&str] = &[
     ":create contains_file {folder_id: String, file_id: String}",
     ":create contains_folder {parent_id: String, child_id: String}",
     ":create defines {file_id: String, symbol_id: String}",
-    ":create calls_service {caller: String, target: String, method: String default \"\", path: String default \"\", target_service: String default \"\"}",
+    ":create calls_service {caller: String, target: String, method: String default \"\", path: String default \"\", target_service: String default \"\", protocol: String default \"\", qualifier: String default \"\"}",
     ":create has_statement {symbol_id: String, statement_id: String}",
     ":create concern {id: String => kind: String, detail: String default \"\"}",
     ":create has_concern {symbol_id: String, concern_id: String}",
@@ -1735,6 +1735,14 @@ const COZO_SCHEMA: &[&str] = &[
     // schema-shape parity only, not a functional query path.
     ":create injects_dependency {source: String, target: String}",
     ":create registers_middleware {source: String, target: String}",
+    // Parity entry for the Kuzu ExternalRef node table / EXTERNAL_CALL rel
+    // table (see schema.rs's ExternalRef comment for what these represent —
+    // a call whose receiver resolves to a real type with no local Symbol).
+    // Same schema-shape-only parity as injects_dependency/registers_middleware
+    // above: Cozo isn't an active GraphBackend, so this exists purely to
+    // satisfy schema_parity.rs, not a functional query path.
+    ":create externalref {id: String => qualifier: String, method: String}",
+    ":create external_call {source: String, target: String}",
     // Materialized helpers for fast aggregation
     ":create meta_cache {key: String => val: Int}",
     ":create testable_cache {id: String}",

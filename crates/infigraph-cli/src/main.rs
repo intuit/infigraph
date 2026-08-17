@@ -700,6 +700,9 @@ pub(crate) enum GroupAction {
     Deps { group: String },
     /// Link cross-service dependencies as CALLS_SERVICE edges in caller graphs
     Link { group: String },
+    /// Render a repo-overview HTML graph: one node per group repo, edges =
+    /// aggregated cross-repo CALLS_SERVICE calls
+    Visualize { group: String },
     /// Run a Cypher query across all repos in a group
     Query {
         group: String,

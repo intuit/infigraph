@@ -2,6 +2,7 @@ mod bridge;
 pub mod combined;
 mod cross_service;
 pub mod grpc;
+pub mod namespace_link;
 
 pub use bridge::*;
 pub use cross_service::*;
@@ -867,7 +868,12 @@ pub fn index_group(
     Ok(results)
 }
 
-fn registry_path() -> Result<PathBuf> {
+pub fn registry_path() -> Result<PathBuf> {
+    if let Some(override_dir) = std::env::var_os("INFIGRAPH_REGISTRY_HOME") {
+        return Ok(PathBuf::from(override_dir)
+            .join(".infigraph")
+            .join("registry.json"));
+    }
     let home = std::env::var_os("HOME")
         .map(PathBuf::from)
         .or_else(dirs_next::home_dir)

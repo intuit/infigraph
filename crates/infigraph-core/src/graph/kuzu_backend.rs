@@ -272,15 +272,16 @@ impl GraphBackend for KuzuBackend {
         let rows = q.raw_query(
             "MATCH (s:Symbol) WHERE s.kind IN ['Function', 'Method'] \
              AND NOT EXISTS { MATCH ()-[:CALLS]->(s) } \
-             RETURN s.name, s.kind, s.file ORDER BY s.file, s.name",
+             RETURN s.id, s.name, s.kind, s.file ORDER BY s.file, s.name",
         )?;
         Ok(rows
             .into_iter()
             .filter_map(|r| {
                 Some(DeadCodeRow {
-                    name: r.first()?.clone(),
-                    kind: r.get(1)?.clone(),
-                    file: r.get(2)?.clone(),
+                    id: r.first()?.clone(),
+                    name: r.get(1)?.clone(),
+                    kind: r.get(2)?.clone(),
+                    file: r.get(3)?.clone(),
                 })
             })
             .collect())
@@ -345,15 +346,16 @@ impl GraphBackend for KuzuBackend {
         let entry_rows = q.raw_query(
             "MATCH (s:Symbol)-[:CALLS]->() WHERE s.kind IN ['Function', 'Method'] \
              AND NOT EXISTS { MATCH ()-[:CALLS]->(s) } \
-             RETURN DISTINCT s.name, s.kind, s.file ORDER BY s.file, s.name LIMIT 20",
+             RETURN DISTINCT s.id, s.name, s.kind, s.file ORDER BY s.file, s.name LIMIT 20",
         )?;
         let entry_points: Vec<DeadCodeRow> = entry_rows
             .into_iter()
             .filter_map(|r| {
                 Some(DeadCodeRow {
-                    name: r.first()?.clone(),
-                    kind: r.get(1)?.clone(),
-                    file: r.get(2)?.clone(),
+                    id: r.first()?.clone(),
+                    name: r.get(1)?.clone(),
+                    kind: r.get(2)?.clone(),
+                    file: r.get(3)?.clone(),
                 })
             })
             .collect();

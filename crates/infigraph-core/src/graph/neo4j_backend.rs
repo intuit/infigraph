@@ -1240,14 +1240,14 @@ impl GraphBackend for Neo4jBackend {
             query(&format!(
                 "MATCH (f:File {{repo: '{r}'}})-[:DEFINES]->(s:Symbol) \
                  WHERE s.kind IN ['Function', 'Method'] AND NOT EXISTS {{ MATCH ()-[:CALLS]->(s) }} \
-                 RETURN s.name AS name, s.kind AS kind, s.file AS file \
+                 RETURN s.id AS id, s.name AS name, s.kind AS kind, s.file AS file \
                  ORDER BY s.file, s.name"
             ))
         } else {
             query(
                 "MATCH (s:Symbol) \
                  WHERE s.kind IN ['Function', 'Method'] AND NOT EXISTS { MATCH ()-[:CALLS]->(s) } \
-                 RETURN s.name AS name, s.kind AS kind, s.file AS file \
+                 RETURN s.id AS id, s.name AS name, s.kind AS kind, s.file AS file \
                  ORDER BY s.file, s.name",
             )
         };
@@ -1255,6 +1255,7 @@ impl GraphBackend for Neo4jBackend {
         Ok(rows
             .iter()
             .map(|r| DeadCodeRow {
+                id: r.get("id").unwrap_or_default(),
                 name: r.get("name").unwrap_or_default(),
                 kind: r.get("kind").unwrap_or_default(),
                 file: r.get("file").unwrap_or_default(),
@@ -1318,12 +1319,13 @@ impl GraphBackend for Neo4jBackend {
             let entry_rows = self.run_query(query(&format!(
                 "MATCH (f:File {{repo: '{r}'}})-[:DEFINES]->(s:Symbol)-[:CALLS]->() \
                  WHERE s.kind IN ['Function', 'Method'] AND NOT EXISTS {{ MATCH ()-[:CALLS]->(s) }} \
-                 RETURN DISTINCT s.name AS name, s.kind AS kind, s.file AS file \
+                 RETURN DISTINCT s.id AS id, s.name AS name, s.kind AS kind, s.file AS file \
                  ORDER BY s.file, s.name LIMIT 20"
             )))?;
             let entry_points: Vec<DeadCodeRow> = entry_rows
                 .iter()
                 .map(|r| DeadCodeRow {
+                    id: r.get("id").unwrap_or_default(),
                     name: r.get("name").unwrap_or_default(),
                     kind: r.get("kind").unwrap_or_default(),
                     file: r.get("file").unwrap_or_default(),
@@ -1389,12 +1391,13 @@ impl GraphBackend for Neo4jBackend {
         let entry_rows = self.run_query(query(
             "MATCH (s:Symbol)-[:CALLS]->() \
              WHERE s.kind IN ['Function', 'Method'] AND NOT EXISTS { MATCH ()-[:CALLS]->(s) } \
-             RETURN DISTINCT s.name AS name, s.kind AS kind, s.file AS file \
+             RETURN DISTINCT s.id AS id, s.name AS name, s.kind AS kind, s.file AS file \
              ORDER BY s.file, s.name LIMIT 20",
         ))?;
         let entry_points: Vec<DeadCodeRow> = entry_rows
             .iter()
             .map(|r| DeadCodeRow {
+                id: r.get("id").unwrap_or_default(),
                 name: r.get("name").unwrap_or_default(),
                 kind: r.get("kind").unwrap_or_default(),
                 file: r.get("file").unwrap_or_default(),

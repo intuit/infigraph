@@ -58,9 +58,74 @@
       declarator: (function_declarator
         declarator: (identifier) @func.name)) @func.def))
 
+; Module/namespace-scope variable and const declarations
+; (`const UINT16 kMaxEFEntities = 5;`). Anchored the same way as the
+; bodyless-prototype function patterns above (translation-unit/namespace
+; scope only) for the same reason: a bare `declaration` inside a function
+; body is grammatically identical to a parenthesised local variable, so
+; matching those anywhere would create phantom Variable symbols for every
+; local. `const zctField* ctField = Get(...);`-style locals are deliberately
+; NOT captured here — only true file/namespace-scope declarations are.
+; declarator may be a bare identifier or an init_declarator (initialized
+; declaration) wrapping one — same shape find_local_var_type already
+; handles in relations.rs for the resolver side of this.
+(translation_unit
+  (declaration
+    declarator: (identifier) @var.name) @var.def)
+
+(translation_unit
+  (declaration
+    declarator: (init_declarator
+      declarator: (identifier) @var.name)) @var.def)
+
+(namespace_definition
+  body: (declaration_list
+    (declaration
+      declarator: (identifier) @var.name) @var.def))
+
+(namespace_definition
+  body: (declaration_list
+    (declaration
+      declarator: (init_declarator
+        declarator: (identifier) @var.name)) @var.def))
+
+; Nearly every real C++ header wraps its entire body in an include guard
+; (#ifndef FOO_H / #define FOO_H / ... / #endif). tree-sitter-cpp nests
+; that guarded content under a preproc_ifdef node instead of leaving it a
+; direct child of translation_unit, so every translation_unit-scoped
+; pattern above (and the bodyless-prototype function patterns futher up
+; this file) silently misses anything inside a real, guarded header —
+; which in practice is almost all of them. Re-declare the same
+; declaration/declarator shapes one level down inside preproc_ifdef.
+(preproc_ifdef
+  (declaration
+    declarator: (identifier) @var.name) @var.def)
+
+(preproc_ifdef
+  (declaration
+    declarator: (init_declarator
+      declarator: (identifier) @var.name)) @var.def)
+
+(preproc_ifdef
+  (declaration
+    declarator: (function_declarator
+      declarator: (identifier) @func.name)) @func.def)
+
 (field_declaration
   declarator: (function_declarator
     declarator: (field_identifier) @method.name)) @method.def
+
+; Bodyless prototypes (pure-virtual `= 0`, plain declarations) with a
+; pointer/reference return type (`virtual zccEntity* GetEntity() const = 0;`)
+; put a pointer_declarator/reference_declarator between field_declaration and
+; function_declarator — same wrapping issue the function_definition patterns
+; above already handle, but this field_declaration pattern was never given
+; the wrapped equivalent, so every pointer/reference-returning pure-virtual
+; method silently failed to extract as a symbol at all.
+(field_declaration
+  declarator: (_
+    (function_declarator
+      declarator: (field_identifier) @method.name))) @method.def
 
 ; Class definitions
 (class_specifier

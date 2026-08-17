@@ -232,6 +232,65 @@ fn test_resolve_receiver_aware() {
 }
 
 #[test]
+fn test_resolve_receiver_with_no_local_symbol_becomes_external_call() {
+    // Mirrors the real gap found in tto-engine-master: GetMappingHandler.cpp
+    // calls tpsContext.GetInstanceWithUUIDs(...) where `tpsContext` resolves
+    // to a real class name (ITpsContext), but ITpsContext.h's source isn't
+    // indexed anywhere in this repo (statically-linked lib, no source
+    // available) — before this fix, the call vanished with zero trace at
+    // write time, not even counted anywhere queryable. Now it should
+    // produce an EXTERNAL_CALL edge to an ExternalRef node instead.
+    let extractions = vec![FileExtraction {
+        file: "handler.cpp".to_string(),
+        language: "cpp".to_string(),
+        content_hash: "a".to_string(),
+        symbols: vec![sym(
+            "handler.cpp::MapTPSPathToMEF",
+            "MapTPSPathToMEF",
+            SymbolKind::Function,
+            "handler.cpp",
+            1,
+            10,
+        )],
+        relations: vec![call_with_receiver(
+            "handler.cpp::MapTPSPathToMEF",
+            "handler.cpp::GetInstanceWithUUIDs",
+            "ITpsContext",
+        )],
+        statements: vec![],
+    }];
+
+    let env = TestEnv::new(&extractions);
+    let stats = resolve::resolve_calls(&env.store, &extractions, None).unwrap();
+
+    assert_eq!(
+        stats.resolved, 0,
+        "no real Symbol exists for ITpsContext — this must not fabricate a CALLS edge"
+    );
+
+    let conn = env.store.connection().unwrap();
+    let rows = conn
+        .query(
+            "MATCH (a:Symbol)-[:EXTERNAL_CALL]->(e:ExternalRef) \
+             WHERE a.id = 'handler.cpp::MapTPSPathToMEF' \
+             RETURN e.qualifier, e.method",
+        )
+        .unwrap();
+    let mut found = false;
+    for row in rows {
+        let vals: Vec<String> = row.into_iter().map(|v| v.to_string()).collect();
+        if vals[0].contains("ITpsContext") && vals[1].contains("GetInstanceWithUUIDs") {
+            found = true;
+        }
+    }
+    assert!(
+        found,
+        "expected an EXTERNAL_CALL edge to an ExternalRef(qualifier=ITpsContext, \
+         method=GetInstanceWithUUIDs) node, found none"
+    );
+}
+
+#[test]
 fn test_resolve_import_scope_preference() {
     let extractions = vec![
         FileExtraction {
