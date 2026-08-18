@@ -525,6 +525,12 @@ resolver = ["./resolve-zed-path.sh"]
         .unwrap();
         assert_eq!(written["mcpServers"]["infigraph"]["command"], mcp_path);
         assert_eq!(written["mcpServers"]["infigraph"]["args"][0], "--mcp");
+        // Confirmed necessary via manual testing against real Copilot CLI in
+        // upstream PR #56 (intuit/infigraph): without "type": "local",
+        // Copilot CLI doesn't recognize this as a local MCP server; without
+        // "tools": ["*"], it isn't granted tool access.
+        assert_eq!(written["mcpServers"]["infigraph"]["type"], "local");
+        assert_eq!(written["mcpServers"]["infigraph"]["tools"][0], "*");
     }
 
     #[test]
