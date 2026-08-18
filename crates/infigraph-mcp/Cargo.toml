@@ -35,6 +35,12 @@ ort = { version = "2.0.0-rc.12", features = ["download-binaries"], optional = tr
 ndarray = { version = "0.16", optional = true }
 tokenizers = { version = "0.21", default-features = false, features = ["onig"], optional = true }
 
+[target.'cfg(unix)'.dependencies]
+libc = "0.2"
+
+[target.'cfg(windows)'.dependencies]
+windows-sys = { version = "0.59", features = ["Win32_Foundation", "Win32_System_Threading"] }
+
 [features]
 default = ["kompress"]
 kompress = ["dep:ort", "dep:ndarray", "dep:tokenizers"]

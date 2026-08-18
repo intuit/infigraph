@@ -21,6 +21,10 @@ impl EmbedProvider for MockEmbedder {
         self.dim
     }
 
+    fn identity(&self) -> String {
+        format!("mock:{}", self.dim)
+    }
+
     fn embed_batch(&self, texts: &[&str]) -> anyhow::Result<Vec<Vec<f32>>> {
         Ok(texts
             .iter()

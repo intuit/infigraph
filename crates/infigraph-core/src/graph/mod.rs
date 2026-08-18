@@ -27,7 +27,7 @@ pub use queries::{
     SymbolRow, SymbolWithDocstring, TestContext, TestCoverage, TestTarget, TypeHierarchy,
 };
 pub use session_store::{SessionData, SessionStore};
-pub use store::{GraphStats, GraphStore};
+pub use store::{validate_db_file, GraphStats, GraphStore};
 pub use test_templates::{test_templates_for, TestTemplate};
 
 pub fn schema_ddl() -> Vec<&'static str> {

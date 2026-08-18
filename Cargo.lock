@@ -2620,6 +2620,7 @@ dependencies = [
  "infigraph-docs",
  "infigraph-languages",
  "infigraph-pipeline-plugin",
+ "libc",
  "ndarray 0.16.1",
  "ort",
  "rayon",
@@ -2630,6 +2631,7 @@ dependencies = [
  "tiny_http",
  "tokenizers",
  "toml",
+ "windows-sys 0.59.0",
 ]
 
 [[package]]
