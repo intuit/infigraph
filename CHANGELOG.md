@@ -7,6 +7,30 @@ Versions follow [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
 
+## [3.2.16] - 2026-08-18
+
+### Added
+
+- C++: cross-repo namespace-qualified call linking through `group build`/`group link` (`feat(multi)`, `feat/cpp-grammer`)
+- gRPC: detect C++ `{Service}::NewStub` client construction as a cross-service edge
+- `group visualize` CLI command (repo-overview graph)
+- Call resolution: track unresolved calls with a known receiver as `EXTERNAL_CALL` instead of dropping them
+- MCP: `expand_interface` option on `trace_callers`/`transitive_impact`
+
+### Fixed
+
+- C++: proxy-ID collision and over-counting in cross-repo namespace linking; module-scope variables/consts extracted even inside include guards; namespace-block functions correctly scoped in symbol IDs; receiver-type gaps causing missing `CALLS` edges
+- Java: `method_reference` (`Foo::bar`, `this::bar`) now captured as call edges
+- Kotlin: bare/type-qualified method references (`::foo`) now captured
+- C#: `this`/`base` receiver calls and property-accessor call sites resolved; delegate-constructor method refs and local same-class call edges resolved; fields and constructors captured with field-receiver resolution; Cozo schema parity fix
+- Call resolution: same-class call fallback now gated on receiver + callable kind (was over-matching)
+- Dead-code detection: suppress vendor-path and interface/impl-split false positives
+- Route detection: reject comment-syntax noise as a false-positive URL path
+- Multi-repo: HTTP/gRPC cross-service edges now carry a `protocol` field; `registry_path` reuse fix; stray env var cleanup
+- `INFIGRAPH_REGISTRY_HOME` override added to prevent test/perf runs from clobbering the real global registry
+
+Note: `3.2.6`–`3.2.15` were released without changelog entries; this entry covers commits since the `3.2.15` version bump (`67e83dd`) only, not the full gap.
+
 ## [3.2.5] - 2026-07-21
 
 ### Fixed
