@@ -134,33 +134,105 @@ pub(crate) fn uninstall_hooks(home: &std::path::Path) -> Result<()> {
                     })
                     .unwrap_or(false)
             };
-            for event in &[
-                "PreToolUse",
-                "UserPromptSubmit",
-                "PostToolUse",
-                "SessionStart",
-                "SessionEnd",
-                "PreCompact",
-            ] {
-                if let Some(arr) = settings["hooks"]
-                    .get_mut(*event)
-                    .and_then(|v| v.as_array_mut())
-                {
-                    let before = arr.len();
-                    arr.retain(|entry| !infigraph_hook(entry));
-                    if arr.len() < before {
-                        println!(
-                            "  Removed {} hook(s) from {}",
-                            event,
-                            settings_path.display()
-                        );
+            // `settings["hooks"]` (Index, not get_mut) silently inserts a
+            // null entry for a missing "hooks" key as a side effect of
+            // indexing -- get_mut avoids that, since the artifact engine's
+            // own settings.json removal (run_uninstall, ahead of this call)
+            // has typically already deleted "hooks" entirely once every
+            // event array it owned went empty.
+            let mut changed = false;
+            if let Some(hooks) = settings.get_mut("hooks") {
+                for event in &[
+                    "PreToolUse",
+                    "UserPromptSubmit",
+                    "PostToolUse",
+                    "SessionStart",
+                    "SessionEnd",
+                    "PreCompact",
+                ] {
+                    if let Some(arr) = hooks.get_mut(*event).and_then(|v| v.as_array_mut()) {
+                        let before = arr.len();
+                        arr.retain(|entry| !infigraph_hook(entry));
+                        if arr.len() < before {
+                            changed = true;
+                            println!(
+                                "  Removed {} hook(s) from {}",
+                                event,
+                                settings_path.display()
+                            );
+                        }
                     }
                 }
             }
-            let pretty = serde_json::to_string_pretty(&settings)?;
-            std::fs::write(&settings_path, pretty)?;
+            if changed {
+                let pretty = serde_json::to_string_pretty(&settings)?;
+                std::fs::write(&settings_path, pretty)?;
+            }
         }
     }
 
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn uninstall_hooks_does_not_inject_null_hooks_key_when_absent() {
+        // Regression test: `settings["hooks"]` (Index, not get_mut) silently
+        // inserts a null entry for a missing key as a side effect of
+        // indexing. The artifact engine's own settings.json removal
+        // (run_uninstall, which always runs before this call from
+        // cmd_uninstall) typically deletes "hooks" entirely once every event
+        // array it owned goes empty -- this must leave that absence alone,
+        // not corrupt the file back to `{"hooks": null}`.
+        let home_dir = tempfile::tempdir().unwrap();
+        let claude_dir = home_dir.path().join(".claude");
+        std::fs::create_dir_all(&claude_dir).unwrap();
+        std::fs::write(claude_dir.join("settings.json"), "{}").unwrap();
+
+        uninstall_hooks(home_dir.path()).unwrap();
+
+        let content = std::fs::read_to_string(claude_dir.join("settings.json")).unwrap();
+        let settings: serde_json::Value = serde_json::from_str(&content).unwrap();
+        assert_eq!(
+            settings,
+            json!({}),
+            "settings.json should stay empty, not gain a null hooks key"
+        );
+    }
+
+    #[test]
+    fn uninstall_hooks_still_removes_hand_added_infigraph_hooks() {
+        // The function's real remaining purpose: cleaning up infigraph hooks
+        // a user (or an older install) added outside the artifact mechanism.
+        let home_dir = tempfile::tempdir().unwrap();
+        let claude_dir = home_dir.path().join(".claude");
+        std::fs::create_dir_all(&claude_dir).unwrap();
+        let settings = json!({
+            "hooks": {
+                "PreToolUse": [
+                    {"hooks": [{"type": "command", "command": "~/.claude/hooks/infigraph-enforce.sh"}]},
+                    {"hooks": [{"type": "command", "command": "~/.claude/hooks/unrelated-tool.sh"}]}
+                ]
+            }
+        });
+        std::fs::write(
+            claude_dir.join("settings.json"),
+            serde_json::to_string_pretty(&settings).unwrap(),
+        )
+        .unwrap();
+
+        uninstall_hooks(home_dir.path()).unwrap();
+
+        let content = std::fs::read_to_string(claude_dir.join("settings.json")).unwrap();
+        let written: serde_json::Value = serde_json::from_str(&content).unwrap();
+        let pre_tool_use = written["hooks"]["PreToolUse"].as_array().unwrap();
+        assert_eq!(pre_tool_use.len(), 1);
+        assert!(pre_tool_use[0]["hooks"][0]["command"]
+            .as_str()
+            .unwrap()
+            .contains("unrelated-tool.sh"));
+    }
 }
