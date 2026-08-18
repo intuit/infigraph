@@ -5,6 +5,8 @@ use serde_json::json;
 pub(crate) enum ConfigFormat {
     Json,
     Toml,
+    CopilotJson,
+    OpenCodeJson,
 }
 
 pub(crate) struct AgentTarget {
@@ -52,9 +54,9 @@ pub(crate) const AGENT_TARGETS: &[AgentTarget] = &[
         label: "Zed",
     },
     AgentTarget {
-        dir_name: ".opencode",
-        config_file: "config.json",
-        format: ConfigFormat::Json,
+        dir_name: ".config/opencode",
+        config_file: "opencode.json",
+        format: ConfigFormat::OpenCodeJson,
         label: "OpenCode",
     },
     AgentTarget {
@@ -77,8 +79,8 @@ pub(crate) const AGENT_TARGETS: &[AgentTarget] = &[
     },
     AgentTarget {
         dir_name: ".copilot",
-        config_file: "mcp.json",
-        format: ConfigFormat::Json,
+        config_file: "mcp-config.json",
+        format: ConfigFormat::CopilotJson,
         label: "GitHub Copilot CLI",
     },
 ];
@@ -108,7 +110,105 @@ pub(crate) fn install_json_target(config_path: &std::path::Path, mcp_path_str: &
 
     Ok(())
 }
+pub(crate) fn install_copilot_target(
+    config_path: &std::path::Path,
+    mcp_path_str: &str,
+) -> Result<()> {
+    let mut config: serde_json::Value = if config_path.is_file() {
+        let content = std::fs::read_to_string(config_path)
+            .with_context(|| format!("Failed to read {}", config_path.display()))?;
 
+        serde_json::from_str(&content)
+            .with_context(|| format!("Failed to parse {}", config_path.display()))?
+    } else {
+        json!({})
+    };
+
+    if config.get("mcpServers").is_none() {
+        config["mcpServers"] = json!({});
+    }
+
+    config["mcpServers"]["infigraph"] = json!({
+        "type": "local",
+        "command": mcp_path_str,
+        "args": ["--mcp"],
+        "tools": ["*"]
+    });
+
+    let pretty = serde_json::to_string_pretty(&config)?;
+    std::fs::write(config_path, pretty.as_bytes())
+        .with_context(|| format!("Failed to write {}", config_path.display()))?;
+
+    Ok(())
+}
+pub(crate) fn install_opencode_target(
+    config_path: &std::path::Path,
+    mcp_path_str: &str,
+) -> Result<()> {
+    let mut config: serde_json::Value = if config_path.is_file() {
+        let content = std::fs::read_to_string(config_path)
+            .with_context(|| format!("Failed to read {}", config_path.display()))?;
+
+        serde_json::from_str(&content)
+            .with_context(|| format!("Failed to parse {}", config_path.display()))?
+    } else {
+        json!({})
+    };
+
+    if config.get("mcp").is_none() {
+        config["mcp"] = json!({});
+    }
+
+    config["mcp"]["infigraph"] = json!({
+        "type": "local",
+        "command": [mcp_path_str, "--mcp"]
+    });
+
+    let pretty = serde_json::to_string_pretty(&config)?;
+    std::fs::write(config_path, pretty.as_bytes())
+        .with_context(|| format!("Failed to write {}", config_path.display()))?;
+
+    Ok(())
+}
+
+pub(crate) fn uninstall_opencode_target<'a>(
+    config_path: &std::path::Path,
+    label: &'a str,
+) -> Result<Option<&'a str>> {
+    if !config_path.is_file() {
+        println!("  Skipping {} (no config found)", label);
+        return Ok(None);
+    }
+
+    let content = std::fs::read_to_string(config_path)
+        .with_context(|| format!("Failed to read {}", config_path.display()))?;
+
+    let mut config: serde_json::Value = serde_json::from_str(&content)
+        .with_context(|| format!("Failed to parse {}", config_path.display()))?;
+
+    let removed = config
+        .get_mut("mcp")
+        .and_then(|mcp| mcp.as_object_mut())
+        .and_then(|mcp| mcp.remove("infigraph"))
+        .is_some();
+
+    if !removed {
+        println!("  Skipping {} (infigraph entry not found)", label);
+        return Ok(None);
+    }
+
+    let pretty = serde_json::to_string_pretty(&config)?;
+    std::fs::write(config_path, pretty.as_bytes())
+        .with_context(|| format!("Failed to write {}", config_path.display()))?;
+
+    println!(
+        "  Removed infigraph from {} ({})",
+        label,
+        config_path.display()
+    );
+
+    Ok(Some(label))
+}
 pub(crate) fn install_toml_target(config_path: &std::path::Path, mcp_path_str: &str) -> Result<()> {
     let existing = if config_path.is_file() {
         std::fs::read_to_string(config_path)
@@ -351,5 +451,121 @@ mod tests {
 
         let content = std::fs::read_to_string(&config).unwrap();
         assert!(!content.contains("infigraph"));
+    }
+    #[test]
+    fn install_copilot_uses_expected_schema() {
+        let dir = tempfile::tempdir().unwrap();
+        let config = dir.path().join("mcp-config.json");
+
+        install_copilot_target(&config, "/usr/bin/infigraph-mcp").unwrap();
+
+        let value = read_json(&config);
+        let server = &value["mcpServers"]["infigraph"];
+
+        assert_eq!(server["type"], "local");
+        assert_eq!(server["command"], "/usr/bin/infigraph-mcp");
+        assert_eq!(server["args"], json!(["--mcp"]));
+        assert_eq!(server["tools"], json!(["*"]));
+    }
+
+    #[test]
+    fn install_opencode_uses_expected_schema_and_preserves_config() {
+        let dir = tempfile::tempdir().unwrap();
+        let config = dir.path().join("opencode.json");
+
+        std::fs::write(
+            &config,
+            r#"{
+                "model": "example/model",
+                "mcp": {
+                    "other": {
+                        "type": "local",
+                        "command": ["other-server"]
+                    }
+                }
+            }"#,
+        )
+        .unwrap();
+
+        install_opencode_target(&config, "/usr/bin/infigraph-mcp").unwrap();
+
+        let value = read_json(&config);
+
+        assert_eq!(value["model"], "example/model");
+        assert!(value["mcp"]["other"].is_object());
+        assert_eq!(value["mcp"]["infigraph"]["type"], "local");
+        assert_eq!(
+            value["mcp"]["infigraph"]["command"],
+            json!(["/usr/bin/infigraph-mcp", "--mcp"])
+        );
+    }
+
+    #[test]
+    fn install_opencode_is_idempotent() {
+        let dir = tempfile::tempdir().unwrap();
+        let config = dir.path().join("opencode.json");
+
+        install_opencode_target(&config, "/first/infigraph-mcp").unwrap();
+        install_opencode_target(&config, "/second/infigraph-mcp").unwrap();
+
+        let value = read_json(&config);
+        let servers = value["mcp"].as_object().unwrap();
+
+        assert_eq!(servers.len(), 1);
+        assert_eq!(
+            value["mcp"]["infigraph"]["command"],
+            json!(["/second/infigraph-mcp", "--mcp"])
+        );
+    }
+
+    #[test]
+    fn uninstall_opencode_only_removes_infigraph() {
+        let dir = tempfile::tempdir().unwrap();
+        let config = dir.path().join("opencode.json");
+
+        std::fs::write(
+            &config,
+            r#"{
+                "model": "example/model",
+                "mcp": {
+                    "infigraph": {
+                        "type": "local",
+                        "command": ["infigraph-mcp", "--mcp"]
+                    },
+                    "other": {
+                        "type": "local",
+                        "command": ["other-server"]
+                    }
+                }
+            }"#,
+        )
+        .unwrap();
+
+        let result = uninstall_opencode_target(&config, "OpenCode").unwrap();
+
+        assert_eq!(result, Some("OpenCode"));
+
+        let value = read_json(&config);
+        assert!(value["mcp"]["infigraph"].is_null());
+        assert!(value["mcp"]["other"].is_object());
+        assert_eq!(value["model"], "example/model");
+    }
+    #[test]
+    fn target_paths_match_agent_documentation() {
+        let opencode = AGENT_TARGETS
+            .iter()
+            .find(|target| target.label == "OpenCode")
+            .unwrap();
+
+        assert_eq!(opencode.dir_name, ".config/opencode");
+        assert_eq!(opencode.config_file, "opencode.json");
+
+        let copilot = AGENT_TARGETS
+            .iter()
+            .find(|target| target.label == "GitHub Copilot CLI")
+            .unwrap();
+
+        assert_eq!(copilot.dir_name, ".copilot");
+        assert_eq!(copilot.config_file, "mcp-config.json");
     }
 }
