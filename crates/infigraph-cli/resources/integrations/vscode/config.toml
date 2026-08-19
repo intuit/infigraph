@@ -2,5 +2,5 @@ label = "VS Code"
 
 [[artifact]]
 strategy = "json_deep_merge"
-resolver = ["./resolve-vscode-path.py"]
+resolver = ["python3", "./resolve-vscode-path.py"]
 content_file = "mcp-fragment.json"

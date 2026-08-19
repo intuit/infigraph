@@ -18,7 +18,12 @@ pub(crate) struct ResolverSpec {
     /// Just the filename (e.g. "resolve-zed-path.sh"), used when writing the
     /// script to a temp directory before spawning it.
     pub script_filename: String,
-    pub extra_args: Vec<String>,
+    /// Every element of the manifest's `resolver` array before the script
+    /// itself (the last element) -- e.g. `resolver = ["python3", "./x.py"]`
+    /// yields `["python3"]` here. Prepended verbatim ahead of the
+    /// materialized script path at invocation time, same shape as pipeline
+    /// plugins' `command` field. Empty for a directly-executable script.
+    pub command_prefix: Vec<String>,
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -205,7 +210,13 @@ pub(crate) fn discover_artifacts(
                         !resolver_cmd.is_empty(),
                         "in manifest {relative_path}: resolver command must not be empty"
                     );
-                    let script_arg = &resolver_cmd[0];
+                    // The script is always the *last* element -- same shape as
+                    // pipeline plugins' `command` field (e.g. ["python3",
+                    // "extract.py"]): everything before it is a literal
+                    // command-prefix element (an interpreter, typically)
+                    // prepended as-is at invocation time, fully author-controlled
+                    // rather than inferred from the script's extension.
+                    let script_arg = resolver_cmd.last().expect("checked non-empty above");
                     let script_relative = script_arg.strip_prefix("./").unwrap_or(script_arg);
                     let combined = format!("{integration_dir}/{script_relative}");
                     let normalized = normalize_relative_path(&combined);
@@ -224,7 +235,7 @@ pub(crate) fn discover_artifacts(
                         script_relative_path: normalized,
                         script_bytes,
                         script_filename,
-                        extra_args: resolver_cmd[1..].to_vec(),
+                        command_prefix: resolver_cmd[..resolver_cmd.len() - 1].to_vec(),
                     })
                 }
                 None => None,
@@ -604,8 +615,42 @@ resolver = ["./resolve-zed-path.sh"]
             resolver.script_bytes,
             b"#!/usr/bin/env bash\necho resolver\n"
         );
-        assert!(resolver.extra_args.is_empty());
+        assert!(resolver.command_prefix.is_empty());
         assert_eq!(a.step, super::super::step::InstallStep::McpRegistration);
+    }
+
+    #[test]
+    fn resolver_with_explicit_interpreter_prefix_splits_prefix_from_script() {
+        // Same shape as pipeline plugins' `command` field -- the script is
+        // always the last element; everything before it is a literal,
+        // author-controlled command prefix (typically an interpreter),
+        // never inferred from the script's own extension.
+        let bundled: &[(&str, &[u8])] = &[
+            (
+                "vscode/config.toml",
+                br#"label = "VS Code"
+
+[[artifact]]
+strategy = "json_deep_merge"
+resolver = ["python3", "./resolve-vscode-path.py"]
+content_file = "mcp-fragment.json"
+"#,
+            ),
+            ("vscode/resolve-vscode-path.py", b"print('resolver')\n"),
+            ("vscode/mcp-fragment.json", br#"{"command":"{{mcp_path}}"}"#),
+        ];
+        let user_dir = tempfile::tempdir().unwrap();
+
+        let artifacts = discover_artifacts(bundled, user_dir.path(), "/bin/infigraph-mcp").unwrap();
+
+        assert_eq!(artifacts.len(), 1);
+        let resolver = artifacts[0]
+            .resolver
+            .as_ref()
+            .expect("should have a resolver spec");
+        assert_eq!(resolver.command_prefix, vec!["python3".to_string()]);
+        assert_eq!(resolver.script_filename, "resolve-vscode-path.py");
+        assert_eq!(resolver.script_bytes, b"print('resolver')\n");
     }
 
     #[test]

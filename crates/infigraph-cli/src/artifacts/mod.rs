@@ -36,7 +36,7 @@ pub(crate) fn apply_resolved_artifact(
             let output = resolver::run_resolver_from_script(
                 &spec.script_bytes,
                 &spec.script_filename,
-                &spec.extra_args,
+                &spec.command_prefix,
                 mcp_path,
                 home,
             )
@@ -149,7 +149,7 @@ pub(crate) fn remove_resolved_artifact(
             let output = resolver::run_resolver_from_script(
                 &spec.script_bytes,
                 &spec.script_filename,
-                &spec.extra_args,
+                &spec.command_prefix,
                 mcp_path,
                 home,
             )

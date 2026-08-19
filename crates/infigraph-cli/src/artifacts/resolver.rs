@@ -87,40 +87,42 @@ pub(crate) fn run_resolver(
     })
 }
 
-/// Builds the actual command to invoke a resolver script, interpreter-aware
-/// by extension rather than relying on shebang-based direct execution (which
-/// only works on Unix). `.py` scripts are launched via an explicit Python
-/// interpreter on every platform; anything else falls back to direct
-/// execution, which remains correct on Unix (and is a clear, immediate
-/// spawn failure on Windows rather than a silent wrong-path resolver run --
-/// this design bundles only `.py` resolvers, so that fallback path isn't
-/// expected to be exercised today).
-fn resolver_invocation(script_path: &Path, script_filename: &str) -> Vec<String> {
-    if Path::new(script_filename)
-        .extension()
-        .and_then(|e| e.to_str())
-        == Some("py")
-    {
-        let python = if cfg!(windows) { "python" } else { "python3" };
-        vec![
-            python.to_string(),
-            script_path.to_string_lossy().to_string(),
-        ]
+/// The portable spelling for a manifest's `command_prefix` -- "python" or
+/// "python3" is normalized to whichever binary actually exists under that
+/// name on the current OS (`python3` on Unix, `python` on Windows, which has
+/// no `python3` shim by convention). This is the one piece of interpreter
+/// magic this system keeps; everything else in `command_prefix` is used
+/// completely literally, same as pipeline plugins' `command` field.
+fn normalize_python_command() -> &'static str {
+    if cfg!(windows) {
+        "python"
     } else {
-        vec![format!("./{script_filename}")]
+        "python3"
     }
 }
 
 /// Writes a bundled/user-override resolver script's bytes to a temp file,
-/// makes it executable (Unix only -- irrelevant for an explicitly
-/// interpreter-invoked script, but harmless), spawns it via `run_resolver`,
-/// and cleans up afterward. Needed because bundled content is embedded bytes
-/// in the binary, not a real file on disk -- `run_resolver` alone can only
-/// spawn a command that already exists at some real `cwd`.
+/// makes it executable (Unix only -- harmless but unnecessary when
+/// `command_prefix` invokes it through an interpreter instead of directly),
+/// spawns it via `run_resolver`, and cleans up afterward. Needed because
+/// bundled content is embedded bytes in the binary, not a real file on disk
+/// -- `run_resolver` alone can only spawn a command that already exists at
+/// some real `cwd`.
+///
+/// `command_prefix` is the manifest's `resolver` array with the script (its
+/// last element) removed -- e.g. `resolver = ["python3", "./x.py"]` yields
+/// `command_prefix = ["python3"]`. Prepended verbatim ahead of the
+/// materialized script path, except that a first element of exactly
+/// "python"/"python3" is normalized for the current OS (see
+/// `normalize_python_command`). An empty `command_prefix` executes the
+/// script directly (`./script-name`), which is Unix-correct via its shebang
+/// and a clear, immediate spawn failure on Windows rather than a silent
+/// wrong-path run -- the manifest author's responsibility to avoid by
+/// declaring an explicit interpreter for anything that needs one there.
 pub(crate) fn run_resolver_from_script(
     script_bytes: &[u8],
     script_filename: &str,
-    extra_args: &[String],
+    command_prefix: &[String],
     mcp_path: &str,
     home: &Path,
 ) -> Result<ResolverOutput> {
@@ -139,8 +141,18 @@ pub(crate) fn run_resolver_from_script(
             .with_context(|| format!("failed to make {} executable", script_path.display()))?;
     }
 
-    let mut resolver_cmd = resolver_invocation(&script_path, script_filename);
-    resolver_cmd.extend(extra_args.iter().cloned());
+    let mut resolver_cmd: Vec<String> = command_prefix
+        .iter()
+        .enumerate()
+        .map(|(i, part)| {
+            if i == 0 && (part == "python" || part == "python3") {
+                normalize_python_command().to_string()
+            } else {
+                part.clone()
+            }
+        })
+        .collect();
+    resolver_cmd.push(format!("./{script_filename}"));
 
     run_resolver(&resolver_cmd, tmp.path(), mcp_path, home)
 }
@@ -307,20 +319,20 @@ mod tests {
     }
 
     #[test]
-    fn run_resolver_from_script_invokes_python_scripts_via_explicit_interpreter() {
-        // Regression test for the Windows resolver bug: a .py resolver must
-        // never be spawned via shebang-based direct execution (Windows has
-        // no such mechanism) -- it must always go through an explicit
-        // python/python3 interpreter invocation, proven here by using a
-        // script with NO shebang line at all (so this test would fail on
-        // every platform, not just Windows, if the fix ever regressed back
-        // to direct execution).
+    fn run_resolver_from_script_invokes_python_scripts_via_explicit_interpreter_prefix() {
+        // Regression test for the Windows resolver bug: a Python resolver
+        // must never be spawned via shebang-based direct execution (Windows
+        // has no such mechanism) -- the manifest must declare an explicit
+        // "python3"/"python" command_prefix, proven here by using a script
+        // with NO shebang line at all (so this test would fail on every
+        // platform, not just Windows, if this ever silently fell back to
+        // direct execution instead of honoring the prefix).
         let script = b"import json, sys\nprint(json.dumps({'status': 'ok', 'data': {'path': '/resolved/from-python.json'}}))\n";
 
         let output = run_resolver_from_script(
             script,
             "resolve-example.py",
-            &[],
+            &["python3".to_string()],
             "/bin/infigraph-mcp",
             std::path::Path::new("/home/x"),
         )
@@ -330,5 +342,29 @@ mod tests {
             ResolverOutput::Ok { data } => assert_eq!(data.path, "/resolved/from-python.json"),
             other => panic!("expected Ok, got {other:?}"),
         }
+    }
+
+    #[test]
+    fn run_resolver_from_script_treats_python_as_a_literal_prefix_not_extension_magic() {
+        // No automatic ".py -> interpreter" inference exists anymore -- an
+        // empty command_prefix always executes the script directly
+        // regardless of its extension, same as pipeline plugins' `command`
+        // field never sniffs the script's language either. A .py script with
+        // no shebang and an empty prefix must fail to spawn (exec format
+        // error), not silently succeed via an inferred interpreter.
+        let script = b"import json, sys\nprint(json.dumps({'status': 'ok', 'data': {'path': '/should/not/reach/here.json'}}))\n";
+
+        let result = run_resolver_from_script(
+            script,
+            "resolve-no-prefix.py",
+            &[],
+            "/bin/infigraph-mcp",
+            std::path::Path::new("/home/x"),
+        );
+
+        assert!(
+            result.is_err(),
+            "a shebang-less .py script with no explicit command_prefix must fail to spawn directly, not silently succeed"
+        );
     }
 }
