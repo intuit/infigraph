@@ -15,6 +15,7 @@ use anyhow::Context;
 mod convention;
 mod discovery;
 mod manifest;
+mod ownership;
 mod resolver;
 mod step;
 mod strategy;
@@ -23,6 +24,19 @@ mod template;
 pub(crate) use discovery::{discover_artifacts, ResolvedArtifact};
 pub(crate) use step::InstallStep;
 pub(crate) use strategy::{ApplyOutcome, Strategy};
+
+/// Outcome of removing one resolved artifact during uninstall.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum RemoveOutcome {
+    /// The artifact was present and was removed.
+    Removed,
+    /// The artifact was never present (nothing to do).
+    NotPresent,
+    /// The artifact's `overwrite`-managed file was present but its content
+    /// no longer matches what install wrote -- the user edited it, so it
+    /// was left in place rather than silently deleted.
+    PreservedModified,
+}
 
 include!(concat!(env!("OUT_DIR"), "/bundled_integrations.rs"));
 
@@ -79,10 +93,11 @@ pub(crate) fn apply_resolved_artifact(
             let content = resolved_content
                 .ok_or_else(|| anyhow::anyhow!("overwrite artifact has no content"))?;
             let outcome = strategy::apply_overwrite(&target_path, &content)?;
-            if matches!(outcome, ApplyOutcome::Written)
-                && target_path.components().any(|c| c.as_os_str() == "hooks")
-            {
-                make_executable(&target_path)?;
+            if matches!(outcome, ApplyOutcome::Written) {
+                ownership::record_written(home, &target_path, &content)?;
+                if target_path.components().any(|c| c.as_os_str() == "hooks") {
+                    make_executable(&target_path)?;
+                }
             }
             Ok(outcome)
         }
@@ -143,7 +158,7 @@ pub(crate) fn remove_resolved_artifact(
     artifact: &ResolvedArtifact,
     home: &std::path::Path,
     mcp_path: &str,
-) -> anyhow::Result<bool> {
+) -> anyhow::Result<RemoveOutcome> {
     let target_path = match &artifact.resolver {
         Some(spec) => {
             let output = resolver::run_resolver_from_script(
@@ -156,7 +171,7 @@ pub(crate) fn remove_resolved_artifact(
             .with_context(|| format!("running resolver {}", spec.script_relative_path))?;
             match output {
                 resolver::ResolverOutput::Ok { data } => std::path::PathBuf::from(data.path),
-                resolver::ResolverOutput::Skip { .. } => return Ok(false),
+                resolver::ResolverOutput::Skip { .. } => return Ok(RemoveOutcome::NotPresent),
                 resolver::ResolverOutput::Error { message } => {
                     anyhow::bail!("resolver {} failed: {message}", spec.script_relative_path);
                 }
@@ -170,42 +185,52 @@ pub(crate) fn remove_resolved_artifact(
         }
     };
 
-    match artifact.strategy {
-        Strategy::JsonDeepMerge => {
-            let content = artifact
-                .content
-                .as_ref()
-                .ok_or_else(|| anyhow::anyhow!("json_deep_merge artifact has no content"))?;
-            let text = std::str::from_utf8(content)?;
-            strategy::remove_json_deep_merge(&target_path, text)
-        }
-        Strategy::Overwrite => strategy::remove_overwrite(&target_path),
-        Strategy::MarkerDelimited => {
-            let start = artifact
-                .start
-                .as_deref()
-                .ok_or_else(|| anyhow::anyhow!("marker_delimited artifact missing start marker"))?;
-            let end = artifact
-                .end
-                .as_deref()
-                .ok_or_else(|| anyhow::anyhow!("marker_delimited artifact missing end marker"))?;
-            strategy::remove_marker_delimited(&target_path, start, end)
-        }
-        Strategy::TomlSection => {
-            let key_path = artifact
-                .key_path
-                .as_deref()
-                .ok_or_else(|| anyhow::anyhow!("toml_section artifact missing key_path"))?;
-            strategy::remove_toml_section(&target_path, key_path)
-        }
-        Strategy::JsonKeyPath => {
-            let key_path = artifact
-                .key_path
-                .as_deref()
-                .ok_or_else(|| anyhow::anyhow!("json_key_path artifact missing key_path"))?;
-            strategy::remove_json_key_path(&target_path, key_path)
-        }
-    }
+    let removed =
+        match artifact.strategy {
+            Strategy::JsonDeepMerge => {
+                let content = artifact
+                    .content
+                    .as_ref()
+                    .ok_or_else(|| anyhow::anyhow!("json_deep_merge artifact has no content"))?;
+                let text = std::str::from_utf8(content)?;
+                strategy::remove_json_deep_merge(&target_path, text)?
+            }
+            Strategy::Overwrite => {
+                if !ownership::verify_unchanged_and_clear(home, &target_path)? {
+                    return Ok(RemoveOutcome::PreservedModified);
+                }
+                strategy::remove_overwrite(&target_path)?
+            }
+            Strategy::MarkerDelimited => {
+                let start = artifact.start.as_deref().ok_or_else(|| {
+                    anyhow::anyhow!("marker_delimited artifact missing start marker")
+                })?;
+                let end = artifact.end.as_deref().ok_or_else(|| {
+                    anyhow::anyhow!("marker_delimited artifact missing end marker")
+                })?;
+                strategy::remove_marker_delimited(&target_path, start, end)?
+            }
+            Strategy::TomlSection => {
+                let key_path = artifact
+                    .key_path
+                    .as_deref()
+                    .ok_or_else(|| anyhow::anyhow!("toml_section artifact missing key_path"))?;
+                strategy::remove_toml_section(&target_path, key_path)?
+            }
+            Strategy::JsonKeyPath => {
+                let key_path = artifact
+                    .key_path
+                    .as_deref()
+                    .ok_or_else(|| anyhow::anyhow!("json_key_path artifact missing key_path"))?;
+                strategy::remove_json_key_path(&target_path, key_path)?
+            }
+        };
+
+    Ok(if removed {
+        RemoveOutcome::Removed
+    } else {
+        RemoveOutcome::NotPresent
+    })
 }
 
 #[cfg(test)]
@@ -313,7 +338,7 @@ content_file = "mcp-section.toml"
         for artifact in &artifacts {
             let removed = remove_resolved_artifact(artifact, home, mcp_path).unwrap();
             assert!(
-                removed,
+                matches!(removed, RemoveOutcome::Removed),
                 "{:?} was not removed",
                 artifact.target_relative_path
             );
@@ -402,12 +427,70 @@ resolver = ["./resolve-zed-path.sh"]
         assert_eq!(written["context_servers"]["infigraph"]["command"], mcp_path);
 
         let removed = remove_resolved_artifact(&artifacts[0], home_dir.path(), mcp_path).unwrap();
-        assert!(removed);
+        assert!(matches!(removed, RemoveOutcome::Removed));
         let after: serde_json::Value = serde_json::from_str(
             &std::fs::read_to_string(home_dir.path().join("zed-settings.json")).unwrap(),
         )
         .unwrap();
         assert!(after["context_servers"]["infigraph"].is_null());
+    }
+
+    #[test]
+    fn uninstall_preserves_a_hand_edited_overwrite_artifact_but_removes_an_unmodified_one() {
+        let bundled: &[(&str, &[u8])] = &[
+            (
+                "claude-code/.claude/hooks/infigraph-enforce.sh",
+                b"#!/usr/bin/env bash\necho enforce\n",
+            ),
+            (
+                "cursor/.cursor/rules/infigraph.mdc",
+                b"# Infigraph rules\nUse infigraph tools first.\n",
+            ),
+        ];
+        let user_dir = tempfile::tempdir().unwrap();
+        let home_dir = tempfile::tempdir().unwrap();
+        let home = home_dir.path();
+        let mcp_path = "/opt/infigraph/bin/infigraph-mcp";
+
+        let artifacts = discover_artifacts(bundled, user_dir.path(), mcp_path).unwrap();
+        assert_eq!(artifacts.len(), 2);
+
+        for artifact in &artifacts {
+            let outcome = apply_resolved_artifact(artifact, home, mcp_path).unwrap();
+            assert!(matches!(outcome, ApplyOutcome::Written));
+        }
+
+        let hook_path = home.join(".claude/hooks/infigraph-enforce.sh");
+        let rules_path = home.join(".cursor/rules/infigraph.mdc");
+
+        // Simulate the user hand-editing the rules file after install, but
+        // leaving the hook script untouched.
+        std::fs::write(&rules_path, "# Infigraph rules\nI added my own note.\n").unwrap();
+
+        for artifact in &artifacts {
+            let outcome = remove_resolved_artifact(artifact, home, mcp_path).unwrap();
+            let target = artifact.target_relative_path.as_deref().unwrap();
+            if target.ends_with(".mdc") {
+                assert_eq!(
+                    outcome,
+                    RemoveOutcome::PreservedModified,
+                    "hand-edited rules file should have been preserved"
+                );
+            } else {
+                assert_eq!(
+                    outcome,
+                    RemoveOutcome::Removed,
+                    "unmodified hook script should have been removed"
+                );
+            }
+        }
+
+        assert!(!hook_path.exists(), "unmodified hook script should be gone");
+        assert!(rules_path.exists(), "hand-edited rules file should remain");
+        assert_eq!(
+            std::fs::read_to_string(&rules_path).unwrap(),
+            "# Infigraph rules\nI added my own note.\n"
+        );
     }
 
     #[test]

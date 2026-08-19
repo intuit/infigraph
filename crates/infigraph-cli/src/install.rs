@@ -4,7 +4,15 @@ use anyhow::{Context, Result};
 
 pub(crate) struct InstallReport {
     pub written: Vec<String>,
-    pub skipped: Vec<(String, String)>, // (path, reason)
+    pub skipped: Vec<(String, String, String)>, // (path, reason, manual_snippet)
+}
+
+/// Result of `run_uninstall`: which artifacts were removed, and which
+/// `overwrite`-managed files were left in place because their content no
+/// longer matched what install wrote (the user edited them).
+pub(crate) struct UninstallReport {
+    pub removed: Vec<String>,
+    pub preserved: Vec<String>,
 }
 
 /// Locate the infigraph-mcp binary: first check the same directory as the running
@@ -60,8 +68,11 @@ pub(crate) fn cmd_install() -> Result<()> {
         print_capabilities_summary(&configured_labels);
     }
 
-    for (path, reason) in &report.skipped {
+    for (path, reason, manual_snippet) in &report.skipped {
         eprintln!("  Skipped {}: {}", home.join(path).display(), reason);
+        if !manual_snippet.is_empty() {
+            eprintln!("    Add this manually:\n{manual_snippet}");
+        }
     }
 
     // Copy model files to ~/.infigraph/models/ -- unchanged, not artifact-based.
@@ -105,9 +116,10 @@ pub(crate) fn run_install(mcp_path: &Path, home: &Path) -> Result<InstallReport>
             .unwrap_or_else(|| format!("{} (resolver-determined)", artifact.integration_label));
         match outcome {
             crate::artifacts::ApplyOutcome::Written => report.written.push(label),
-            crate::artifacts::ApplyOutcome::Skipped { reason, .. } => {
-                report.skipped.push((label, reason))
-            }
+            crate::artifacts::ApplyOutcome::Skipped {
+                reason,
+                manual_snippet,
+            } => report.skipped.push((label, reason, manual_snippet)),
         }
     }
 
@@ -212,14 +224,21 @@ pub(crate) fn cmd_uninstall() -> Result<()> {
     let home = dirs::home_dir().context("Could not determine home directory")?;
     let mcp_path = find_mcp_binary().unwrap_or_else(|_| PathBuf::from("infigraph-mcp"));
 
-    let removed = run_uninstall(&mcp_path, &home)?;
+    let report = run_uninstall(&mcp_path, &home)?;
 
-    if removed.is_empty() {
+    if report.removed.is_empty() {
         println!("No agents had infigraph configured.");
     } else {
         println!(
             "\nUninstalled infigraph MCP server artifacts: {}",
-            removed.join(", ")
+            report.removed.join(", ")
+        );
+    }
+
+    for path in &report.preserved {
+        eprintln!(
+            "  Preserved {}: content changed since install, left in place",
+            home.join(path).display()
         );
     }
 
@@ -253,11 +272,11 @@ pub(crate) fn cmd_uninstall() -> Result<()> {
 }
 
 /// The actual artifact-engine uninstall logic, factored out from
-/// `cmd_uninstall` so it's testable against a fake `$HOME`. Returns the list
-/// of artifact labels that were actually removed (mirrors `run_install`'s
-/// `InstallReport.written` shape, one label per artifact whose `remove_*`
-/// call reported `true`).
-pub(crate) fn run_uninstall(mcp_path: &Path, home: &Path) -> Result<Vec<String>> {
+/// `cmd_uninstall` so it's testable against a fake `$HOME`. Returns which
+/// artifact labels were actually removed (mirrors `run_install`'s
+/// `InstallReport.written` shape) and which `overwrite`-managed paths were
+/// preserved because the user had edited them since install.
+pub(crate) fn run_uninstall(mcp_path: &Path, home: &Path) -> Result<UninstallReport> {
     let mcp_path_str = mcp_path.to_string_lossy().to_string();
     let user_override_dir = home.join(".infigraph").join("integrations");
 
@@ -268,16 +287,26 @@ pub(crate) fn run_uninstall(mcp_path: &Path, home: &Path) -> Result<Vec<String>>
     )?;
 
     let mut removed = Vec::new();
+    let mut preserved = Vec::new();
     for artifact in &artifacts {
-        let was_removed = crate::artifacts::remove_resolved_artifact(artifact, home, &mcp_path_str)
+        let outcome = crate::artifacts::remove_resolved_artifact(artifact, home, &mcp_path_str)
             .with_context(|| format!("removing {} artifact", artifact.integration_label))?;
-        if was_removed {
-            removed.push(artifact.integration_label.clone());
+        match outcome {
+            crate::artifacts::RemoveOutcome::Removed => {
+                removed.push(artifact.integration_label.clone())
+            }
+            crate::artifacts::RemoveOutcome::NotPresent => {}
+            crate::artifacts::RemoveOutcome::PreservedModified => {
+                let label = artifact.target_relative_path.clone().unwrap_or_else(|| {
+                    format!("{} (resolver-determined)", artifact.integration_label)
+                });
+                preserved.push(label);
+            }
         }
     }
     removed.sort();
     removed.dedup();
-    Ok(removed)
+    Ok(UninstallReport { removed, preserved })
 }
 
 /// Removes disposable caches under `~/.infigraph/` (the semantic-search
