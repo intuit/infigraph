@@ -1,0 +1,6 @@
+label = "Zed"
+
+[[artifact]]
+strategy = "json_key_path"
+key_path = ["context_servers", "infigraph"]
+resolver = ["python3", "./resolve-zed-path.py"]

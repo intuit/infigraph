@@ -1,0 +1,12 @@
+label = "Codex"
+
+[[artifact]]
+path = ".codex/config.toml"
+strategy = "toml_section"
+key_path = ["mcp_servers", "infigraph"]
+content_file = "mcp-section.toml"
+
+[[artifact]]
+path = ".codex/skills/infigraph-reindex/SKILL.md"
+strategy = "overwrite"
+content_file = "../shared/skills/infigraph-reindex/SKILL.md"

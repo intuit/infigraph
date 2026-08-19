@@ -2,7 +2,18 @@ use std::path::{Path, PathBuf};
 
 use anyhow::{Context, Result};
 
-use crate::config_targets::{self, ConfigFormat, AGENT_TARGETS};
+pub(crate) struct InstallReport {
+    pub written: Vec<String>,
+    pub skipped: Vec<(String, String, String)>, // (path, reason, manual_snippet)
+}
+
+/// Result of `run_uninstall`: which artifacts were removed, and which
+/// `overwrite`-managed files were left in place because their content no
+/// longer matched what install wrote (the user edited them).
+pub(crate) struct UninstallReport {
+    pub removed: Vec<String>,
+    pub preserved: Vec<String>,
+}
 
 /// Locate the infigraph-mcp binary: first check the same directory as the running
 /// binary, then fall back to searching PATH.
@@ -41,218 +52,125 @@ pub(crate) fn find_mcp_binary() -> Result<PathBuf> {
 
 pub(crate) fn cmd_install() -> Result<()> {
     let mcp_path = find_mcp_binary()?;
-    let mcp_path_str = mcp_path.to_string_lossy().to_string();
-
-    println!("Found infigraph-mcp at: {}", mcp_path_str);
+    println!("Found infigraph-mcp at: {}", mcp_path.to_string_lossy());
 
     let home = dirs::home_dir().context("Could not determine home directory")?;
-    let mut configured = Vec::new();
 
-    for target in AGENT_TARGETS {
-        let dir = home.join(target.dir_name);
+    let report = run_install(&mcp_path, &home)?;
 
-        std::fs::create_dir_all(&dir)
-            .with_context(|| format!("Failed to create directory {}", dir.display()))?;
-
-        let config_path = if target.config_file == "CLAUDE_CODE_SPECIAL" {
-            home.join(".claude.json")
-        } else {
-            dir.join(target.config_file)
-        };
-
-        match target.format {
-            ConfigFormat::Json => config_targets::install_json_target(&config_path, &mcp_path_str)?,
-            ConfigFormat::Toml => config_targets::install_toml_target(&config_path, &mcp_path_str)?,
-        }
-
-        configured.push(target.label);
-        println!("  Configured {} ({})", target.label, config_path.display());
-    }
-
-    if configured.is_empty() {
+    if report.written.is_empty() {
         println!("No agents were configured.");
     } else {
-        print_capabilities_summary(&configured);
+        for path in &report.written {
+            println!("  Configured: {}", home.join(path).display());
+        }
+        let configured_labels = configured_integration_labels(&mcp_path, &home, &report)?;
+        print_capabilities_summary(&configured_labels);
     }
 
-    // Write primary search instructions to ~/.claude/CLAUDE.md
-    write_claude_md_instructions(&home)?;
+    for (path, reason, manual_snippet) in &report.skipped {
+        eprintln!("  Skipped {}: {}", home.join(path).display(), reason);
+        if !manual_snippet.is_empty() {
+            eprintln!("    Add this manually:\n{manual_snippet}");
+        }
+    }
 
-    // Write cursor/windsurf rules
-    write_editor_rules(&home)?;
-
-    // Write /infigraph-reindex command to ~/.claude/commands/
-    write_reindex_command(&home)?;
-
-    // Install hooks and Claude Code allowlist
-    crate::hooks::install_enforcement_hook(&home)?;
-    crate::hooks::install_edit_tracker_hook(&home)?;
-    crate::hooks::install_session_save_hook(&home)?;
-    crate::hooks::install_clear_suggest_hook(&home)?;
-    crate::hooks::install_clear_guard_hook(&home)?;
-    crate::hooks::install_session_end_hook(&home)?;
-    crate::hooks::install_test_context_sentinel_hook(&home)?;
-    crate::hooks::install_search_fallback_sentinel_hook(&home)?;
-    crate::hooks::install_claude_allowlist(&home)?;
-
-    // Copy model files to ~/.infigraph/models/
+    // Copy model files to ~/.infigraph/models/ -- unchanged, not artifact-based.
     install_models(&mcp_path, &home)?;
 
     Ok(())
 }
 
-fn write_claude_md_instructions(home: &Path) -> Result<()> {
-    let claude_md = home.join(".claude").join("CLAUDE.md");
-    let marker = "<!-- infigraph-primary-search -->";
-    let instructions = format!(
-        r#"
-{marker}
-## Infigraph — Primary Code Intelligence
+/// The actual artifact-engine install logic, factored out from `cmd_install`
+/// so it's testable against a fake `$HOME` without touching the real one.
+pub(crate) fn run_install(mcp_path: &Path, home: &Path) -> Result<InstallReport> {
+    let mcp_path_str = mcp_path.to_string_lossy().to_string();
+    let user_override_dir = home.join(".infigraph").join("integrations");
 
-Infigraph MCP is indexed. Use Infigraph tools FIRST for all code tasks. Fall back to grep/Read only if Infigraph returns nothing or for non-code files.
+    let artifacts = crate::artifacts::discover_artifacts(
+        crate::artifacts::BUNDLED_INTEGRATIONS,
+        &user_override_dir,
+        &mcp_path_str,
+    )?;
 
-### Rules
-1. Check `list_projects` before indexing — don't re-index
-2. **`search`** for ALL code search — hybrid BM25+vector+grep in one call, auto-escalates
-3. **`get_doc_context`** before editing any function — returns source+callers+callees in one call
-4. **`trace_callers`** / **`find_all_references`** before refactoring — never grep for callers
-5. **`trace_callees`** / **`transitive_impact`** for blast radius — never manually trace call chains
-6. Read files directly only for non-code files (configs, docs, manifests) or Edit tool line-number context
-
-### Workflows
-- **Find code:** `search` → if need symbol detail: `get_code_snippet` or `symbol_context`
-- **Before editing:** `get_doc_context`
-- **Before refactoring:** `find_all_references` → `transitive_impact` → edit
-- **Onboarding:** `index_project` → `get_architecture` → `get_stats`
-- **Multi-repo:** `group_create` → `group_add` × N → `group_index` → `group_sync` → `group_link`
-
-### Subagents — infigraph-indexed projects
-Do NOT spawn these agent types for code tasks — they lack MCP access and will fall back to grep/glob:
-- **Explore** → use `search`, `search_code`, `search_symbols` directly instead
-- **Plan** → use `get_architecture`, `get_skeleton`, `get_stats` directly instead
-- **code-reviewer** → use `get_doc_context`, `get_code_snippet`, `review` directly instead
-
-For tasks requiring a subagent, use **general-purpose** — it has full MCP/infigraph access.
-
-### Verbose tools — delegate to subagent
-`get_architecture`, `transitive_impact`, `detect_dead_code`, `detect_clusters`, `detect_clones`, `export_graph`, `query_graph`, `trace_callers`/`trace_callees` (deep), `group_query`, `group_index`
-
-> All other Infigraph tools are safe to call inline. Each tool description says what it replaces — check descriptions when unsure which tool to use.
-
-**Reindex:** `/infigraph-reindex [path]` — always runs in subagent.
-
-### Session Continuity — MANDATORY
-- **On session start:** MUST call `get_latest_session` to resume prior context
-- **After context compaction:** if you see "continued from a previous conversation" or a compaction summary, IMMEDIATELY call `save_session` with whatever context survived before doing anything else
-- **MUST call `save_session` IMMEDIATELY (before responding to the user)** when ANY of these occur. No session-end signal exists — if you don't save now, context is lost forever:
-  1. **Finding** — root cause identified, discovered a bug, learned how something works
-  2. **Milestone** — bug fixed and verified, feature committed, test passing, build green
-  3. **Decision** — chose an approach, ruled something out, changed strategy
-  4. **Task done** — any pending task from a prior session is completed
-  5. **Periodic** — if you have NOT called `save_session` in the last 5 exchanges with the user, call it NOW regardless of whether anything dramatic happened. This is a hard rule, not a suggestion.
-- Do NOT defer saves ("I'll save later"). Do NOT batch them. Do NOT wait for user to ask.
-- "Later" does not exist — context compaction or session end can happen at any moment.
-- **Before `/clear`:** ALWAYS call `save_session` first — `/clear` wipes context and LM2 can only restore what was persisted. Unsaved reasoning, decisions, and in-flight work will be lost.
-- Same-day saves merge: summary/pending_tasks overwrite, decisions append, files_touched union
-- **Narrative dumps:** On every `save_session`, include `narrative` field with full session story — what was explored, found, reasoned, decided, and why. Chronological prose, not terse bullets. Written to `.infigraph/sessions/session_YYYY-MM-DD.md` and embedded for semantic search. On session start, if `get_latest_session` shows a narrative log path, read it when structured fields aren't enough context.
-
-### Session Field Guide
-- **decisions** — structured format: `Goal: X. Decision: Y. Why: Z. Invalidates-if: W.`
-- **constraints** — things that failed: `Tried: X. Failed because: Y. Do not retry unless: Z.`
-- **assumptions** — what current approach depends on: `Assumes: X. If X changes: Y.`
-- **blockers** — stuck items needing human input or external dependency
-- **narrative** — full session story: explorations, findings, reasoning, code changes, decisions in chronological order. Write as prose, not structured fields.
-"#
-    );
-
-    let existing = std::fs::read_to_string(&claude_md).unwrap_or_default();
-    let new_content = if let Some(start) = existing.find(marker) {
-        let after = &existing[start..];
-        let end = after[marker.len()..]
-            .find("\n<!-- ")
-            .map(|p| start + marker.len() + p + 1)
-            .unwrap_or(existing.len());
-        format!("{}{}{}", &existing[..start], instructions, &existing[end..])
-    } else {
-        format!("{}\n{}", existing, instructions)
+    let mut report = InstallReport {
+        written: Vec::new(),
+        skipped: Vec::new(),
     };
-    std::fs::write(&claude_md, new_content)?;
-    println!(
-        "  Updated primary search instructions in {}",
-        claude_md.display()
-    );
+
+    for artifact in &artifacts {
+        let outcome = crate::artifacts::apply_resolved_artifact(artifact, home, &mcp_path_str)
+            .with_context(|| {
+                format!(
+                    "applying {} artifact for {}",
+                    artifact.integration_label,
+                    artifact
+                        .target_relative_path
+                        .as_deref()
+                        .unwrap_or("(resolver-determined path)")
+                )
+            })?;
+        let label = artifact
+            .target_relative_path
+            .clone()
+            .unwrap_or_else(|| format!("{} (resolver-determined)", artifact.integration_label));
+        match outcome {
+            crate::artifacts::ApplyOutcome::Written => report.written.push(label),
+            crate::artifacts::ApplyOutcome::Skipped {
+                reason,
+                manual_snippet,
+            } => report.skipped.push((label, reason, manual_snippet)),
+        }
+    }
+
+    write_claude_allowlist_and_hooks_extras(home)?;
+
+    Ok(report)
+}
+
+/// Everything the artifact engine doesn't cover: the Claude Code permission
+/// allowlist (a grant list, not "content deployed to a path" -- see the
+/// design spec's "stays outside the artifact mechanism").
+fn write_claude_allowlist_and_hooks_extras(home: &Path) -> Result<()> {
+    crate::hooks::install_claude_allowlist(home)?;
     Ok(())
 }
 
-// Project-level CLAUDE.md generation moved to infigraph_core::claude_md
+/// Derives the human-readable "Configured for: X, Y, Z" summary from which
+/// integrations actually had at least one artifact written -- replaces the
+/// old per-`AgentTarget` `configured.push(target.label)` bookkeeping now that
+/// artifacts (not agent targets) are the unit of installation.
+fn configured_integration_labels(
+    mcp_path: &Path,
+    home: &Path,
+    report: &InstallReport,
+) -> Result<Vec<String>> {
+    let mcp_path_str = mcp_path.to_string_lossy().to_string();
+    let user_override_dir = home.join(".infigraph").join("integrations");
+    let artifacts = crate::artifacts::discover_artifacts(
+        crate::artifacts::BUNDLED_INTEGRATIONS,
+        &user_override_dir,
+        &mcp_path_str,
+    )?;
 
-fn write_editor_rules(home: &Path) -> Result<()> {
-    let marker = "<!-- infigraph-primary-search -->";
-    let instructions = crate::agent::infigraph_instructions();
+    let written_set: std::collections::HashSet<&str> =
+        report.written.iter().map(|s| s.as_str()).collect();
 
-    // Write .cursorrules to ~/.cursor/rules/infigraph.mdc
-    let cursor_rules_dir = home.join(".cursor").join("rules");
-    if home.join(".cursor").exists() {
-        std::fs::create_dir_all(&cursor_rules_dir)?;
-        let cursor_rule = cursor_rules_dir.join("infigraph.mdc");
-        let cursor_content = format!(
-            "---\ndescription: Infigraph primary code intelligence rules\nglobs: \nalwaysApply: true\n---\n\n{instructions}"
-        );
-        std::fs::write(&cursor_rule, cursor_content)?;
-        println!("  Updated Cursor rules in {}", cursor_rule.display());
-    }
-
-    // Write .windsurfrules to ~/.windsurf/rules/infigraph.md
-    let windsurf_rules_dir = home.join(".windsurf").join("rules");
-    if home.join(".windsurf").exists() {
-        std::fs::create_dir_all(&windsurf_rules_dir)?;
-        let windsurf_rule = windsurf_rules_dir.join("infigraph.md");
-        std::fs::write(&windsurf_rule, instructions)?;
-        println!("  Updated Windsurf rules in {}", windsurf_rule.display());
-    }
-
-    let _ = marker;
-    Ok(())
-}
-
-fn write_reindex_command(home: &Path) -> Result<()> {
-    let commands_dir = home.join(".claude").join("commands");
-    std::fs::create_dir_all(&commands_dir)?;
-    let reindex_cmd = commands_dir.join("infigraph-reindex.md");
-    let reindex_content = r#"# Infigraph Reindex
-
-Reindex the project directly (no subagent — saves tokens).
-
-## Usage
-
-```
-/infigraph-reindex [path]
-```
-
-If `path` is omitted, uses the current working directory.
-
-## Instructions
-
-1. Determine project path: use the argument provided, or fall back to the current working directory.
-2. Load the tool schema: `ToolSearch("select:mcp__infigraph__index_project")`
-3. Call `mcp__infigraph__index_project` with that path directly (do NOT spawn an Agent).
-4. Report back in this exact format (nothing else):
-
-```
-Reindexed: <path>
-Files: <N> | Symbols: <N> | Calls: <N> resolved / <N> unresolved
-Languages: <comma-separated list with file counts>
-```
-
-If indexing fails, report the error verbatim. Do not attempt fixes.
-"#;
-    // Always overwrite to pick up content updates
-    std::fs::write(&reindex_cmd, reindex_content)?;
-    println!(
-        "  Updated /infigraph-reindex command at {}",
-        reindex_cmd.display()
-    );
-    Ok(())
+    let mut labels: Vec<String> = artifacts
+        .iter()
+        .filter(|a| {
+            let key = a
+                .target_relative_path
+                .as_deref()
+                .map(|p| p.to_string())
+                .unwrap_or_else(|| format!("{} (resolver-determined)", a.integration_label));
+            written_set.contains(key.as_str())
+        })
+        .map(|a| a.integration_label.clone())
+        .collect();
+    labels.sort();
+    labels.dedup();
+    Ok(labels)
 }
 
 pub(crate) fn install_models(mcp_path: &Path, home: &Path) -> Result<()> {
@@ -304,86 +222,27 @@ pub(crate) fn install_models(mcp_path: &Path, home: &Path) -> Result<()> {
 
 pub(crate) fn cmd_uninstall() -> Result<()> {
     let home = dirs::home_dir().context("Could not determine home directory")?;
-    let mut removed = Vec::new();
+    let mcp_path = find_mcp_binary().unwrap_or_else(|_| PathBuf::from("infigraph-mcp"));
 
-    for target in AGENT_TARGETS {
-        let config_path = if target.config_file == "CLAUDE_CODE_SPECIAL" {
-            home.join(".claude.json")
-        } else {
-            home.join(target.dir_name).join(target.config_file)
-        };
+    let report = run_uninstall(&mcp_path, &home)?;
 
-        let result = match target.format {
-            ConfigFormat::Json => {
-                config_targets::uninstall_json_target(&config_path, target.label)?
-            }
-            ConfigFormat::Toml => {
-                config_targets::uninstall_toml_target(&config_path, target.label)?
-            }
-        };
-
-        if let Some(label) = result {
-            removed.push(label);
-        }
-    }
-
-    if removed.is_empty() {
+    if report.removed.is_empty() {
         println!("No agents had infigraph configured.");
     } else {
         println!(
-            "\nUninstalled infigraph MCP server from {} agent(s): {}",
-            removed.len(),
-            removed.join(", ")
+            "\nUninstalled infigraph MCP server artifacts: {}",
+            report.removed.join(", ")
         );
     }
 
-    // Remove primary search instructions from ~/.claude/CLAUDE.md
-    let claude_md = home.join(".claude").join("CLAUDE.md");
-    let marker = "<!-- infigraph-primary-search -->";
-    if claude_md.exists() {
-        let content = std::fs::read_to_string(&claude_md)?;
-        if let Some(start) = content.find(marker) {
-            let new_content = content[..start].trim_end().to_string();
-            std::fs::write(
-                &claude_md,
-                if new_content.is_empty() {
-                    String::new()
-                } else {
-                    format!("{}\n", new_content)
-                },
-            )?;
-            println!(
-                "  Removed primary search instructions from {}",
-                claude_md.display()
-            );
-        }
+    for path in &report.preserved {
+        eprintln!(
+            "  Preserved {}: content changed since install, left in place",
+            home.join(path).display()
+        );
     }
 
-    // Remove Cursor rules
-    let cursor_rule = home.join(".cursor").join("rules").join("infigraph.mdc");
-    if cursor_rule.exists() {
-        std::fs::remove_file(&cursor_rule)?;
-        println!("  Removed Cursor rules: {}", cursor_rule.display());
-    }
-
-    // Remove Windsurf rules
-    let windsurf_rule = home.join(".windsurf").join("rules").join("infigraph.md");
-    if windsurf_rule.exists() {
-        std::fs::remove_file(&windsurf_rule)?;
-        println!("  Removed Windsurf rules: {}", windsurf_rule.display());
-    }
-
-    // Remove /infigraph-reindex skill from ~/.claude/commands/
-    let reindex_cmd = home
-        .join(".claude")
-        .join("commands")
-        .join("infigraph-reindex.md");
-    if reindex_cmd.exists() {
-        std::fs::remove_file(&reindex_cmd)?;
-        println!("  Removed skill: {}", reindex_cmd.display());
-    }
-
-    // Remove hooks and Claude Code allowlist
+    // Remove hooks and Claude Code allowlist -- outside the artifact mechanism.
     crate::hooks::uninstall_hooks(&home)?;
     crate::hooks::uninstall_claude_allowlist(&home)?;
 
@@ -407,13 +266,69 @@ pub(crate) fn cmd_uninstall() -> Result<()> {
         }
     }
 
-    // Remove model cache ~/.infigraph/
-    let model_cache = home.join(".infigraph");
-    if model_cache.exists() {
-        std::fs::remove_dir_all(&model_cache)?;
-        println!("  Removed model cache: {}", model_cache.display());
-    }
+    clean_infigraph_cache_dir(&home)?;
 
+    Ok(())
+}
+
+/// The actual artifact-engine uninstall logic, factored out from
+/// `cmd_uninstall` so it's testable against a fake `$HOME`. Returns which
+/// artifact labels were actually removed (mirrors `run_install`'s
+/// `InstallReport.written` shape) and which `overwrite`-managed paths were
+/// preserved because the user had edited them since install.
+pub(crate) fn run_uninstall(mcp_path: &Path, home: &Path) -> Result<UninstallReport> {
+    let mcp_path_str = mcp_path.to_string_lossy().to_string();
+    let user_override_dir = home.join(".infigraph").join("integrations");
+
+    let artifacts = crate::artifacts::discover_artifacts(
+        crate::artifacts::BUNDLED_INTEGRATIONS,
+        &user_override_dir,
+        &mcp_path_str,
+    )?;
+
+    let mut removed = Vec::new();
+    let mut preserved = Vec::new();
+    for artifact in &artifacts {
+        let outcome = crate::artifacts::remove_resolved_artifact(artifact, home, &mcp_path_str)
+            .with_context(|| format!("removing {} artifact", artifact.integration_label))?;
+        match outcome {
+            crate::artifacts::RemoveOutcome::Removed => {
+                removed.push(artifact.integration_label.clone())
+            }
+            crate::artifacts::RemoveOutcome::NotPresent => {}
+            crate::artifacts::RemoveOutcome::PreservedModified => {
+                let label = artifact.target_relative_path.clone().unwrap_or_else(|| {
+                    format!("{} (resolver-determined)", artifact.integration_label)
+                });
+                preserved.push(label);
+            }
+        }
+    }
+    removed.sort();
+    removed.dedup();
+    Ok(UninstallReport { removed, preserved })
+}
+
+/// Removes disposable caches under `~/.infigraph/` (the semantic-search
+/// model files, the update-check cache) while deliberately preserving
+/// `~/.infigraph/integrations/` -- the persistent, user-authored override
+/// directory the two-tier discovery system depends on (see Task 9). Before
+/// this PR, `~/.infigraph/` only ever held disposable caches, so wiping the
+/// whole directory on uninstall was safe; now that it also holds real user
+/// customization work, that would silently destroy it. Extracted as its own
+/// function (rather than inlined in `cmd_uninstall`) specifically so it's
+/// testable against a fake home directory -- `cmd_uninstall` itself calls
+/// `dirs::home_dir()` directly and can't be pointed at a temp dir in a test.
+fn clean_infigraph_cache_dir(home: &Path) -> Result<()> {
+    let models_cache = home.join(".infigraph").join("models");
+    if models_cache.exists() {
+        std::fs::remove_dir_all(&models_cache)?;
+        println!("  Removed model cache: {}", models_cache.display());
+    }
+    let update_check_cache = home.join(".infigraph").join("update_check.json");
+    if update_check_cache.exists() {
+        let _ = std::fs::remove_file(&update_check_cache);
+    }
     Ok(())
 }
 
@@ -551,7 +466,7 @@ pub(crate) fn self_update(version: &str) -> Result<()> {
     Ok(())
 }
 
-pub(crate) fn print_capabilities_summary(configured: &[&str]) {
+pub(crate) fn print_capabilities_summary(configured: &[String]) {
     let version = env!("CARGO_PKG_VERSION");
     let count = configured.len();
     let agents = configured.join(", ");
@@ -699,15 +614,8 @@ pub(crate) fn print_update_hint(handle: Option<std::thread::JoinHandle<()>>) {
 fn reinstall_hooks() -> Result<()> {
     let home = dirs::home_dir().context("cannot find home directory")?;
     println!("\nReinstalling hooks...");
-    crate::hooks::install_enforcement_hook(&home)?;
-    crate::hooks::install_edit_tracker_hook(&home)?;
-    crate::hooks::install_session_save_hook(&home)?;
-    crate::hooks::install_clear_suggest_hook(&home)?;
-    crate::hooks::install_clear_guard_hook(&home)?;
-    crate::hooks::install_session_end_hook(&home)?;
-    crate::hooks::install_test_context_sentinel_hook(&home)?;
-    crate::hooks::install_search_fallback_sentinel_hook(&home)?;
-    crate::hooks::install_claude_allowlist(&home)?;
+    let mcp_path = find_mcp_binary()?;
+    run_install(&mcp_path, &home)?;
     Ok(())
 }
 
@@ -773,4 +681,108 @@ pub(crate) fn cmd_update() -> Result<()> {
     }
 
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn cmd_install_writes_every_convention_based_integration_under_a_fake_home() {
+        let home_dir = tempfile::tempdir().unwrap();
+        let mcp_path = "/opt/infigraph/bin/infigraph-mcp";
+
+        let report = run_install(&std::path::PathBuf::from(mcp_path), home_dir.path()).unwrap();
+
+        assert!(report.written.iter().any(|p| p == ".claude.json"));
+        assert!(report.written.iter().any(|p| p == ".gemini/settings.json"));
+        assert!(report.written.iter().any(|p| p == ".codex/config.toml"));
+        assert!(
+            report.skipped.is_empty(),
+            "nothing should be skipped against an empty $HOME"
+        );
+
+        let claude_json: serde_json::Value = serde_json::from_str(
+            &std::fs::read_to_string(home_dir.path().join(".claude.json")).unwrap(),
+        )
+        .unwrap();
+        assert_eq!(claude_json["mcpServers"]["infigraph"]["command"], mcp_path);
+    }
+
+    #[test]
+    fn cmd_install_is_idempotent() {
+        let home_dir = tempfile::tempdir().unwrap();
+        let mcp_path = "/opt/infigraph/bin/infigraph-mcp";
+
+        run_install(&std::path::PathBuf::from(mcp_path), home_dir.path()).unwrap();
+        run_install(&std::path::PathBuf::from(mcp_path), home_dir.path()).unwrap();
+
+        let claude_json: serde_json::Value = serde_json::from_str(
+            &std::fs::read_to_string(home_dir.path().join(".claude.json")).unwrap(),
+        )
+        .unwrap();
+        assert_eq!(
+            claude_json["mcpServers"]["infigraph"]["args"]
+                .as_array()
+                .unwrap()
+                .len(),
+            1
+        );
+    }
+
+    #[test]
+    fn cmd_uninstall_removes_everything_cmd_install_wrote() {
+        let home_dir = tempfile::tempdir().unwrap();
+        let mcp_path = "/opt/infigraph/bin/infigraph-mcp";
+
+        run_install(&std::path::PathBuf::from(mcp_path), home_dir.path()).unwrap();
+        assert!(home_dir.path().join(".claude.json").exists());
+
+        run_uninstall(&std::path::PathBuf::from(mcp_path), home_dir.path()).unwrap();
+
+        let claude_json: serde_json::Value = serde_json::from_str(
+            &std::fs::read_to_string(home_dir.path().join(".claude.json")).unwrap(),
+        )
+        .unwrap();
+        assert!(claude_json["mcpServers"]["infigraph"].is_null());
+        assert!(!home_dir
+            .path()
+            .join(".claude/hooks/infigraph-enforce.sh")
+            .exists());
+
+        let codex_toml =
+            std::fs::read_to_string(home_dir.path().join(".codex/config.toml")).unwrap();
+        assert!(!codex_toml.contains("[mcp_servers.infigraph]"));
+    }
+
+    #[test]
+    fn clean_infigraph_cache_dir_preserves_user_integration_overrides() {
+        let home_dir = tempfile::tempdir().unwrap();
+        let integrations_dir = home_dir.path().join(".infigraph").join("integrations");
+        std::fs::create_dir_all(&integrations_dir).unwrap();
+        std::fs::write(
+            integrations_dir.join("my-custom-agent.json"),
+            "a user's own override, not a cache",
+        )
+        .unwrap();
+
+        let models_dir = home_dir
+            .path()
+            .join(".infigraph")
+            .join("models")
+            .join("potion-base-8M");
+        std::fs::create_dir_all(&models_dir).unwrap();
+        std::fs::write(models_dir.join("model.safetensors"), "fake model data").unwrap();
+
+        clean_infigraph_cache_dir(home_dir.path()).unwrap();
+
+        assert!(
+            integrations_dir.join("my-custom-agent.json").exists(),
+            "user-authored integration overrides must survive uninstall's cache cleanup"
+        );
+        assert!(
+            !models_dir.exists(),
+            "the model cache should still be removed"
+        );
+    }
 }
