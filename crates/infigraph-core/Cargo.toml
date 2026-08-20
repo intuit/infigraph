@@ -40,6 +40,10 @@ ignore = "0.4"
 serde_yaml = "0.9.34"
 fs2 = "0.4.3"
 memmap2 = "0.9"
+# Only used to check whether a graph write lock's recorded PID is still
+# alive (see GraphStore::unclean_shutdown_wal_holder) -- a stale WAL from a
+# dead process can crash Kuzu's WAL-replay-on-open with SIGBUS.
+sysinfo = "0.39.6"
 
 [features]
 default = []
