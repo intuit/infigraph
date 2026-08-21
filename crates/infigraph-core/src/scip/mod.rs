@@ -92,15 +92,22 @@ pub fn import_scip_index(
     // Used to detect when SCIP resolves differently (= a correction to learn from).
     let mut existing_calls: HashMap<String, std::collections::HashSet<String>> = HashMap::new();
     if project_root.is_some() {
-        if let Ok(rows) = conn.query("MATCH (a:Symbol)-[:CALLS]->(b:Symbol) RETURN a.id, b.id") {
-            for row in rows {
-                if row.len() < 2 {
-                    continue;
-                }
-                let src = row[0].to_string().trim_matches('"').to_string();
-                let tgt = row[1].to_string().trim_matches('"').to_string();
-                existing_calls.entry(src).or_default().insert(tgt);
+        // Must propagate a query failure here rather than silently treating
+        // it as "no existing CALLS edges" -- that would make every SCIP
+        // resolution look like a correction to learn, corrupting the
+        // learned-pattern store on every enrichment cycle a query happens
+        // to fail (see the sibling preload below for the more severe half
+        // of this same bug class).
+        let rows = conn
+            .query("MATCH (a:Symbol)-[:CALLS]->(b:Symbol) RETURN a.id, b.id")
+            .context("SCIP import: failed to preload existing CALLS edges")?;
+        for row in rows {
+            if row.len() < 2 {
+                continue;
             }
+            let src = row[0].to_string().trim_matches('"').to_string();
+            let tgt = row[1].to_string().trim_matches('"').to_string();
+            existing_calls.entry(src).or_default().insert(tgt);
         }
     }
 
@@ -115,28 +122,40 @@ pub fn import_scip_index(
     let mut file_name_to_ids: NameCandidates = HashMap::new();
     let mut file_symbols: HashMap<String, Vec<(u32, u32, String)>> = HashMap::new();
 
+    // Must propagate a query failure here rather than silently falling back
+    // to an empty map: every real symbol already in the graph would then
+    // look brand-new to Pass 1 below and get re-inserted via COPY, and this
+    // failure mode never self-heals -- the very next enrichment cycle
+    // repeats it from the same graph state. This is what caused sittir's
+    // graph to balloon: a large multi-language repo's `MATCH (s:Symbol)`
+    // scan (tens of thousands of rows) is exactly the kind of query that
+    // can fail under real-world resource pressure (buffer-manager
+    // contention with the daemon's own concurrent watcher writes), and
+    // `if let Ok(rows) = ...` was treating that failure identically to "this
+    // is a brand-new project with no symbols yet".
     let q = "MATCH (s:Symbol) RETURN s.id, s.file, s.name, s.start_line, s.end_line";
-    if let Ok(rows) = conn.query(q) {
-        for row in rows {
-            if row.len() < 5 {
-                continue;
-            }
-            let sid = row[0].to_string().trim_matches('"').to_string();
-            let sfile = row[1].to_string().trim_matches('"').to_string();
-            let sname = row[2].to_string().trim_matches('"').to_string();
-            let sstart: u32 = row[3].to_string().trim_matches('"').parse().unwrap_or(0);
-            let send: u32 = row[4].to_string().trim_matches('"').parse().unwrap_or(0);
-
-            file_name_to_ids
-                .entry((sfile.clone(), sname))
-                .or_default()
-                .push((sstart, send, sid.clone()));
-
-            file_symbols
-                .entry(sfile)
-                .or_default()
-                .push((sstart, send, sid));
+    let rows = conn
+        .query(q)
+        .context("SCIP import: failed to preload existing symbols")?;
+    for row in rows {
+        if row.len() < 5 {
+            continue;
         }
+        let sid = row[0].to_string().trim_matches('"').to_string();
+        let sfile = row[1].to_string().trim_matches('"').to_string();
+        let sname = row[2].to_string().trim_matches('"').to_string();
+        let sstart: u32 = row[3].to_string().trim_matches('"').parse().unwrap_or(0);
+        let send: u32 = row[4].to_string().trim_matches('"').parse().unwrap_or(0);
+
+        file_name_to_ids
+            .entry((sfile.clone(), sname))
+            .or_default()
+            .push((sstart, send, sid.clone()));
+
+        file_symbols
+            .entry(sfile)
+            .or_default()
+            .push((sstart, send, sid));
     }
 
     // Sort file_symbols by span size (smallest first) for containment lookup
