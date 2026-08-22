@@ -581,7 +581,9 @@ pub fn mcp_log(level: &str, msg: &str) {
         .map(|d| d.as_secs())
         .unwrap_or(0);
     let line = format!("[{ts}] {level}: {msg}");
-    eprintln!("{line}");
+    let stderr = std::io::stderr();
+    let mut stderr = stderr.lock();
+    let _ = writeln!(stderr, "{line}");
     let path = mcp_log_file_path();
     if let Some(parent) = path.parent() {
         let _ = std::fs::create_dir_all(parent);
