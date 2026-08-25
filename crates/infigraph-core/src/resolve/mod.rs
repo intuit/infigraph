@@ -37,7 +37,7 @@ impl std::fmt::Display for ResolveStats {
 
 // Shared helpers used by both calls and inherits submodules.
 
-fn shortest_id<'a, I, F>(iter: I, pred: F) -> Option<String>
+pub(crate) fn shortest_id<'a, I, F>(iter: I, pred: F) -> Option<String>
 where
     I: Iterator<Item = &'a (String, String, String)>,
     F: Fn(&(String, String, String)) -> bool,
@@ -47,6 +47,6 @@ where
         .map(|(id, _, _)| id.clone())
 }
 
-fn escape(s: &str) -> String {
+pub(crate) fn escape(s: &str) -> String {
     s.replace('\'', "\\'")
 }
