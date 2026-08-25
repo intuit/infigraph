@@ -11,7 +11,7 @@ use crate::learned::LearnedStore;
 use crate::model::FileExtraction;
 use crate::resolve::ResolveStats;
 
-use super::backend::{CallsServiceEdge, GraphBackend};
+use super::backend::{CallsServiceEdge, Concern, GraphBackend, ResolvesToEdge};
 use super::{
     ApiSymbol, ArchitectureStats, BranchInfo, ComplexityRow, DeadCodeRow, FileDeps, FileHotspot,
     GraphStats, HubFunction, ImpactRow, KindCount, LanguageCount, ReferenceRow, SymbolDetail,
@@ -1856,6 +1856,70 @@ impl GraphBackend for Neo4jBackend {
             ),
         )
         .map_err(|e| anyhow::anyhow!("write_calls_service_edges failed: {e}"))?;
+        Ok(())
+    }
+
+    fn replace_concerns(&self, concerns: &[Concern]) -> Result<()> {
+        let concern_maps: Vec<HashMap<&str, String>> = concerns
+            .iter()
+            .map(|c| {
+                let mut m = HashMap::new();
+                m.insert("id", format!("{}::{}", c.symbol_id, c.kind));
+                m.insert("symbol_id", c.symbol_id.clone());
+                m.insert("kind", c.kind.clone());
+                m.insert("detail", c.detail.clone());
+                m
+            })
+            .collect();
+        // Single query: Neo4j auto-commits one Cypher statement atomically,
+        // so the delete and the recreate either both land or neither does --
+        // no driver-level transaction needed (same reasoning as
+        // `write_calls_service_edges`). Correct even when `concerns` is
+        // empty: the DETACH DELETE still runs, UNWIND over an empty list
+        // just contributes zero rows to what follows it.
+        self.block_on(
+            self.graph.run(
+                query(
+                    "MATCH (c:Concern) DETACH DELETE c \
+                     WITH 1 AS _cleared \
+                     UNWIND $concerns AS m \
+                     CREATE (c:Concern {id: m.id, kind: m.kind, detail: m.detail}) \
+                     WITH c, m \
+                     MATCH (s:Symbol) WHERE s.id = m.symbol_id \
+                     CREATE (s)-[:HAS_CONCERN]->(c)",
+                )
+                .param("concerns", concern_maps),
+            ),
+        )
+        .map_err(|e| anyhow::anyhow!("replace_concerns failed: {e}"))?;
+        Ok(())
+    }
+
+    fn replace_resolves_to(&self, edges: &[ResolvesToEdge]) -> Result<()> {
+        let edge_maps: Vec<HashMap<&str, String>> = edges
+            .iter()
+            .map(|e| {
+                let mut m = HashMap::new();
+                m.insert("caller_symbol", e.caller_symbol.clone());
+                m.insert("target", e.target.clone());
+                m.insert("mechanism", e.mechanism.clone());
+                m.insert("config_source", e.config_source.clone());
+                m
+            })
+            .collect();
+        self.block_on(
+            self.graph.run(
+                query(
+                    "MATCH ()-[r:RESOLVES_TO]->() DELETE r \
+                     WITH 1 AS _cleared \
+                     UNWIND $edges AS e \
+                     MATCH (s:Symbol), (t:Symbol) WHERE s.id = e.caller_symbol AND t.id = e.target \
+                     CREATE (s)-[:RESOLVES_TO {mechanism: e.mechanism, config_source: e.config_source}]->(t)",
+                )
+                .param("edges", edge_maps),
+            ),
+        )
+        .map_err(|e| anyhow::anyhow!("replace_resolves_to failed: {e}"))?;
         Ok(())
     }
 

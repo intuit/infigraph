@@ -554,13 +554,13 @@ impl GraphStore {
             }
             let edge_pq = tmp.join(format!("infigraph_index_{}.parquet", table.to_lowercase()));
             copy_edges_with_bad_record_retry(
-                conn,
+                self,
                 table,
                 pairs.to_vec(),
                 src_label,
                 dst_label,
                 &edge_pq,
-            );
+            )?;
         }
 
         // Custom edge tables
@@ -574,13 +574,13 @@ impl GraphStore {
                 edge_name.to_lowercase()
             ));
             copy_edges_with_bad_record_retry(
-                conn,
+                self,
                 edge_name,
                 pairs.to_vec(),
                 "Symbol",
                 "Symbol",
                 &edge_pq,
-            );
+            )?;
         }
 
         // Cleanup node parquet files

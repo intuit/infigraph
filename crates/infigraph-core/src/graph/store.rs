@@ -113,6 +113,34 @@ impl GraphStore {
         Connection::new(&self.db).map_err(|e| anyhow::anyhow!("failed to create connection: {e}"))
     }
 
+    /// Run `f` inside a real transaction: opens one connection, issues
+    /// `BEGIN TRANSACTION`, runs `f` against that connection, commits on
+    /// `Ok`, rolls back on `Err`.
+    ///
+    /// Use this for any write that must be atomic across more than one
+    /// statement. `KuzuBackend::raw_query`'s `BEGIN`/`COMMIT`/`ROLLBACK`
+    /// handling is deliberately a no-op (each call opens a fresh connection,
+    /// so transaction-control statements issued through it can never span
+    /// more than the one statement they're attached to) -- passing those
+    /// strings to `raw_query` does not get you a transaction. This method is
+    /// the real thing.
+    pub fn transaction<T>(&self, f: impl FnOnce(&Connection<'_>) -> Result<T>) -> Result<T> {
+        let conn = self.connection()?;
+        conn.query("BEGIN TRANSACTION")
+            .map_err(|e| anyhow::anyhow!("failed to begin transaction: {e}"))?;
+        match f(&conn) {
+            Ok(value) => {
+                conn.query("COMMIT")
+                    .map_err(|e| anyhow::anyhow!("failed to commit transaction: {e}"))?;
+                Ok(value)
+            }
+            Err(e) => {
+                let _ = conn.query("ROLLBACK");
+                Err(e)
+            }
+        }
+    }
+
     /// Remove all graph data for a deleted file.
     pub fn remove_file(&self, file: &str) -> Result<()> {
         let _lock = self.write_lock()?;

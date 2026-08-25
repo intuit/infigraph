@@ -1,8 +1,10 @@
 use std::path::Path;
 
+use anyhow::Result;
 use kuzu::Connection;
 
 use crate::graph::parquet_loader;
+use crate::graph::store::GraphStore;
 
 /// How many bad-record-drop-and-retry cycles a bulk COPY gets before giving
 /// up and falling back to the slow per-row UNWIND path for whatever remains.
@@ -184,18 +186,30 @@ pub(crate) fn extract_bad_copy_value(err: &str) -> Option<&str> {
 /// retries are exhausted (`MAX_BAD_RECORD_RETRIES`) or the error isn't
 /// recognized as recoverable -- avoids paying the slow UNWIND path for an
 /// entire batch over a handful of bad rows.
+///
+/// Takes `store` rather than a borrowed `Connection`: a caught COPY failure
+/// can leave Kùzu's internal transaction bookkeeping on that connection in a
+/// state where the *next* statement fails immediately with `Invalid
+/// transaction type to rollback.` (observed in production -- a Symbol-table
+/// COPY's bad-PK retries left the connection wedged for the CALLS-table COPY
+/// that followed on the same connection). None of these bulk loads are
+/// wrapped in an explicit transaction, so sharing a connection across them
+/// buys no atomicity -- asking `store` for a fresh one every attempt is
+/// free of that risk and no more expensive (`GraphStore::connection` is a
+/// cheap `Connection::new` per call).
 pub(crate) fn copy_edges_with_bad_record_retry(
-    conn: &Connection,
+    store: &GraphStore,
     table: &str,
     mut pairs: Vec<(String, String)>,
     src_label: &str,
     dst_label: &str,
     edge_pq: &Path,
-) {
+) -> Result<()> {
     for attempt in 0..MAX_BAD_RECORD_RETRIES {
         if pairs.is_empty() {
-            return;
+            return Ok(());
         }
+        let conn = store.connection()?;
         let refs: Vec<(&str, &str)> = pairs
             .iter()
             .map(|(a, b)| (a.as_str(), b.as_str()))
@@ -206,7 +220,7 @@ pub(crate) fn copy_edges_with_bad_record_retry(
         match conn.query(&format!("COPY {table} FROM '{}'", fwd_slash_path(edge_pq))) {
             Ok(_) => {
                 let _ = std::fs::remove_file(edge_pq);
-                return;
+                return Ok(());
             }
             Err(e) => {
                 let msg = e.to_string();
@@ -227,12 +241,14 @@ pub(crate) fn copy_edges_with_bad_record_retry(
             }
         }
     }
+    let conn = store.connection()?;
     let refs: Vec<(&str, &str)> = pairs
         .iter()
         .map(|(a, b)| (a.as_str(), b.as_str()))
         .collect();
-    unwind_edges_from_pairs(conn, &refs, table, src_label, dst_label);
+    unwind_edges_from_pairs(&conn, &refs, table, src_label, dst_label);
     let _ = std::fs::remove_file(edge_pq);
+    Ok(())
 }
 
 pub fn classify_file(file: &str) -> &'static str {
