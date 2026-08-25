@@ -2,6 +2,7 @@ use std::collections::HashMap;
 
 use anyhow::Result;
 
+use crate::graph::store::GraphStore;
 use crate::graph::store_util::copy_edges_with_bad_record_retry;
 use crate::model::{FileExtraction, RelationKind};
 
@@ -11,7 +12,7 @@ const TYPE_KINDS: &[&str] = &["Class", "Interface", "Struct", "Trait", "Enum"];
 
 /// Caller must hold WriteLock.
 pub(crate) fn resolve_inherits(
-    conn: &kuzu::Connection<'_>,
+    store: &GraphStore,
     extractions: &[FileExtraction],
     symbol_map: &HashMap<String, Vec<(String, String, String)>>,
 ) -> Result<usize> {
@@ -183,7 +184,7 @@ pub(crate) fn resolve_inherits(
         .map(|(a, b)| (a.clone(), b.clone()))
         .collect();
     let pq_path = std::env::temp_dir().join("infigraph_resolve_inherits.parquet");
-    copy_edges_with_bad_record_retry(conn, "INHERITS", pairs, "Symbol", "Symbol", &pq_path);
+    copy_edges_with_bad_record_retry(store, "INHERITS", pairs, "Symbol", "Symbol", &pq_path)?;
 
     Ok(count)
 }
