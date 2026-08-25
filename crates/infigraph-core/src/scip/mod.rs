@@ -246,6 +246,13 @@ pub fn import_scip_index(
                 break;
             }
 
+            // Fresh connection every attempt -- a caught COPY failure can
+            // leave Kùzu's internal transaction bookkeeping wedged for
+            // whatever query runs next on that same connection (see
+            // `copy_edges_with_bad_record_retry`'s doc comment for the
+            // production incident this mirrors).
+            let conn = store.connection()?;
+
             let ids: Vec<&str> = remaining.iter().map(|(id, ..)| id.as_str()).collect();
             let names: Vec<&str> = remaining
                 .iter()
@@ -342,6 +349,9 @@ pub fn import_scip_index(
         }
 
         if !remaining.is_empty() {
+            // Fresh connection: the retry loop above may have just failed a
+            // COPY on whatever connection it was using.
+            let conn = store.connection()?;
             for chunk in remaining.chunks(CHUNK) {
                 let rows: Vec<String> = chunk
                     .iter()
@@ -370,6 +380,9 @@ pub fn import_scip_index(
     // Bulk write enrichments via UNWIND (updates can't use COPY FROM).
     // Only docstring is enriched -- see the note on `enrichments` above for
     // why start_line/end_line must never be written here.
+    // Fresh connection: the Symbol-COPY block above may have just failed a
+    // COPY on whatever connection it was using.
+    let conn = store.connection()?;
     for chunk in enrichments.chunks(CHUNK) {
         let rows: Vec<String> = chunk
             .iter()
@@ -468,13 +481,13 @@ pub fn import_scip_index(
         let edge_pq = tmp.join("infigraph_scip_calls.parquet");
         stats.references_added = calls_to_create.len();
         copy_edges_with_bad_record_retry(
-            &conn,
+            store,
             "CALLS",
             calls_to_create,
             "Symbol",
             "Symbol",
             &edge_pq,
-        );
+        )?;
     }
 
     // Pass 3: build INHERITS edges from SCIP's compiler-verified is_implementation
@@ -536,13 +549,13 @@ pub fn import_scip_index(
         let edge_pq = tmp.join("infigraph_scip_inherits.parquet");
         stats.relations_added = inherits_to_create.len();
         copy_edges_with_bad_record_retry(
-            &conn,
+            store,
             "INHERITS",
             inherits_to_create,
             "Symbol",
             "Symbol",
             &edge_pq,
-        );
+        )?;
     }
 
     // Persist learned corrections (if any were recorded)

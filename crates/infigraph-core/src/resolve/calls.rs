@@ -38,8 +38,8 @@ pub fn resolve_calls_incremental(
         symbol_map.entry(name).or_default().push((id, file, kind));
     }
 
-    let mut stats = resolve_with_map(&conn, extractions, &symbol_map, learned_store)?;
-    stats.inherits_resolved = resolve_inherits(&conn, extractions, &symbol_map)?;
+    let mut stats = resolve_with_map(store, &conn, extractions, &symbol_map, learned_store)?;
+    stats.inherits_resolved = resolve_inherits(store, extractions, &symbol_map)?;
     resolve_custom_edges(&conn, extractions, &symbol_map)?;
     Ok(stats)
 }
@@ -74,8 +74,8 @@ pub fn resolve_calls(
         }
     }
 
-    let mut stats = resolve_with_map(&conn, extractions, &symbol_map, learned_store)?;
-    stats.inherits_resolved = resolve_inherits(&conn, extractions, &symbol_map)?;
+    let mut stats = resolve_with_map(store, &conn, extractions, &symbol_map, learned_store)?;
+    stats.inherits_resolved = resolve_inherits(store, extractions, &symbol_map)?;
     resolve_custom_edges(&conn, extractions, &symbol_map)?;
     Ok(stats)
 }
@@ -230,6 +230,7 @@ fn write_external_calls(
 
 /// Caller must hold WriteLock.
 fn resolve_with_map(
+    store: &GraphStore,
     conn: &kuzu::Connection<'_>,
     extractions: &[FileExtraction],
     symbol_map: &HashMap<String, Vec<(String, String, String)>>,
@@ -607,7 +608,7 @@ fn resolve_with_map(
             .map(|(a, b)| (a.clone(), b.clone()))
             .collect();
         let pq_path = std::env::temp_dir().join("infigraph_resolve_calls.parquet");
-        copy_edges_with_bad_record_retry(conn, "CALLS", pairs, "Symbol", "Symbol", &pq_path);
+        copy_edges_with_bad_record_retry(store, "CALLS", pairs, "Symbol", "Symbol", &pq_path)?;
     }
 
     if !external_calls.is_empty() {
@@ -667,8 +668,8 @@ pub fn re_resolve_for_files(
         .collect();
 
     let filtered_owned: Vec<FileExtraction> = filtered.into_iter().cloned().collect();
-    let mut stats = resolve_with_map(&conn, &filtered_owned, &symbol_map, learned_store)?;
-    stats.inherits_resolved = resolve_inherits(&conn, &filtered_owned, &symbol_map)?;
+    let mut stats = resolve_with_map(store, &conn, &filtered_owned, &symbol_map, learned_store)?;
+    stats.inherits_resolved = resolve_inherits(store, &filtered_owned, &symbol_map)?;
     Ok(stats)
 }
 
