@@ -49,9 +49,9 @@ void SetFormMLHandler(int entity, const char* formML) {
 "#,
     )]);
 
-    let backends: Vec<(&str, &dyn GraphBackend)> = vec![
-        ("tps-bridge", &producer_backend),
-        ("tto-engine", &consumer_backend),
+    let backends: Vec<(&str, &dyn GraphBackend, Option<&str>)> = vec![
+        ("tps-bridge", &producer_backend, None),
+        ("tto-engine", &consumer_backend, None),
     ];
     let linked = link_cross_repo_namespace_calls(&backends).unwrap();
     assert_eq!(linked, 1, "expected exactly one cross-repo namespace edge");
@@ -81,10 +81,10 @@ fn does_not_link_when_qualifier_matches_multiple_repos() {
     let (_consumer_dir, consumer_backend) =
         backend_with(&[("c.cpp", br#"void Handler(int e) { tps::SetFormML(e); }"#)]);
 
-    let backends: Vec<(&str, &dyn GraphBackend)> = vec![
-        ("repo-a", &producer1),
-        ("repo-b", &producer2),
-        ("repo-c", &consumer_backend),
+    let backends: Vec<(&str, &dyn GraphBackend, Option<&str>)> = vec![
+        ("repo-a", &producer1, None),
+        ("repo-b", &producer2, None),
+        ("repo-c", &consumer_backend, None),
     ];
     let linked = link_cross_repo_namespace_calls(&backends).unwrap();
     assert_eq!(linked, 0, "ambiguous match across 2 repos must not link");

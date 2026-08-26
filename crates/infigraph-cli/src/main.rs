@@ -812,6 +812,7 @@ fn main() -> Result<()> {
             | Commands::Languages
             | Commands::Repos
             | Commands::CleanRuntimes
+            | Commands::Group { .. }
     );
 
     let result = std::thread::Builder::new()
