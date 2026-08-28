@@ -60,7 +60,7 @@ ureq = "2"
 sha2 = "0.10"
 chrono = { version = "0.4", features = ["serde"] }
 cozo = { version = "0.7.6", features = ["storage-sqlite"] }
-kuzu = { package = "lbug", version = "= 0.16.0" }
+kuzu = { package = "lbug", version = "= 0.19.1" }
 fs2 = "0.4"
 
 [target.'cfg(unix)'.dependencies]

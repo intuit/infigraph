@@ -38,7 +38,11 @@ fn concurrent_writer_reader_raw_query_correctness_under_load() {
     let root = project.path().to_path_buf();
     let db_path = root.join(".infigraph").join("graph");
 
-    write_fixture(&root, "mod_stable.py", "def stable_marker_fn():\n    pass\n");
+    write_fixture(
+        &root,
+        "mod_stable.py",
+        "def stable_marker_fn():\n    pass\n",
+    );
     write_fixture(&root, "mod_churn.py", "def churn_fn_0():\n    pass\n");
     {
         let registry = infigraph_languages::bundled_registry().expect("bundled registry");
@@ -109,19 +113,24 @@ fn concurrent_writer_reader_raw_query_correctness_under_load() {
                     correct.fetch_add(1, Ordering::Relaxed);
                 }
                 Ok(rows) => {
-                    wrong_results
-                        .lock()
-                        .unwrap()
-                        .push(format!("query succeeded but missing stable_marker_fn: {rows:?}"));
+                    wrong_results.lock().unwrap().push(format!(
+                        "query succeeded but missing stable_marker_fn: {rows:?}"
+                    ));
                 }
                 Err(e) => {
                     clean_errors.fetch_add(1, Ordering::Relaxed);
-                    error_samples.lock().unwrap().push(format!("query error: {e}"));
+                    error_samples
+                        .lock()
+                        .unwrap()
+                        .push(format!("query error: {e}"));
                 }
             },
             Err(e) => {
                 clean_errors.fetch_add(1, Ordering::Relaxed);
-                error_samples.lock().unwrap().push(format!("open error: {e}"));
+                error_samples
+                    .lock()
+                    .unwrap()
+                    .push(format!("open error: {e}"));
             }
         }
     }
