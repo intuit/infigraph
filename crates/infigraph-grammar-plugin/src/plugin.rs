@@ -4,7 +4,7 @@ use std::sync::Arc;
 use anyhow::{Context, Result};
 use serde::Deserialize;
 
-use infigraph_core::lang::CustomExtractor;
+use infigraph_core::lang::{fingerprint_parts, CustomExtractor};
 use infigraph_core::model::{Relation, RelationKind, Span, Symbol, SymbolKind};
 
 use crate::driver::GrammarDriver;
@@ -243,6 +243,43 @@ pub fn discover_plugins(plugins_dir: &Path) -> Result<Vec<(GrammarPluginConfig, 
 /// source file is resolved to an absolute path next to `plugin.toml` (the
 /// driver compiles it on load); anything else (e.g. `"GenericExtractor"`)
 /// passes through unchanged.
+/// Digest of everything in a plugin directory that determines what the plugin
+/// extracts: its `plugin.toml` (entry rule, preprocessor and lexing flags), both
+/// ANTLR grammars, and the extractor source when it ships with the plugin. A
+/// built-in extractor lives in the driver jar instead, so only its name is
+/// covered — replacing the jar is not detected here.
+///
+/// Mixed into the language pack's fingerprint so that swapping a plugin's
+/// grammar or extractor re-indexes that language's files, the same way editing a
+/// tree-sitter query does. Without it, a plugin upgrade would leave existing
+/// indexes on the old extractor's output indefinitely.
+///
+/// An unreadable input contributes its path rather than its bytes, so a plugin
+/// we can't hash stays cacheable instead of re-extracting on every run.
+pub fn plugin_fingerprint(config: &GrammarPluginConfig, plugin_dir: &Path) -> String {
+    let lang = &config.language;
+    let mut inputs = vec![
+        plugin_dir.join("plugin.toml"),
+        plugin_dir.join(&lang.lexer),
+        plugin_dir.join(&lang.parser),
+    ];
+    if lang.extractor.ends_with(".java") {
+        inputs.push(plugin_dir.join(&lang.extractor));
+    }
+
+    let contents: Vec<Vec<u8>> = inputs
+        .iter()
+        .map(|path| {
+            std::fs::read(path).unwrap_or_else(|_| path.to_string_lossy().as_bytes().to_vec())
+        })
+        .collect();
+
+    let mut parts: Vec<&[u8]> = Vec::with_capacity(contents.len() + 1);
+    parts.push(lang.extractor.as_bytes());
+    parts.extend(contents.iter().map(|c| c.as_slice()));
+    fingerprint_parts(&parts)
+}
+
 fn resolve_extractor(plugin_dir: &Path, extractor: &str) -> Result<String> {
     if extractor.ends_with(".java") {
         let joined = plugin_dir.join(extractor);
@@ -292,6 +329,96 @@ fn parse_relation_kind(s: &str) -> RelationKind {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Write a minimal plugin directory and return it with its parsed config.
+    fn write_plugin(dir: &Path, lexer_src: &str, extractor: &str) -> GrammarPluginConfig {
+        let toml_src = format!(
+            "[language]\nname = \"demo\"\nextensions = [\".demo\"]\n\
+             entry_rule = \"program\"\nlexer = \"DemoLexer.g4\"\n\
+             parser = \"DemoParser.g4\"\nextractor = \"{extractor}\"\n"
+        );
+        std::fs::write(dir.join("plugin.toml"), &toml_src).unwrap();
+        std::fs::write(dir.join("DemoLexer.g4"), lexer_src).unwrap();
+        std::fs::write(dir.join("DemoParser.g4"), "parser grammar DemoParser;").unwrap();
+        std::fs::write(dir.join("Extractor.java"), "class Extractor {}").unwrap();
+        toml::from_str(&toml_src).unwrap()
+    }
+
+    #[test]
+    fn test_plugin_fingerprint_is_stable_for_unchanged_plugin() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let config = write_plugin(dir.path(), "lexer grammar DemoLexer;", "Extractor.java");
+        assert_eq!(
+            plugin_fingerprint(&config, dir.path()),
+            plugin_fingerprint(&config, dir.path()),
+            "an untouched plugin must keep its fingerprint, so its files stay cached"
+        );
+    }
+
+    /// Replacing a plugin's grammar has to invalidate its files, the same way
+    /// editing a tree-sitter query does — otherwise the upgrade never reaches an
+    /// existing index.
+    #[test]
+    fn test_plugin_fingerprint_changes_when_grammar_changes() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let config = write_plugin(dir.path(), "lexer grammar DemoLexer;", "Extractor.java");
+        let before = plugin_fingerprint(&config, dir.path());
+
+        std::fs::write(
+            dir.path().join("DemoLexer.g4"),
+            "lexer grammar DemoLexer;\nID : [a-z]+ ;",
+        )
+        .unwrap();
+
+        assert_ne!(before, plugin_fingerprint(&config, dir.path()));
+    }
+
+    #[test]
+    fn test_plugin_fingerprint_changes_when_extractor_source_changes() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let config = write_plugin(dir.path(), "lexer grammar DemoLexer;", "Extractor.java");
+        let before = plugin_fingerprint(&config, dir.path());
+
+        std::fs::write(
+            dir.path().join("Extractor.java"),
+            "class Extractor { void more() {} }",
+        )
+        .unwrap();
+
+        assert_ne!(before, plugin_fingerprint(&config, dir.path()));
+    }
+
+    /// A built-in extractor's code lives in the driver jar, so switching which
+    /// built-in a plugin uses is the only part of it we can detect.
+    #[test]
+    fn test_plugin_fingerprint_changes_when_builtin_extractor_switched() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let with_builtin = write_plugin(dir.path(), "lexer grammar DemoLexer;", "BuiltinA");
+        let a = plugin_fingerprint(&with_builtin, dir.path());
+
+        let with_other = write_plugin(dir.path(), "lexer grammar DemoLexer;", "BuiltinB");
+        assert_ne!(a, plugin_fingerprint(&with_other, dir.path()));
+    }
+
+    /// A plugin whose files can't be read must stay cacheable rather than
+    /// producing a fresh fingerprint (and a full re-extraction) on every run.
+    #[test]
+    fn test_plugin_fingerprint_stable_when_files_missing() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let config = write_plugin(dir.path(), "lexer grammar DemoLexer;", "Extractor.java");
+        for name in [
+            "plugin.toml",
+            "DemoLexer.g4",
+            "DemoParser.g4",
+            "Extractor.java",
+        ] {
+            std::fs::remove_file(dir.path().join(name)).unwrap();
+        }
+        assert_eq!(
+            plugin_fingerprint(&config, dir.path()),
+            plugin_fingerprint(&config, dir.path())
+        );
+    }
 
     #[test]
     fn test_parse_symbol_kind_all_variants() {

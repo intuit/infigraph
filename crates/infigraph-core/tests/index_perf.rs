@@ -350,6 +350,60 @@ fn test_incremental_index_only_changed() {
     );
 }
 
+/// Upgrading an extractor must reach existing indexes on its own.
+///
+/// Before `content_hash` covered the language pack, a query fix never re-ran on
+/// unedited files: their content hash still matched, so they were skipped
+/// indefinitely and the graph kept whatever the old, buggy extractor produced —
+/// silently, unless the user knew to run `index --full`.
+#[test]
+fn test_extractor_change_reindexes_unedited_files() {
+    let (dir, ig) = make_project(5);
+    assert_eq!(ig.index().unwrap().indexed_files, 5, "first index is full");
+    // Kuzu is single-writer: release the graph before reopening it.
+    drop(ig);
+
+    let reindex_with = |pack: LanguagePack| {
+        let mut reg = LanguageRegistry::new();
+        reg.register(pack);
+        let mut ig = Infigraph::open(dir.path(), reg).unwrap();
+        ig.init().unwrap();
+        let indexed = ig.index().unwrap().indexed_files;
+        drop(ig);
+        indexed
+    };
+
+    assert_eq!(
+        reindex_with(python_pack()),
+        0,
+        "same files and same extractor must still skip everything"
+    );
+
+    // Stand-in for shipping an extractor fix: one more pattern in entities.scm.
+    let upgraded = || {
+        LanguagePack::new(
+            "python",
+            vec![".py"],
+            tree_sitter_python::LANGUAGE.into(),
+            &format!("{PYTHON_ENTITIES}\n(lambda) @func.def\n"),
+            PYTHON_RELATIONS,
+        )
+        .unwrap()
+    };
+
+    assert_eq!(
+        reindex_with(upgraded()),
+        5,
+        "an upgraded extractor must re-extract its files without --full"
+    );
+    assert_eq!(
+        reindex_with(upgraded()),
+        0,
+        "re-extraction must settle: the upgraded extractor is now the stored \
+         fingerprint, so a further run skips again rather than reindexing forever"
+    );
+}
+
 #[test]
 fn test_large_project_index() {
     let (_dir, ig) = make_project(200);
