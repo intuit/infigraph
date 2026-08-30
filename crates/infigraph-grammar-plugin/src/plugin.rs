@@ -119,6 +119,7 @@ impl GrammarPlugin {
                 arr.iter()
                     .filter_map(|s| {
                         Some(Symbol {
+                            scip_id: None,
                             id: s.get("id")?.as_str()?.to_string(),
                             name: s.get("name")?.as_str()?.to_string(),
                             kind: parse_symbol_kind(s.get("kind")?.as_str()?),

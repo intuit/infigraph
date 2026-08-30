@@ -245,6 +245,7 @@ pub fn extract_entities(
                 complexity,
                 parameters,
                 return_type,
+                scip_id: None,
             });
         }
 
@@ -284,6 +285,7 @@ pub fn extract_entities(
                 visibility: None,
                 docstring,
                 complexity: 1,
+                scip_id: None,
             });
         }
     }
