@@ -315,18 +315,31 @@ pub fn extract_entities(
         }
     }
 
-    // Deduplicate by ID — multiple query patterns (e.g. bare vs. annotated
-    // decorator variants, or a params/return_type-capturing pattern vs. an
-    // annotation-capturing one) can match the same definition node, each
-    // populating a different subset of fields. Prefer the more specific kind
-    // (Test > Function/Method), keep the richest docstring seen so an
-    // earlier bare-pattern match doesn't blank out a later match's
-    // decorator/annotation text, and fill in parameters/return_type from any
-    // duplicate match that has them if the kept entry doesn't yet.
-    let mut seen = std::collections::HashMap::new();
+    // Group by ID first. Two cases share an id here:
+    // 1. Multiple query patterns (e.g. bare vs. annotated decorator variants,
+    //    or a params/return_type-capturing pattern vs. an annotation-capturing
+    //    one) matching the SAME definition node (identical span) -- merge
+    //    these, keeping the richest docstring/kind/parameters/return_type,
+    //    exactly as before.
+    // 2. Genuinely DIFFERENT declarations (different spans) whose id string
+    //    happens to collide -- e.g. two same-named methods under the same
+    //    parent. These must not be merged (that's the sym_seen collapse bug
+    //    in store_parquet.rs) -- instead, disambiguate by appending an
+    //    ordinal suffix based on source order (see the
+    //    symbol-identity-and-scoping-hardening spec's Phase 2: a per-
+    //    (file, parent, name) occurrence ordinal, sorted by start position,
+    //    applied only when there's more than one occurrence).
+    let mut by_id: std::collections::HashMap<String, Vec<Symbol>> =
+        std::collections::HashMap::new();
     for sym in symbols {
-        seen.entry(sym.id.clone())
-            .and_modify(|existing: &mut Symbol| {
+        by_id.entry(sym.id.clone()).or_default().push(sym);
+    }
+
+    let mut result = Vec::new();
+    for group in by_id.into_values() {
+        let mut by_span: Vec<Symbol> = Vec::new();
+        for sym in group {
+            if let Some(existing) = by_span.iter_mut().find(|s| s.span == sym.span) {
                 if sym.kind == SymbolKind::Test && existing.kind == SymbolKind::Function {
                     existing.kind = sym.kind.clone();
                 }
@@ -341,10 +354,22 @@ pub fn extract_entities(
                 if existing.return_type.is_none() && sym.return_type.is_some() {
                     existing.return_type = sym.return_type.clone();
                 }
-            })
-            .or_insert(sym);
+            } else {
+                by_span.push(sym);
+            }
+        }
+
+        if by_span.len() > 1 {
+            by_span.sort_by_key(|s| (s.span.start_line, s.span.start_col));
+            for (i, mut sym) in by_span.into_iter().enumerate() {
+                sym.id = format!("{}#{}", sym.id, i + 1);
+                result.push(sym);
+            }
+        } else {
+            result.extend(by_span);
+        }
     }
-    seen.into_values().collect()
+    result
 }
 
 /// Look at preceding siblings for attribute/decorator nodes.
@@ -1896,17 +1921,14 @@ mod tests {
         assert!(hello_ids.contains(&"src/main.rs::Beta::hello"));
     }
 
-    /// Known, tracked residual gap (pradeepmouli/infigraph#125), not fixed by the
-    /// impl_item parent-scoping fix above: a single type with two same-named
-    /// methods from different sources (an inherent impl and a trait impl of the
-    /// *same* type) both resolve @method.parent to the same type name, so they
-    /// still collide into one id. This test documents that current, known
-    /// behavior explicitly rather than letting it pass silently as "fixed" --
-    /// if a future change (Phase 2 of the symbol-identity-and-scoping-hardening
-    /// spec) fixes this, this assertion should be updated to expect 2 distinct
-    /// ids, not treated as a regression to preserve.
+    /// Regression test for pradeepmouli/infigraph#125, fixed by Phase 2's
+    /// per-(file, parent, name) occurrence ordinal: a single type with two
+    /// same-named methods from different sources (an inherent impl and a
+    /// trait impl of the *same* type) both resolve @method.parent to the
+    /// same type name and have the same raw id -- but different spans, so
+    /// they now get distinct #1/#2-suffixed ids instead of colliding.
     #[test]
-    fn test_rust_same_type_inherent_and_trait_impl_method_still_collide() {
+    fn test_rust_same_type_inherent_and_trait_impl_method_gets_distinct_ordinal_ids() {
         let (grammar, entity_query, decompose_query) = rust_entity_query();
 
         let src = b"struct Bar;\ntrait SomeTrait { fn x(&self); }\n\nimpl Bar {\n    fn x(&self) {}\n}\n\nimpl SomeTrait for Bar {\n    fn x(&self) {}\n}\n";
@@ -1924,18 +1946,56 @@ mod tests {
             Some(&decompose_query),
         );
 
-        let x_ids: Vec<&str> = symbols
+        let mut x_ids: Vec<&str> = symbols
             .iter()
             .filter(|s| s.name == "x" && s.kind == SymbolKind::Method)
             .map(|s| s.id.as_str())
             .collect();
+        x_ids.sort();
 
         assert_eq!(
-            x_ids.len(),
-            1,
-            "known gap: Bar's inherent and trait-impl `x` methods both resolve to \
-             src/main.rs::Bar::x today and collapse into one symbol (see #125) -- \
-             if this now fails with 2, update this test, don't treat it as broken"
+            x_ids,
+            vec!["src/main.rs::Bar::x#1", "src/main.rs::Bar::x#2"],
+            "Bar's inherent and trait-impl `x` methods should get distinct \
+             ordinal-suffixed ids, not collapse into one (see #125)"
+        );
+    }
+
+    /// Ordinal assignment generalizes past pairs and follows source order,
+    /// not just producing a stable-but-arbitrary count.
+    #[test]
+    fn test_rust_three_way_collision_gets_ordinals_in_source_order() {
+        let (grammar, entity_query, decompose_query) = rust_entity_query();
+
+        let src = b"struct Bar;\ntrait TraitA { fn x(&self); }\ntrait TraitB { fn x(&self); }\n\nimpl Bar {\n    fn x(&self) {}\n}\n\nimpl TraitA for Bar {\n    fn x(&self) {}\n}\n\nimpl TraitB for Bar {\n    fn x(&self) {}\n}\n";
+
+        let mut parser = Parser::new();
+        parser.set_language(&grammar).unwrap();
+        let tree = parser.parse(src, None).unwrap();
+
+        let symbols = extract_entities(
+            "src/main.rs",
+            src,
+            tree.root_node(),
+            &entity_query,
+            "rust",
+            Some(&decompose_query),
+        );
+
+        let mut x_syms: Vec<&Symbol> = symbols
+            .iter()
+            .filter(|s| s.name == "x" && s.kind == SymbolKind::Method)
+            .collect();
+        x_syms.sort_by_key(|s| s.span.start_line);
+
+        assert_eq!(x_syms.len(), 3, "all three overloads should survive");
+        assert_eq!(x_syms[0].id, "src/main.rs::Bar::x#1");
+        assert_eq!(x_syms[1].id, "src/main.rs::Bar::x#2");
+        assert_eq!(x_syms[2].id, "src/main.rs::Bar::x#3");
+        assert!(
+            x_syms[0].span.start_line < x_syms[1].span.start_line
+                && x_syms[1].span.start_line < x_syms[2].span.start_line,
+            "ordinal order should match source position order"
         );
     }
 }
