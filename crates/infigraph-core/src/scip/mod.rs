@@ -15,6 +15,15 @@ use crate::graph::store_util::{
 use crate::graph::GraphStore;
 use crate::model::{Span, SymbolKind};
 
+/// (file, name) -> candidate (start_line, end_line, symbol_id) tuples --
+/// see `file_name_to_ids` in `import_scip_index` for how this disambiguates
+/// same-named symbols by containment.
+type NameCandidates = HashMap<(String, String), Vec<(u32, u32, String)>>;
+
+/// A newly-created (SCIP-only) symbol row, in COPY column order: id, name,
+/// kind, file, start_line, end_line, docstring, scip_id.
+type NewSymbolRow = (String, String, String, String, u32, u32, String, String);
+
 /// True when `scip_sym` is a member (e.g. a parameter) of a symbol we
 /// already know about, per SCIP's own descriptor grammar: strip a single
 /// trailing `(...)` group and check whether what remains is a moniker
@@ -33,15 +42,6 @@ use crate::model::{Span, SymbolKind};
 /// `#` (Type), or `().` (Method) per SCIP's descriptor grammar -- never a
 /// bare `)` -- so this never fires for a legitimately-new symbol; it can
 /// only match nested member descriptors.
-/// (file, name) -> candidate (start_line, end_line, symbol_id) tuples --
-/// see `file_name_to_ids` in `import_scip_index` for how this disambiguates
-/// same-named symbols by containment.
-type NameCandidates = HashMap<(String, String), Vec<(u32, u32, String)>>;
-
-/// A newly-created (SCIP-only) symbol row, in COPY column order: id, name,
-/// kind, file, start_line, end_line, docstring, scip_id.
-type NewSymbolRow = (String, String, String, String, u32, u32, String, String);
-
 fn is_member_of_known_symbol(scip_sym: &str, known: &HashMap<String, (String, String)>) -> bool {
     let Some(without_group) = scip_sym.strip_suffix(')') else {
         return false;
