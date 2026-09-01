@@ -75,6 +75,10 @@ pub struct Symbol {
     pub parameters: Option<String>,
     /// Return type annotation (raw text from AST)
     pub return_type: Option<String>,
+    /// SCIP moniker string this symbol was correlated to during enrichment
+    /// (full descriptor path, including disambiguator). `None` until SCIP
+    /// enrichment runs and finds a match.
+    pub scip_id: Option<String>,
 }
 
 /// The kind of relationship between two symbols.
