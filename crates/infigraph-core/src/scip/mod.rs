@@ -144,6 +144,19 @@ pub fn import_scip_index(
         syms.sort_by_key(|(s, e, _)| *e as i64 - *s as i64);
     }
 
+    // Snapshot of what existed in the graph BEFORE this import pass -- used
+    // below to scope the `.first()` fallback to genuinely pre-existing
+    // ambiguity (a span-computation edge case against one already-known
+    // symbol), never against a candidate `file_name_to_ids` gains *during*
+    // this same Pass 1 loop. Without this, a second brand-new same-named
+    // symbol in this batch sees the first one (just inserted a few lines
+    // below) as its only "candidate", fails containment (their spans don't
+    // overlap), and silently falls back to merging into it as an
+    // "enrichment" instead of becoming its own symbol -- confirmed via
+    // `probe_two_new_same_named_symbols_one_file`: two distinct new SCIP
+    // symbols collapsed into one Symbol row with zero warning.
+    let preexisting_file_name_to_ids = file_name_to_ids.clone();
+
     // Build SCIP symbol -> definition file mapping (cross-file resolution)
     let mut scip_sym_to_file_name: HashMap<String, (String, String)> = HashMap::new();
     for doc in &index.documents {
@@ -215,16 +228,30 @@ pub fn import_scip_index(
             // occurrence's identifier token -- not every same-named candidate.
             // Phase 2's ordinal disambiguation (entities.rs) means genuinely
             // distinct same-named symbols now have distinct, non-overlapping
-            // spans, so containment reliably picks the right one; `.first()` as
-            // a fallback only matters for a span-computation edge case, not the
-            // common overload case this is designed for.
-            let matched = file_name_to_ids.get(&key).and_then(|candidates| {
-                candidates
-                    .iter()
-                    .find(|(s, e, _)| span.start_line >= *s && span.start_line <= *e)
-                    .or_else(|| candidates.first())
-                    .map(|(_, _, id)| id.clone())
-            });
+            // spans, so containment reliably picks the right one. The `.first()`
+            // fallback only covers a genuine span-computation edge case against
+            // a symbol that already existed BEFORE this import pass -- it must
+            // never fall back onto a candidate `file_name_to_ids` gained *during*
+            // this same loop (that candidate is some other occurrence processed
+            // moments ago, not this one), and only when pre-existing ambiguity is
+            // low enough (a single candidate) to safely guess.
+            let matched = file_name_to_ids
+                .get(&key)
+                .and_then(|candidates| {
+                    candidates
+                        .iter()
+                        .find(|(s, e, _)| span.start_line >= *s && span.start_line <= *e)
+                        .map(|(_, _, id)| id.clone())
+                })
+                .or_else(|| {
+                    preexisting_file_name_to_ids.get(&key).and_then(|c| {
+                        if c.len() == 1 {
+                            c.first().map(|(_, _, id)| id.clone())
+                        } else {
+                            None
+                        }
+                    })
+                });
 
             if let Some(sid) = matched {
                 enrichments.push((sid.clone(), docstring.to_string(), scip_sym.clone()));
@@ -263,13 +290,56 @@ pub fn import_scip_index(
         stats.files_processed += 1;
     }
 
-    // Bulk insert new SCIP symbols via Parquet COPY FROM. A batch containing
-    // two rows with the same id (e.g. two distinct SCIP symbols that
-    // collapse to the same extracted name) is dropped down to one entry up
-    // front -- an objectively-bad duplicate should never be sent to COPY at
-    // all. On a COPY failure against an id that already exists in the graph,
-    // drop that one record and retry rather than falling back to UNWIND for
-    // the whole batch; only exhausting MAX_SYMBOL_RETRIES falls back.
+    // Phase 2-style ordinal disambiguation (mirrors entities.rs's
+    // tree-sitter path) for genuinely-distinct new SCIP symbols that share a
+    // (file, name) key -- e.g. `A#foo()` and `B#foo()` both extract to
+    // "foo". Without this, both would carry the identical unsuffixed id and
+    // the `seen_ids` dedup below would silently keep only one, losing the
+    // other with no warning (confirmed via
+    // `probe_two_new_same_named_symbols_one_file`). Ordinals continue past
+    // whatever count already existed for this key before this import pass,
+    // so a newly-added symbol can never collide with one already in the
+    // graph either.
+    {
+        let mut groups: HashMap<(String, String), Vec<usize>> = HashMap::new();
+        for (i, (_, name, _, file, ..)) in new_symbols.iter().enumerate() {
+            groups
+                .entry((file.clone(), name.clone()))
+                .or_default()
+                .push(i);
+        }
+        for ((file, name), mut idxs) in groups {
+            let existing_count = preexisting_file_name_to_ids
+                .get(&(file.clone(), name.clone()))
+                .map_or(0, |v| v.len());
+            // Truly unambiguous: exactly one new occurrence in this batch,
+            // and nothing pre-existing under this key either -- keep the
+            // bare id (matches entities.rs's own single-occurrence case).
+            // Otherwise (more than one new occurrence, and/or something
+            // already exists for this key) every one of THIS batch's
+            // occurrences needs a suffix continuing past `existing_count`,
+            // including a solo one -- a lone new occurrence colliding with
+            // pre-existing rows is exactly what caused a real
+            // duplicated-primary-key COPY failure before this fix.
+            if idxs.len() == 1 && existing_count == 0 {
+                continue;
+            }
+            idxs.sort_by_key(|&i| (new_symbols[i].4, new_symbols[i].5));
+            for (n, i) in idxs.into_iter().enumerate() {
+                let new_id = format!("{file}::{name}#{}", existing_count + n + 1);
+                new_symbols[i].0 = new_id.clone();
+                scip_sym_to_ts_id.insert(new_symbols[i].7.clone(), new_id);
+            }
+        }
+    }
+
+    // Bulk insert new SCIP symbols via Parquet COPY FROM. `seen_ids` is now
+    // only a defensive backstop against a literal exact duplicate (the same
+    // definition occurrence observed twice) -- genuinely distinct same-named
+    // symbols are disambiguated above before reaching this point. On a COPY
+    // failure against an id that already exists in the graph, drop that one
+    // record and retry rather than falling back to UNWIND for the whole
+    // batch; only exhausting MAX_SYMBOL_RETRIES falls back.
     const CHUNK: usize = 2000;
     const MAX_SYMBOL_RETRIES: usize = 20;
     if !new_symbols.is_empty() {
@@ -1387,6 +1457,173 @@ mod tests {
             "a failed Symbol preload must propagate as an error, not silently \
              proceed with an empty file_name_to_ids map that makes every \
              existing symbol look new"
+        );
+    }
+
+    fn two_same_named_defs_doc(file: &str, a_sym: &str, b_sym: &str) -> Document {
+        Document {
+            relative_path: file.to_string(),
+            occurrences: vec![
+                Occurrence {
+                    range: vec![1, 0, 1, 3],
+                    symbol: a_sym.to_string(),
+                    symbol_roles: SymbolRole::Definition as i32,
+                    ..Default::default()
+                },
+                Occurrence {
+                    range: vec![10, 0, 10, 3],
+                    symbol: b_sym.to_string(),
+                    symbol_roles: SymbolRole::Definition as i32,
+                    ..Default::default()
+                },
+            ],
+            symbols: vec![
+                SymbolInformation {
+                    symbol: a_sym.to_string(),
+                    ..Default::default()
+                },
+                SymbolInformation {
+                    symbol: b_sym.to_string(),
+                    ..Default::default()
+                },
+            ],
+            ..Default::default()
+        }
+    }
+
+    /// Regression test: two brand-new SCIP symbols in the same file that
+    /// both extract to the same name via `scip_sym_to_name` (e.g. `A#foo()`
+    /// and `B#foo()` -- a realistic same-named-method-on-different-types
+    /// collision, no existing graph state at all) must both survive as
+    /// distinct Symbol rows, ordinal-disambiguated like entities.rs's
+    /// tree-sitter path -- not silently collapse into one via the
+    /// `.first()` enrichment fallback (they used to: confirmed
+    /// `symbols_added: 1, symbols_enriched: 1` and only one graph row before
+    /// this fix) or via the `seen_ids` bulk-insert dedup (confirmed
+    /// `symbols_added: 2` but still only one graph row, before the ordinal
+    /// disambiguation half of this fix).
+    #[test]
+    fn two_new_same_named_symbols_in_one_file_both_survive_with_distinct_ordinal_ids() {
+        let env = TestEnv::new();
+        let file = "test.ts";
+        let a_foo_sym = "scip-test npm test 1.0.0 `test.ts`/A#foo().".to_string();
+        let b_foo_sym = "scip-test npm test 1.0.0 `test.ts`/B#foo().".to_string();
+
+        let doc = two_same_named_defs_doc(file, &a_foo_sym, &b_foo_sym);
+        let index = Index {
+            documents: vec![doc],
+            ..Default::default()
+        };
+        let bytes = index.write_to_bytes().unwrap();
+        let index_path = env._dir.path().join("index.scip");
+        std::fs::write(&index_path, bytes).unwrap();
+
+        let stats = import_scip_index(&index_path, &env.store, None).unwrap();
+        assert_eq!(
+            stats.symbols_added, 2,
+            "both distinct symbols must be counted as added"
+        );
+        assert_eq!(
+            stats.symbols_enriched, 0,
+            "neither is an enrichment of the other"
+        );
+
+        let conn = env.store.connection().unwrap();
+        let rows = conn
+            .query("MATCH (s:Symbol) RETURN s.id, s.start_line ORDER BY s.start_line")
+            .unwrap();
+        let ids: Vec<(String, String)> = rows
+            .into_iter()
+            .map(|row| {
+                (
+                    row[0].to_string().trim_matches('"').to_string(),
+                    row[1].to_string(),
+                )
+            })
+            .collect();
+        assert_eq!(
+            ids,
+            vec![
+                ("test.ts::foo#1".to_string(), "1".to_string()),
+                ("test.ts::foo#2".to_string(), "10".to_string()),
+            ],
+            "both symbols must survive as distinct, ordinal-suffixed rows sorted by span position"
+        );
+    }
+
+    /// Regression test: a genuinely new same-named symbol introduced in an
+    /// import pass where TWO symbols under that (file, name) key already
+    /// exist in the graph (e.g. from a prior run's own ordinal
+    /// disambiguation) must get an ordinal-suffixed id continuing past the
+    /// existing count -- `#3`, not `#1` or `#2` (which would collide with
+    /// one of the pre-existing rows and hit a real duplicated-primary-key
+    /// COPY failure) and not the bare unsuffixed id either. With 2+
+    /// pre-existing candidates the `.first()` fallback correctly refuses to
+    /// guess (see its `c.len() == 1` guard), so this occurrence takes the
+    /// "new symbol" path, which is what needs the continued ordinal.
+    #[test]
+    fn new_symbol_colliding_with_two_preexisting_same_named_symbols_gets_next_ordinal() {
+        let env = TestEnv::new();
+        let conn = env.store.connection().unwrap();
+        conn.query(
+            "CREATE (:Symbol {id: 'test.ts::foo#1', name: 'foo', kind: 'method', \
+             file: 'test.ts', start_line: 1, end_line: 5, signature_hash: '', \
+             language: 'typescript', visibility: 'public', parent: '', \
+             docstring: '', complexity: 0, parameters: '', return_type: ''})",
+        )
+        .unwrap();
+        conn.query(
+            "CREATE (:Symbol {id: 'test.ts::foo#2', name: 'foo', kind: 'method', \
+             file: 'test.ts', start_line: 10, end_line: 15, signature_hash: '', \
+             language: 'typescript', visibility: 'public', parent: '', \
+             docstring: '', complexity: 0, parameters: '', return_type: ''})",
+        )
+        .unwrap();
+
+        let file = "test.ts";
+        let c_foo_sym = "scip-test npm test 1.0.0 `test.ts`/C#foo().".to_string();
+        let doc = Document {
+            relative_path: file.to_string(),
+            occurrences: vec![Occurrence {
+                range: vec![20, 0, 20, 3],
+                symbol: c_foo_sym.clone(),
+                symbol_roles: SymbolRole::Definition as i32,
+                ..Default::default()
+            }],
+            symbols: vec![SymbolInformation {
+                symbol: c_foo_sym.clone(),
+                ..Default::default()
+            }],
+            ..Default::default()
+        };
+        let index = Index {
+            documents: vec![doc],
+            ..Default::default()
+        };
+        let bytes = index.write_to_bytes().unwrap();
+        let index_path = env._dir.path().join("index.scip");
+        std::fs::write(&index_path, bytes).unwrap();
+
+        let stats = import_scip_index(&index_path, &env.store, None).unwrap();
+        assert_eq!(stats.symbols_added, 1);
+        assert_eq!(stats.symbols_enriched, 0);
+
+        let rows = conn
+            .query("MATCH (s:Symbol) RETURN s.id ORDER BY s.start_line")
+            .unwrap();
+        let ids: Vec<String> = rows
+            .into_iter()
+            .map(|row| row[0].to_string().trim_matches('"').to_string())
+            .collect();
+        assert_eq!(
+            ids,
+            vec![
+                "test.ts::foo#1".to_string(),
+                "test.ts::foo#2".to_string(),
+                "test.ts::foo#3".to_string(),
+            ],
+            "the new symbol must continue the ordinal sequence, not collide with either \
+             pre-existing row"
         );
     }
 }
