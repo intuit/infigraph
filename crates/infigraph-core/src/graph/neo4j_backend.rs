@@ -11,7 +11,7 @@ use crate::learned::LearnedStore;
 use crate::model::FileExtraction;
 use crate::resolve::ResolveStats;
 
-use super::backend::{CallsServiceEdge, GraphBackend};
+use super::backend::{CallsServiceEdge, GraphBackend, TaintFlowEdge};
 use super::{
     ApiSymbol, ArchitectureStats, BranchInfo, ComplexityRow, DeadCodeRow, FileDeps, FileHotspot,
     GraphStats, HubFunction, ImpactRow, KindCount, LanguageCount, ReferenceRow, SymbolDetail,
@@ -1856,6 +1856,39 @@ impl GraphBackend for Neo4jBackend {
             ),
         )
         .map_err(|e| anyhow::anyhow!("write_calls_service_edges failed: {e}"))?;
+        Ok(())
+    }
+
+    fn replace_taint_flows(&self, flows: &[TaintFlowEdge]) -> Result<()> {
+        let flow_maps: Vec<HashMap<&str, String>> = flows
+            .iter()
+            .map(|f| {
+                let mut m = HashMap::new();
+                m.insert("symbol_id", f.symbol_id.clone());
+                m.insert("source_kind", f.source_kind.clone());
+                m.insert("sink_kind", f.sink_kind.clone());
+                m.insert("path", f.path.clone());
+                m
+            })
+            .collect();
+        // Single statement: Neo4j auto-commits one Cypher statement
+        // atomically, so the delete and the recreates either all land or
+        // none do -- no driver-level transaction needed. Correct for an
+        // empty slice too: the DELETE still runs, and UNWIND over an empty
+        // list contributes zero rows to what follows it.
+        self.block_on(
+            self.graph.run(
+                query(
+                    "MATCH ()-[r:TAINT_FLOW]->() DELETE r \
+                     WITH 1 AS _cleared \
+                     UNWIND $flows AS m \
+                     MATCH (s:Symbol) WHERE s.id = m.symbol_id \
+                     CREATE (s)-[:TAINT_FLOW {source_kind: m.source_kind, sink_kind: m.sink_kind, path: m.path}]->(s)",
+                )
+                .param("flows", flow_maps),
+            ),
+        )
+        .map_err(|e| anyhow::anyhow!("replace_taint_flows failed: {e}"))?;
         Ok(())
     }
 

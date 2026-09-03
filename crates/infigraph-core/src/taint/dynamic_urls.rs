@@ -26,7 +26,7 @@ pub struct MatchedRoute {
     pub framework: String,
 }
 
-static HTTP_CLIENT_PATTERNS: &[(&str, &[&str])] = &[
+pub(super) static HTTP_CLIENT_PATTERNS: &[(&str, &[&str])] = &[
     ("fetch", &["fetch(", "fetch ("]),
     (
         "axios",
@@ -52,7 +52,7 @@ static HTTP_CLIENT_PATTERNS: &[(&str, &[&str])] = &[
     (
         "http_client",
         &[
-            "HttpClient(",
+            "httpclient(",
             "http.get(",
             "http.post(",
             "http.put(",
@@ -62,32 +62,32 @@ static HTTP_CLIENT_PATTERNS: &[(&str, &[&str])] = &[
     ("urllib", &["urllib.request.urlopen(", "urlopen("]),
     (
         "okhttp",
-        &["OkHttpClient(", ".newCall(", "Request.Builder()"],
+        &["okhttpclient(", ".newcall(", "request.builder()"],
     ),
     (
         "resttemplate",
         &[
-            "restTemplate.getForObject(",
-            "restTemplate.postForObject(",
-            "restTemplate.exchange(",
+            "resttemplate.getforobject(",
+            "resttemplate.postforobject(",
+            "resttemplate.exchange(",
         ],
     ),
     (
         "webclient",
-        &["WebClient.create(", "webClient.get()", "webClient.post()"],
+        &["webclient.create(", "webclient.get()", "webclient.post()"],
     ),
     (
         "httpclient_dotnet",
         &[
-            "HttpClient.GetAsync(",
-            "HttpClient.PostAsync(",
-            "HttpClient.SendAsync(",
+            "httpclient.getasync(",
+            "httpclient.postasync(",
+            "httpclient.sendasync(",
         ],
     ),
-    ("net_http", &["http.Get(", "http.Post(", "http.NewRequest("]),
+    ("net_http", &["http.get(", "http.post(", "http.newrequest("]),
     (
         "reqwest",
-        &["reqwest::get(", "reqwest::Client::new(", ".send().await"],
+        &["reqwest::get(", "reqwest::client::new(", ".send().await"],
     ),
 ];
 
@@ -230,7 +230,7 @@ fn find_urls_in_function(
         // Check for HTTP client calls
         for &(client, patterns) in HTTP_CLIENT_PATTERNS {
             for &pat in patterns {
-                if lower.contains(&pat.to_lowercase()) {
+                if lower.contains(pat) {
                     if let Some(url) = extract_url_from_line(trimmed, &string_vars) {
                         let template = url_to_template(&url);
                         let matched = match_route(&template, routes);
