@@ -7,7 +7,7 @@ use crate::learned::LearnedStore;
 use crate::model::FileExtraction;
 use crate::resolve::ResolveStats;
 
-use super::backend::{CallsServiceEdge, GraphBackend};
+use super::backend::{CallsServiceEdge, GraphBackend, TaintFlowEdge};
 use super::queries::GraphQuery;
 use super::store::GraphStore;
 use super::{
@@ -500,6 +500,38 @@ impl GraphBackend for KuzuBackend {
         }
         conn.query("COMMIT")
             .map_err(|e| anyhow::anyhow!("failed to commit CALLS_SERVICE edges: {e}"))?;
+        Ok(())
+    }
+
+    fn replace_taint_flows(&self, flows: &[TaintFlowEdge]) -> Result<()> {
+        // One held connection for the whole batch, same shape as
+        // `write_calls_service_edges` above. No early return on an empty
+        // slice: the clearing DELETE must still run so a clean pass drops
+        // the previous run's edges.
+        let conn = self.store.connection()?;
+        conn.query("BEGIN TRANSACTION")
+            .map_err(|e| anyhow::anyhow!("failed to begin transaction: {e}"))?;
+        if let Err(e) = conn.query("MATCH ()-[r:TAINT_FLOW]->() DELETE r") {
+            let _ = conn.query("ROLLBACK");
+            return Err(anyhow::anyhow!("failed to clear existing taint flows: {e}"));
+        }
+        for flow in flows {
+            let sym_esc = crate::escape_str(&flow.symbol_id);
+            let src_esc = crate::escape_str(&flow.source_kind);
+            let sink_esc = crate::escape_str(&flow.sink_kind);
+            let path_esc = crate::escape_str(&flow.path);
+            if let Err(e) = conn.query(&format!(
+                "MATCH (s:Symbol) WHERE s.id = '{sym_esc}' \
+                 CREATE (s)-[:TAINT_FLOW {{source_kind: '{src_esc}', sink_kind: '{sink_esc}', path: '{path_esc}'}}]->(s)"
+            )) {
+                // Roll back so we don't leave the graph with every previous
+                // flow deleted and only some of the new ones written.
+                let _ = conn.query("ROLLBACK");
+                return Err(anyhow::anyhow!("failed to create TAINT_FLOW edge: {e}"));
+            }
+        }
+        conn.query("COMMIT")
+            .map_err(|e| anyhow::anyhow!("failed to commit TAINT_FLOW edges: {e}"))?;
         Ok(())
     }
 
