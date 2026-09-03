@@ -51,9 +51,17 @@ impl std::fmt::Display for WatchEvent {
 
 /// Watch a project directory and auto-reindex on file changes.
 ///
-/// Opens a short-lived DB connection for each batch of changes rather than
-/// holding one open continuously. This avoids Kuzu file-lock conflicts on
-/// Windows where mandatory locking prevents concurrent DB connections.
+/// On non-Windows platforms, holds one DB connection open for the whole
+/// watch session and reuses it across batches — see `watch_db`. Reopening a
+/// fresh connection per batch was the original design, but each open/close
+/// cycle forces a full Kuzu checkpoint (`forceCheckpointOnClose`), and at
+/// sustained watch frequency (roughly once per second of active editing)
+/// that turns a long session into thousands of forced checkpoints, which was
+/// found to cause severe embedded-graph-file bloat over time (multi-GB
+/// write amplification per cycle at scale, independent of actual data
+/// growth). On Windows, mandatory file locking prevents a second concurrent
+/// connection while another handle on the same file is open elsewhere, so
+/// the original per-batch open/close behavior is kept there.
 ///
 /// Blocks until `stop_rx` receives a signal.
 pub fn watch_project<MR>(
@@ -120,6 +128,11 @@ where
     // then index them all at once using the bulk write path.
     let mut batch = ChangeBatch::new(1000);
 
+    // Shared DB connection for the watch session — see `watch_db`'s doc
+    // comment for the platform split (held open on non-Windows, reopened
+    // per call on Windows).
+    let mut held_prism: Option<Infigraph> = None;
+
     let sentinel = root.join(".infigraph").join("watch.stop");
 
     const MAX_RESTARTS: u32 = 3;
@@ -155,14 +168,17 @@ where
             && last_periodic.elapsed() >= Duration::from_secs(periodic_secs)
         {
             if let Some(ref cb) = on_periodic {
-                if let Ok(prism) = open_transient(root, &make_registry) {
+                if let Ok(prism) = watch_db(root, &make_registry, &mut held_prism) {
                     match prism.index() {
                         Ok(result) => {
                             if !result.extractions.is_empty() {
                                 cb(&result);
                             }
                         }
-                        Err(e) => eprintln!("[watch] periodic reindex failed: {e}"),
+                        Err(e) => {
+                            eprintln!("[watch] periodic reindex failed: {e}");
+                            poison_watch_db(&mut held_prism);
+                        }
                     }
                 }
             }
@@ -176,7 +192,7 @@ where
             let count = paths.len();
             eprintln!("[watch] batch indexing {count} files");
 
-            if let Ok(prism) = open_transient(root, &make_registry) {
+            if let Ok(prism) = watch_db(root, &make_registry, &mut held_prism) {
                 match prism.index_files(&paths) {
                     Ok(result) => {
                         changes_since_periodic += result.indexed_files;
@@ -194,7 +210,7 @@ where
                         }
 
                         for extraction in &result.extractions {
-                            let cross = has_cross_file_calls(&prism, &extraction.file);
+                            let cross = has_cross_file_calls(prism, &extraction.file);
                             let abs_path = root.join(&extraction.file);
                             on_event(WatchEvent {
                                 kind: WatchEventKind::Modified,
@@ -203,9 +219,14 @@ where
                             });
                         }
                     }
-                    Err(e) => eprintln!("[watch] batch reindex failed: {e}"),
+                    Err(e) => {
+                        eprintln!("[watch] batch reindex failed: {e}");
+                        poison_watch_db(&mut held_prism);
+                    }
                 }
-                // prism drops here, releasing the DB lock
+                // On non-Windows this connection stays open for reuse by the
+                // next batch; on Windows it's closed on the next `watch_db`
+                // call's reopen (or when the loop exits).
             }
         }
 
@@ -230,7 +251,7 @@ where
 
                     match watch_kind {
                         WatchEventKind::Removed => {
-                            if let Ok(prism) = open_transient(root, &make_registry) {
+                            if let Ok(prism) = watch_db(root, &make_registry, &mut held_prism) {
                                 let _ = prism.remove_file(&path);
                                 // Also remove files under this path (handles directory removal)
                                 let _ = prism.remove_files_by_prefix(&path);
@@ -426,6 +447,52 @@ where
     let mut prism = Infigraph::open(root, registry)?;
     prism.init()?;
     Ok(prism)
+}
+
+/// Acquires the watch session's shared DB connection, opening it if not
+/// already held. On non-Windows platforms this connection is reused across
+/// the whole watch session rather than reopened per batch/event — see
+/// `watch_project_with_periodic`'s doc comment for why that matters. If an
+/// operation on the returned connection fails, call `poison_watch_db` so the
+/// next call reopens fresh (e.g. after the on-disk database was replaced out
+/// from under a live connection, such as a concurrent `infigraph index
+/// --full` against a project this watcher is also watching).
+#[cfg(not(windows))]
+fn watch_db<'a, MR>(
+    root: &Path,
+    make_registry: &MR,
+    held: &'a mut Option<Infigraph>,
+) -> Result<&'a mut Infigraph>
+where
+    MR: Fn() -> Result<crate::lang::LanguageRegistry>,
+{
+    if held.is_none() {
+        *held = Some(open_transient(root, make_registry)?);
+    }
+    Ok(held.as_mut().unwrap())
+}
+
+/// Windows' mandatory file locking prevents a second concurrent connection
+/// while another handle on the same file is open elsewhere, so each call
+/// opens (and the previous one closes) fresh rather than holding one open
+/// across the whole session — see `open_transient`.
+#[cfg(windows)]
+fn watch_db<'a, MR>(
+    root: &Path,
+    make_registry: &MR,
+    held: &'a mut Option<Infigraph>,
+) -> Result<&'a mut Infigraph>
+where
+    MR: Fn() -> Result<crate::lang::LanguageRegistry>,
+{
+    *held = Some(open_transient(root, make_registry)?);
+    Ok(held.as_mut().unwrap())
+}
+
+/// Drops the watch session's shared DB connection so the next `watch_db`
+/// call reopens fresh. See `watch_db`'s doc comment for when to call this.
+fn poison_watch_db(held: &mut Option<Infigraph>) {
+    *held = None;
 }
 
 /// Returns the relative paths of files that have cross-file CALLS edges to/from the given file.
