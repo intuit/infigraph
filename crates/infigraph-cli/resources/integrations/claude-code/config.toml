@@ -1,0 +1,13 @@
+label = "Claude Code"
+
+[[artifact]]
+path = ".claude/CLAUDE.md"
+strategy = "marker_delimited"
+start = "<!-- infigraph-primary-search -->"
+end = "<!-- /infigraph-primary-search -->"
+content_file = "../shared/agents.md"
+
+[[artifact]]
+path = ".claude/skills/infigraph-reindex/SKILL.md"
+strategy = "overwrite"
+content_file = "../shared/skills/infigraph-reindex/SKILL.md"

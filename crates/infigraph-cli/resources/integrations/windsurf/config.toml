@@ -1,0 +1,6 @@
+label = "Windsurf"
+
+[[artifact]]
+path = ".windsurf/rules/infigraph.md"
+strategy = "overwrite"
+content_file = "../shared/agents.md"

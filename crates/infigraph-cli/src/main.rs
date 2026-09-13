@@ -1,7 +1,7 @@
 mod agent;
 mod analysis_commands;
+mod artifacts;
 mod commands;
-mod config_targets;
 mod git_commands;
 mod graph_commands;
 mod group_commands;

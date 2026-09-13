@@ -9,6 +9,7 @@ keywords = ["cli", "code-analysis", "impact-analysis", "developer-tools", "codeb
 categories = ["development-tools", "command-line-utilities"]
 readme.workspace = true
 description = "CLI for infigraph — AST-powered code analysis and impact review"
+build = "build.rs"
 
 [[bin]]
 name = "infigraph"
@@ -62,10 +63,8 @@ chrono = { version = "0.4", features = ["serde"] }
 cozo = { version = "0.7.6", features = ["storage-sqlite"] }
 kuzu = { package = "lbug", version = "= 0.16.0" }
 fs2 = "0.4"
+tempfile = "3"
+toml = "0.8"
 
 [target.'cfg(unix)'.dependencies]
 libc = "0.2"
-
-[dev-dependencies]
-tempfile = "3"
-toml = "0.8"

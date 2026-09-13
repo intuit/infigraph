@@ -1,0 +1,2 @@
+command = "{{mcp_path}}"
+args = ["--mcp"]
