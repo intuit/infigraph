@@ -100,12 +100,20 @@ The `infigraph` CLI binary (`crates/infigraph-cli/`) exposes `index-docs`, `rein
 
 ## File Discovery
 
-`DocIndex::collect_doc_files()` (`lib.rs:212-216`) calls `walk_doc_dir()` (`lib.rs:218-247`), a recursive `std::fs::read_dir` walker.
+`DocIndex::collect_doc_files()` (`lib.rs`) walks the project directory via
+the same shared `infigraph_core::ignore_rules` component code discovery
+uses (`crates/infigraph-core/src/ignore_rules.rs`).
 
 ### Ignored directories
 
-These directories are always skipped:
-`.infigraph`, `.git`, `node_modules`, `__pycache__`, `.venv`, `venv`, `target`, `build`, `dist`, `.tox`, plus any directory starting with `.`
+A fixed safety list is always excluded regardless of any ignore file:
+`.infigraph`, `.git`, `node_modules`, `__pycache__`, `.venv`, `venv`,
+`target`, `build`, `dist`, `.tox`, `vendor`, `.idea`, `.mypy_cache`,
+`coverage`, `.pytest_cache`.
+
+Beyond that, real `.gitignore` rules are honored (via the `ignore` crate),
+plus a custom `.infigraphignore` file recognized with the same syntax and
+directory-level semantics as `.gitignore`.
 
 ### Supported extensions
 
