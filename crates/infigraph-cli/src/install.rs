@@ -63,6 +63,12 @@ pub(crate) fn cmd_install() -> Result<()> {
         match target.format {
             ConfigFormat::Json => config_targets::install_json_target(&config_path, &mcp_path_str)?,
             ConfigFormat::Toml => config_targets::install_toml_target(&config_path, &mcp_path_str)?,
+            ConfigFormat::CopilotJson => {
+                config_targets::install_copilot_target(&config_path, &mcp_path_str)?
+            }
+            ConfigFormat::OpenCodeJson => {
+                config_targets::install_opencode_target(&config_path, &mcp_path_str)?
+            }
         }
 
         configured.push(target.label);
@@ -314,11 +320,14 @@ pub(crate) fn cmd_uninstall() -> Result<()> {
         };
 
         let result = match target.format {
-            ConfigFormat::Json => {
+            ConfigFormat::Json | ConfigFormat::CopilotJson => {
                 config_targets::uninstall_json_target(&config_path, target.label)?
             }
             ConfigFormat::Toml => {
                 config_targets::uninstall_toml_target(&config_path, target.label)?
+            }
+            ConfigFormat::OpenCodeJson => {
+                config_targets::uninstall_opencode_target(&config_path, target.label)?
             }
         };
 
