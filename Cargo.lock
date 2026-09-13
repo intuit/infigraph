@@ -2495,6 +2495,7 @@ dependencies = [
  "tree-sitter-dart",
  "tree-sitter-kotlin-ng",
  "tree-sitter-python",
+ "tree-sitter-rust",
  "ureq 2.12.1",
  "usearch",
 ]
