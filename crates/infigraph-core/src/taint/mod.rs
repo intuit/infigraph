@@ -180,7 +180,7 @@ fn analyze_function(
         // Check for taint sources
         for source in TAINT_SOURCES {
             for &pattern in source.patterns {
-                if lower.contains(&pattern.to_lowercase()) {
+                if lower.contains(pattern) {
                     if let Some(var) = extract_lhs(trimmed) {
                         tainted.insert(
                             var.clone(),
@@ -221,7 +221,7 @@ fn analyze_function(
                 // Check if RHS has a sanitizer — clears taint from LHS
                 for san in TAINT_SANITIZERS {
                     for &pat in san.patterns {
-                        if rhs_lower.contains(&pat.to_lowercase()) {
+                        if rhs_lower.contains(pat) {
                             tainted.remove(&lhs);
                         }
                     }
@@ -232,7 +232,7 @@ fn analyze_function(
         // Check for taint sinks
         for sink in TAINT_SINKS {
             for &pattern in sink.patterns {
-                if lower.contains(&pattern.to_lowercase()) {
+                if lower.contains(pattern) {
                     let sink_vars = extract_args_from_call(trimmed);
                     for svar in &sink_vars {
                         if let Some(info) = tainted.get(&svar.to_lowercase()).or_else(|| {
@@ -388,7 +388,7 @@ fn is_sanitized_nearby(lines: &[String], current_offset: usize, category: &str) 
         for line in &lines[start..end] {
             let lower = line.to_lowercase();
             for &pat in san.patterns {
-                if lower.contains(&pat.to_lowercase()) {
+                if lower.contains(pat) {
                     return true;
                 }
             }
@@ -408,7 +408,7 @@ fn find_sanitizer_name(lines: &[String], current_offset: usize, category: &str) 
         for line in &lines[start..end] {
             let lower = line.to_lowercase();
             for &pat in san.patterns {
-                if lower.contains(&pat.to_lowercase()) {
+                if lower.contains(pat) {
                     return Some(pat.to_string());
                 }
             }
@@ -418,25 +418,17 @@ fn find_sanitizer_name(lines: &[String], current_offset: usize, category: &str) 
 }
 
 fn write_taint_flows(backend: &dyn GraphBackend, flows: &[TaintFlow]) -> Result<()> {
-    let _ = backend.raw_query("MATCH ()-[r:TAINT_FLOW]->() DELETE r");
-
-    for flow in flows {
-        if flow.sanitized {
-            continue;
-        }
-        let sym_esc = crate::escape_str(&flow.symbol_id);
-        let src_esc = crate::escape_str(&flow.source_kind);
-        let sink_esc = crate::escape_str(&flow.sink_kind);
-        let path_str = flow.path.join(" -> ");
-        let path_esc = crate::escape_str(&path_str);
-
-        let _ = backend.raw_query(&format!(
-            "MATCH (s:Symbol) WHERE s.id = '{sym_esc}' \
-             CREATE (s)-[:TAINT_FLOW {{source_kind: '{src_esc}', sink_kind: '{sink_esc}', path: '{path_esc}'}}]->(s)"
-        ));
-    }
-
-    Ok(())
+    let edges: Vec<crate::graph::TaintFlowEdge> = flows
+        .iter()
+        .filter(|f| !f.sanitized)
+        .map(|f| crate::graph::TaintFlowEdge {
+            symbol_id: f.symbol_id.clone(),
+            source_kind: f.source_kind.clone(),
+            sink_kind: f.sink_kind.clone(),
+            path: f.path.join(" -> "),
+        })
+        .collect();
+    backend.replace_taint_flows(&edges)
 }
 
 pub fn format_taint_flows(flows: &[TaintFlow]) -> String {
@@ -502,6 +494,42 @@ pub fn format_taint_flows(flows: &[TaintFlow]) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Every taint pattern is matched with `lower.contains(pattern)` against an
+    /// already-lowercased line, so the patterns themselves must be stored
+    /// lowercase. They used to be lowercased at the point of comparison, which
+    /// allocated a `String` per pattern per line of every function in the graph
+    /// -- 202 patterns x every line, and the single largest cost of a reindex.
+    /// Lowercasing at the definition removes that, but makes an uppercase
+    /// pattern silently unmatchable, so the invariant is pinned here.
+    #[test]
+    fn every_taint_pattern_is_stored_lowercase() {
+        let mut offenders: Vec<String> = Vec::new();
+        let mut check = |label: &str, patterns: &[&str]| {
+            for p in patterns {
+                if **p != *p.to_lowercase() {
+                    offenders.push(format!("{label}: {p:?}"));
+                }
+            }
+        };
+        for src in sources::TAINT_SOURCES {
+            check(&format!("source {}", src.kind), src.patterns);
+        }
+        for sink in sinks::TAINT_SINKS {
+            check(&format!("sink {}", sink.kind), sink.patterns);
+        }
+        for san in sinks::TAINT_SANITIZERS {
+            check(&format!("sanitizer {}", san.category), san.patterns);
+        }
+        for (client, patterns) in dynamic_urls::HTTP_CLIENT_PATTERNS {
+            check(&format!("http client {client}"), patterns);
+        }
+        assert!(
+            offenders.is_empty(),
+            "these patterns are not lowercase and can never match:\n  {}",
+            offenders.join("\n  ")
+        );
+    }
 
     fn run_analysis(code: &str) -> Vec<TaintFlow> {
         let lines: Vec<String> = code.lines().map(String::from).collect();
