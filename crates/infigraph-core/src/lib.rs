@@ -39,7 +39,6 @@ use std::path::{Path, PathBuf};
 
 use anyhow::{Context, Result};
 use rayon::prelude::*;
-use sha2::{Digest, Sha256};
 
 use graph::GraphStore;
 use lang::LanguageRegistry;
@@ -306,11 +305,11 @@ impl Infigraph {
                     None => raw_rel.clone(),
                 };
                 let source = std::fs::read(path).ok()?;
-                let hash = {
-                    let mut h = Sha256::new();
-                    h.update(&source);
-                    format!("{:x}", h.finalize())
-                };
+                // Resolve the pack before hashing: the skip decision has to use the
+                // same fingerprint `extract_file` will store, and that covers the
+                // pack's extraction behavior as well as the file's bytes.
+                let pack = self.registry.for_file_with_content(&rel_path, &source)?;
+                let hash = pack.content_fingerprint(&source);
                 let n = done.fetch_add(1, std::sync::atomic::Ordering::Relaxed) + 1;
                 let pct = n * 100 / total;
                 let prev_pct = (n - 1) * 100 / total;
@@ -320,7 +319,6 @@ impl Infigraph {
                 if existing_hashes.get(&rel_path).map(|s| s.as_str()) == Some(hash.as_str()) {
                     return None;
                 }
-                let pack = self.registry.for_file_with_content(&rel_path, &source)?;
                 extract::extract_file(&rel_path, &source, pack).ok()
             })
             .collect();

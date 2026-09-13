@@ -279,10 +279,10 @@ If the Model2Vec model files are not found, the embedder automatically falls bac
 
 ## 8. Incremental Indexing
 
-Every indexed file has its SHA-256 content hash stored in the `Module` node (`content_hash` property). On subsequent `infigraph index` runs:
+Every indexed file has a SHA-256 fingerprint stored in the `Module` node (`content_hash` property). The fingerprint covers both halves of staleness: the file's bytes **and** the language pack that parsed it (its `entities.scm`/`relations.scm` sources, the grammar's structural identity, its custom edge definitions, and `EXTRACTOR_SCHEMA_VERSION`). Upgrading an extractor therefore re-extracts the files that extractor owns without a `--full` reindex, and without disturbing other languages. On subsequent `infigraph index` runs:
 
-1. All files are hashed (in parallel via rayon)
-2. Files whose hash matches the stored hash are skipped entirely — no re-parsing, no graph updates
+1. All files are fingerprinted (in parallel via rayon) via `LanguagePack::content_fingerprint`
+2. Files whose fingerprint matches the stored one are skipped entirely — no re-parsing, no graph updates
 3. Changed and new files are re-parsed and their nodes/edges are deleted and reinserted
 4. The cross-file call resolution pass only re-resolves calls from changed files, but reads the full symbol table from the graph (so cross-file edges from unchanged files are preserved)
 

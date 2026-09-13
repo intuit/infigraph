@@ -182,7 +182,7 @@ The core parsing function for a single file:
 4. Run `extract_relations` — executes `relations.scm` query against the AST
 5. Run `extract_statements_for_symbols` — extracts statement-level detail
 6. Generate route → handler CALLS edges via `generate_route_handler_edges`
-7. Compute SHA-256 `content_hash` of the file
+7. Compute the SHA-256 `content_hash` fingerprint over the file bytes plus the language pack's extractor fingerprint (`LanguagePack::content_fingerprint`)
 
 ### entities.scm — Symbol extraction
 
@@ -465,7 +465,7 @@ Old data for changed files is deleted via `DETACH DELETE` before re-inserting.
 
 ### File hash storage
 
-Content hashes are stored on `Module` nodes via the `content_hash` column. Retrieved by `get_file_hashes()` (`graph/cozo_store.rs:1405-1412`, `graph/store.rs:163-175`) for incremental indexing.
+Content fingerprints are stored on `Module` nodes via the `content_hash` column. Retrieved by `get_file_hashes()` (`graph/cozo_store.rs:1405-1412`, `graph/store.rs:163-175`) for incremental indexing.
 
 ---
 
@@ -474,10 +474,28 @@ Content hashes are stored on `Module` nodes via the `content_hash` column. Retri
 ### How it works
 
 1. Walk the directory tree, collect all source files
-2. Hash each file with SHA-256
-3. Load previously stored hashes via `get_file_hashes()`
-4. **Skip** files whose hash hasn't changed
+2. Fingerprint each file with `LanguagePack::content_fingerprint` — SHA-256 over the file's bytes **and** the pack's extractor fingerprint
+3. Load previously stored fingerprints via `get_file_hashes()`
+4. **Skip** files whose fingerprint hasn't changed
 5. Re-parse and re-extract only changed/new files
+
+### What invalidates a file's fingerprint
+
+Because the fingerprint folds in the language pack, a file becomes stale either when the user edits it or when Infigraph's own extraction for that language changes:
+
+| Change | Detected | How |
+|--------|----------|-----|
+| File edited | exact | file bytes |
+| `entities.scm` / `relations.scm` edited | exact | query sources hashed into the pack fingerprint |
+| Custom edge definitions changed | exact | edge name/capture pairs |
+| Grammar crate upgraded | heuristic | ABI version plus node-kind/field/parse-state counts — tree-sitter exposes no grammar version, so an upgrade that leaves all four counts unchanged is missed |
+| Runtime grammar-plugin (ANTLR) grammar, extractor source, or `plugin.toml` changed | exact | `plugin_fingerprint` hashes the plugin directory's inputs into the pack via `LanguagePack::with_fingerprint_part` |
+| Rust-side extraction logic changed (symbol-ID scheme, new derived edge, span convention) | **manual** | bump `EXTRACTOR_SCHEMA_VERSION` in `lang/mod.rs` |
+| Grammar-plugin built-in extractor changed inside the driver jar | **not detected** | the jar's contents are opaque; only the extractor's name is covered |
+
+The fingerprint is deliberately *per pack*, not global: a Java query fix re-extracts Java files and leaves Python and TypeScript cached. Mixing in the Infigraph crate version instead would make every release a full reindex.
+
+Two call sites produce a `content_hash` — the skip gate in `Infigraph::index_via_backend` and `extract_file` — and they must use the same formula, hence the single `content_fingerprint` function. If they ever diverge, nothing is skipped and every index silently becomes a full reindex; `test_incremental_index_skips_unchanged` (`tests/index_perf.rs`, `#[ignore]`d, run with `--ignored`) is the guard.
 6. Delete old symbols/edges for changed files via `DETACH DELETE`
 7. Insert new symbols/edges via Parquet COPY
 8. Delete symbols for files that no longer exist on disk (stale pruning)
