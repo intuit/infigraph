@@ -104,6 +104,25 @@ impl Neo4jBackend {
         self.run_void("CREATE INDEX symbol_file IF NOT EXISTS FOR (s:Symbol) ON (s.file)")?;
         self.run_void("CREATE INDEX symbol_name IF NOT EXISTS FOR (s:Symbol) ON (s.name)")?;
         self.run_void("CREATE INDEX file_repo IF NOT EXISTS FOR (f:File) ON (f.repo)")?;
+        // Statement had no constraint/index at all — every upsert_files_bulk
+        // MERGE (s:Statement {id: st.id}) was a full label scan across ALL
+        // existing Statement nodes, cost growing with total Statement count.
+        // Confirmed empirically (live SHOW TRANSACTIONS during a real
+        // TpsBridge index): a single 1000-row Statement batch took 5.5s+ and
+        // climbing once ~28,000 Statement nodes existed, which is the actual
+        // root cause of "group build" taking 15+ minutes on repos with many
+        // statements instead of the few seconds Kuzu (PRIMARY KEY-indexed by
+        // construction) takes on the same input.
+        self.run_void(
+            "CREATE CONSTRAINT statement_id IF NOT EXISTS FOR (s:Statement) REQUIRE s.id IS UNIQUE",
+        )?;
+        // ExternalRef has the same MERGE-by-id shape (see resolve_calls's new
+        // EXTERNAL_CALL write) — index it too so it doesn't repeat this bug
+        // once repos with many unresolved receiver-qualified calls hit remote
+        // mode at volume.
+        self.run_void(
+            "CREATE CONSTRAINT external_ref_id IF NOT EXISTS FOR (e:ExternalRef) REQUIRE e.id IS UNIQUE",
+        )?;
         Ok(())
     }
 
@@ -1920,52 +1939,20 @@ impl GraphBackend for Neo4jBackend {
             ));
         }
 
-        let mut resolved = 0usize;
-        let mut unresolved = 0usize;
-        let mut total_dangling = 0usize;
-        let mut pairs: Vec<(String, String)> = Vec::new();
-
-        for ext in extractions {
-            let local_symbols: HashMap<&str, &str> = ext
-                .symbols
-                .iter()
-                .map(|s| (s.name.as_str(), s.id.as_str()))
-                .collect();
-
-            for rel in &ext.relations {
-                if rel.kind != crate::model::RelationKind::Calls {
-                    continue;
-                }
-                let target_name = rel.target_id.rsplit("::").next().unwrap_or(&rel.target_id);
-                if local_symbols.contains_key(target_name) {
-                    continue;
-                }
-                total_dangling += 1;
-
-                if let Some(candidates) = symbol_map.get(target_name) {
-                    let cross_file: Vec<_> = candidates
-                        .iter()
-                        .filter(|(_, f, _)| *f != ext.file)
-                        .collect();
-                    if cross_file.len() == 1 {
-                        pairs.push((rel.source_id.clone(), cross_file[0].0.clone()));
-                        resolved += 1;
-                    } else if cross_file.len() > 1 {
-                        // Pick shortest ID as tiebreaker
-                        if let Some(best) = cross_file.iter().min_by_key(|(id, _, _)| id.len()) {
-                            pairs.push((rel.source_id.clone(), best.0.clone()));
-                            resolved += 1;
-                        } else {
-                            unresolved += 1;
-                        }
-                    } else {
-                        unresolved += 1;
-                    }
-                } else {
-                    unresolved += 1;
-                }
-            }
-        }
+        // Shared decision loop with KuzuBackend — see
+        // resolve/calls.rs::resolve_pairs. Neo4j only supplies its own
+        // (network-sourced) symbol_map and does its own Cypher write; the
+        // disambiguation strategies, same-class fast path, and bare-source-id
+        // reconciliation live in exactly one place now, not two hand-synced
+        // copies.
+        let crate::resolve::ResolvedCalls {
+            pairs,
+            external_calls,
+            stats,
+        } = crate::resolve::resolve_pairs(extractions, &symbol_map, None);
+        let resolved = stats.resolved;
+        let unresolved = stats.unresolved;
+        let total_dangling = stats.total_calls;
 
         // Batch insert CALLS edges
         for chunk in pairs.chunks(BATCH_SIZE) {
@@ -1984,6 +1971,40 @@ impl GraphBackend for Neo4jBackend {
                         "UNWIND $batch AS p \
                      MATCH (a:Symbol {id: p.src}), (b:Symbol {id: p.tgt}) \
                      MERGE (a)-[:CALLS]->(b)",
+                    )
+                    .param("batch", batch),
+                ),
+            );
+        }
+
+        // Batch insert ExternalRef nodes + EXTERNAL_CALL edges — mirrors
+        // resolve/calls.rs::write_external_calls's MERGE shape exactly
+        // (same "{receiver}::{method}" ref_id key, same qualifier/method
+        // properties) so downstream readers (e.g.
+        // multi/namespace_link.rs::link_cross_repo_namespace_calls) don't
+        // need to special-case which backend produced the data.
+        for chunk in external_calls.chunks(BATCH_SIZE) {
+            let batch: Vec<HashMap<String, String>> = chunk
+                .iter()
+                .map(|(caller, receiver, method)| {
+                    let ref_id = format!("{}::{}", receiver, method);
+                    let mut m = HashMap::new();
+                    m.insert("caller".into(), caller.clone());
+                    m.insert("ref_id".into(), ref_id);
+                    m.insert("qualifier".into(), receiver.clone());
+                    m.insert("method".into(), method.clone());
+                    m
+                })
+                .collect();
+            let _ = self.block_on(
+                self.graph.run(
+                    query(
+                        "UNWIND $batch AS r \
+                         MERGE (e:ExternalRef {id: r.ref_id}) \
+                         ON CREATE SET e.qualifier = r.qualifier, e.method = r.method \
+                         WITH r, e \
+                         MATCH (a:Symbol {id: r.caller}) \
+                         MERGE (a)-[:EXTERNAL_CALL]->(e)",
                     )
                     .param("batch", batch),
                 ),

@@ -276,6 +276,140 @@ fn test_group_build_links_cross_service_call_neo4j_postgres() {
     std::env::remove_var("INFIGRAPH_BACKEND");
 }
 
+// C++ namespace-qualified static-lib fixtures for the remote namespace-link
+// test below (TpsBridge/tto-engine's real shape).
+const TPS_BRIDGE_FORMML_CPP: &str = r#"
+namespace tps
+{
+    void SetFormML(int entity, const char* formML)
+    {
+        DoWork(entity, formML);
+    }
+}
+"#;
+
+const TTO_ENGINE_TAX_RETURN_SERVICE_CPP: &str = r#"
+void SetFormMLHandler(int entity, const char* formML) {
+    tps::SetFormML(entity, formML);
+}
+"#;
+
+/// Remote-mode C++ namespace-qualified cross-repo link (`link_cross_repo_namespace_calls`
+/// via `link_cross_repo_namespace_calls_for_group`) against live Neo4j + Postgres.
+///
+/// tps-bridge (producer) defines `tps::SetFormML`; tto-engine (consumer) calls it
+/// with no local definition — the same TpsBridge/tto-engine pair the feature's
+/// own commit message names. On the SHARED Neo4j graph, every repo's `Infigraph`
+/// handle is the SAME connection (`Neo4jBackend::connect_from_env()` reads only
+/// global env vars, no per-repo parameter) — so without positive namespace
+/// scoping on both (a) the caller's own EXTERNAL_CALL scan and (b) each
+/// sibling's qualified-suffix scan, tps-bridge's own repo would spuriously
+/// "match itself" during its own EXTERNAL_CALL scan (bug 1) and/or the
+/// suffix-match query would return hits from every repo in the shared
+/// instance, not just the intended sibling (bug 2) — either way tripping the
+/// "0 or 2+ matches, don't guess" guard and silently producing ZERO edges
+/// where local (separate-Kuzu-per-repo) mode produces exactly one. This test
+/// asserts the fixed, correct behavior: exactly one CALLS_SERVICE{protocol:
+/// 'static_lib'} edge, matching local mode's `namespace_link.rs` unit tests.
+///
+/// `#[ignore]`: needs live containers (see module header). Run with
+/// `--ignored --test-threads=1` alongside the other remote tests.
+#[test]
+#[ignore]
+fn test_group_build_links_namespace_cross_repo_call_neo4j_postgres() {
+    let group_name = "remote-namespace-xsvc-test-group";
+
+    std::env::set_var("INFIGRAPH_BACKEND", "neo4j");
+
+    let pg = connect_pg();
+    clean_pg(&pg);
+    let neo = connect_neo4j();
+    neo.raw_query("MATCH (n) DETACH DELETE n")
+        .expect("clear neo4j graph before test");
+
+    let producer_dir = make_repo(&[(
+        "Src/High/HAPI/FormML/zhaSetFormML.cpp",
+        TPS_BRIDGE_FORMML_CPP,
+    )]);
+    let consumer_dir = make_repo(&[(
+        "Src/TaxApp/Server/grpc/service/TaxReturnService.cpp",
+        TTO_ENGINE_TAX_RETURN_SERVICE_CPP,
+    )]);
+
+    pg.upsert_repo("tps-bridge", &repo_entry("tps-bridge", producer_dir.path()))
+        .expect("seed tps-bridge repo");
+    pg.upsert_repo("tto-engine", &repo_entry("tto-engine", consumer_dir.path()))
+        .expect("seed tto-engine repo");
+    pg.create_group(group_name).expect("create group");
+    pg.group_add(group_name, "tps-bridge")
+        .expect("add tps-bridge to group");
+    pg.group_add(group_name, "tto-engine")
+        .expect("add tto-engine to group");
+
+    let mut registry =
+        Registry::load().expect("load registry via Postgres (INFIGRAPH_BACKEND=neo4j)");
+    assert!(
+        registry.groups.contains_key(group_name),
+        "seeded namespace-link group should round-trip through Postgres"
+    );
+
+    let index_results = multi::index_group(
+        &mut registry,
+        group_name,
+        true,
+        infigraph_languages::bundled_registry,
+    )
+    .expect("index_group should succeed against live Neo4j");
+    assert_eq!(index_results.len(), 2, "both repos should have indexed");
+
+    // The actual regression target: link_cross_repo_namespace_calls_for_group,
+    // called as group build's Step 3b in production (group_commands.rs /
+    // tools/groups.rs), right after link_cross_service_calls.
+    let linked = multi::namespace_link::link_cross_repo_namespace_calls_for_group(
+        &registry,
+        group_name,
+        infigraph_languages::bundled_registry,
+    )
+    .expect("link_cross_repo_namespace_calls_for_group should succeed against live Neo4j");
+    assert_eq!(
+        linked, 1,
+        "expected exactly one cross-repo namespace-qualified CALLS_SERVICE edge \
+         (tto-engine -> tps-bridge's tps::SetFormML) on the SHARED Neo4j graph; \
+         a count of 0 here is the exact bug this test regresses on — see module \
+         doc comment"
+    );
+
+    // The real regression assertion: a CALLS_SERVICE{protocol:'static_lib'}
+    // edge from a tto-engine caller into tps-bridge's tps::SetFormML, correctly
+    // scoped to exactly one edge despite both repos sharing one Neo4j instance.
+    let rows = neo
+        .raw_query(
+            "MATCH (caller:Symbol)-[r:CALLS_SERVICE]->(target:Symbol) \
+             WHERE r.protocol = 'static_lib' AND r.qualifier = 'tps' \
+             RETURN caller.id, target.id, r.qualifier",
+        )
+        .expect("query for namespace-qualified CALLS_SERVICE edge into tps-bridge");
+    assert_eq!(
+        rows.len(),
+        1,
+        "expected exactly one CALLS_SERVICE{{protocol:'static_lib'}} edge \
+         (not zero — the bug; not more than one — a scoping fix that's too \
+         narrow could instead double-count across repos). Rows: {:?}",
+        rows
+    );
+    assert!(
+        rows[0][1].ends_with("tps::SetFormML"),
+        "target should be tps-bridge's tps::SetFormML symbol, got: {}",
+        rows[0][1]
+    );
+
+    // Cleanup.
+    neo.raw_query("MATCH (n) DETACH DELETE n")
+        .expect("clear neo4j graph after test");
+    clean_pg(&pg);
+    std::env::remove_var("INFIGRAPH_BACKEND");
+}
+
 // gRPC producer/consumer fixtures for the remote gRPC test (AIF3X-331 #35).
 const USER_SERVICE_PROTO: &str = "syntax = \"proto3\";\nservice UserService {\n  rpc GetUser (GetUserRequest) returns (User);\n}\n";
 

@@ -28,11 +28,11 @@ use crate::Infigraph;
 /// into the caller's own graph and pointing `CALLS_SERVICE` at that proxy
 /// instead of the producer's real node.
 pub fn link_cross_repo_namespace_calls(
-    group_backends: &[(&str, &dyn GraphBackend)],
+    group_backends: &[(&str, &dyn GraphBackend, Option<&str>)],
 ) -> Result<usize> {
     let mut linked = 0usize;
 
-    for (caller_name, caller_backend) in group_backends {
+    for (caller_name, caller_backend, caller_ns) in group_backends {
         // Find calls whose receiver is a plausible C++ namespace qualifier
         // and whose target symbol doesn't exist in this repo's own graph.
         // relations.scm already tags these with the qualifier text as the
@@ -45,10 +45,21 @@ pub fn link_cross_repo_namespace_calls(
         // MERGE key, "{receiver}::{method}") and carry `qualifier`/`method`
         // properties set via `ON CREATE SET e.qualifier = ..., e.method = ...`
         // — matching the property names used below.
-        let unresolved = caller_backend.raw_query(
+        //
+        // In remote mode, group_backends' handles all point at the SAME
+        // Neo4j instance (Neo4jBackend::connect_from_env reads only global
+        // env vars, no per-repo connection) — unlike local mode, where each
+        // handle is genuinely a separate Kuzu database. Scope this repo's own
+        // scan to its own namespace or every repo's EXTERNAL_CALL rows leak
+        // into every other repo's "unresolved" set.
+        let caller_ns_clause = caller_ns
+            .map(|n| format!(" AND a.id STARTS WITH '{}/'", crate::escape_str(n)))
+            .unwrap_or_default();
+        let unresolved = caller_backend.raw_query(&format!(
             "MATCH (a:Symbol)-[:EXTERNAL_CALL]->(e:ExternalRef) \
-             RETURN a.id, e.qualifier, e.method",
-        )?;
+             WHERE true{caller_ns_clause} \
+             RETURN a.id, e.qualifier, e.method"
+        ))?;
 
         for row in &unresolved {
             if row.len() < 3 {
@@ -70,12 +81,27 @@ pub fn link_cross_repo_namespace_calls(
             let qualified_suffix = format!("::{qualifier}::{method}");
             let mut matches: Vec<(&str, String)> = Vec::new();
 
-            for (repo_name, repo_backend) in group_backends {
+            for (repo_name, repo_backend, repo_ns) in group_backends {
                 if repo_name == caller_name {
                     continue;
                 }
+                // `s.id ENDS WITH qualified_suffix` only anchors the tail — in
+                // remote mode s.id is itself namespaced ({org}/{repo}/{path}::
+                // {symbol}), so without a positive scope on THIS sibling's
+                // namespace, the suffix match hits every repo in the shared
+                // Neo4j instance, not just this one. The `repo_name ==
+                // caller_name` check above is a no-op against that: it only
+                // skips this Rust-side loop iteration, it does not stop this
+                // query from also matching the caller's own symbols when
+                // repo_backend is the same shared connection as
+                // caller_backend. Scope positively (not just exclude the
+                // caller) so this sibling's query only ever returns ITS OWN
+                // symbols.
+                let repo_ns_clause = repo_ns
+                    .map(|n| format!(" AND s.id STARTS WITH '{}/'", crate::escape_str(n)))
+                    .unwrap_or_default();
                 let query = format!(
-                    "MATCH (s:Symbol) WHERE s.id ENDS WITH '{}' RETURN s.id",
+                    "MATCH (s:Symbol) WHERE s.id ENDS WITH '{}'{repo_ns_clause} RETURN s.id",
                     qualified_suffix.replace('\'', "\\'")
                 );
                 let hits = repo_backend.raw_query(&query).unwrap_or_default();
@@ -174,7 +200,7 @@ pub fn link_cross_repo_namespace_calls_for_group(
         .get(group_name)
         .ok_or_else(|| anyhow::anyhow!("group '{group_name}' not found"))?;
 
-    let mut opened: Vec<(String, Infigraph)> = Vec::new();
+    let mut opened: Vec<(String, Infigraph, Option<String>)> = Vec::new();
     for repo_name in &group.repos {
         let entry = match registry.repos.get(repo_name) {
             Some(e) => e,
@@ -182,12 +208,17 @@ pub fn link_cross_repo_namespace_calls_for_group(
         };
         let mut prism = Infigraph::open(&entry.path, build_registry()?)?;
         prism.init()?;
-        opened.push((repo_name.clone(), prism));
+        // None in local mode (each `prism` is a genuinely separate Kuzu
+        // database, no scoping needed); Some("{org}/{repo}") in remote mode,
+        // matching the org/repo prefix `index_group` stamps onto s.id/s.file
+        // on the shared Neo4j instance.
+        let ns = crate::multi::remote_namespace(&group.org, repo_name);
+        opened.push((repo_name.clone(), prism, ns));
     }
 
-    let refs: Vec<(&str, &dyn GraphBackend)> = opened
+    let refs: Vec<(&str, &dyn GraphBackend, Option<&str>)> = opened
         .iter()
-        .filter_map(|(name, prism)| prism.backend().map(|b| (name.as_str(), b)))
+        .filter_map(|(name, prism, ns)| prism.backend().map(|b| (name.as_str(), b, ns.as_deref())))
         .collect();
 
     link_cross_repo_namespace_calls(&refs)

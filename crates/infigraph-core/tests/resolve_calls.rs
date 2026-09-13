@@ -646,6 +646,108 @@ fn test_resolve_relative_import_with_name_collision() {
 }
 
 #[test]
+fn test_resolve_same_file_bare_name_collision_prefers_own_class_method() {
+    // Regression for the noise-floor investigation: a file with both a free
+    // function and a same-named method (e.g. a static helper `helper()` next
+    // to `Widget::helper`) used to collapse into one HashMap slot keyed by
+    // bare name, so which one an unqualified same-file call resolved to
+    // depended on extraction/insertion order — non-deterministic across
+    // otherwise-identical runs. A call from inside Widget's own method must
+    // resolve to Widget::helper (class member shadows the free function);
+    // a call from an unrelated free function must resolve to the free
+    // function, since it has no enclosing class to be shadowed by.
+    let extractions = vec![FileExtraction {
+        file: "widget.py".to_string(),
+        language: "python".to_string(),
+        content_hash: "a".to_string(),
+        symbols: vec![
+            sym(
+                "widget.py::helper",
+                "helper",
+                SymbolKind::Function,
+                "widget.py",
+                1,
+                3,
+            ),
+            sym(
+                "widget.py::Widget",
+                "Widget",
+                SymbolKind::Class,
+                "widget.py",
+                5,
+                12,
+            ),
+            sym(
+                "widget.py::Widget::helper",
+                "helper",
+                SymbolKind::Method,
+                "widget.py",
+                6,
+                8,
+            ),
+            sym(
+                "widget.py::Widget::render",
+                "render",
+                SymbolKind::Method,
+                "widget.py",
+                9,
+                11,
+            ),
+            sym(
+                "widget.py::standalone",
+                "standalone",
+                SymbolKind::Function,
+                "widget.py",
+                13,
+                15,
+            ),
+        ],
+        relations: vec![
+            // Widget::render() calls helper() unqualified — must resolve to
+            // its own sibling Widget::helper, not the free function. Source
+            // is bare ("widget.py::render", no class segment), matching what
+            // find_enclosing_function actually emits (see the comment on the
+            // fast path in resolve/calls.rs) — this is the path the fix
+            // governs; a fully-qualified source_id's target is whatever the
+            // initial bulk write chose and this pass never rewrites it.
+            call_with_receiver("widget.py::render", "widget.py::helper", "self"),
+            // standalone() calls helper() unqualified — has no enclosing
+            // class, so must resolve to the free function. Source is already
+            // correctly bare-and-unqualified (standalone has no class), so
+            // this exercises the "no caller class" branch of the same path.
+            call("widget.py::standalone", "widget.py::helper"),
+        ],
+        statements: vec![],
+    }];
+
+    let env = TestEnv::new(&extractions);
+    let stats = resolve::resolve_calls(&env.store, &extractions, None).unwrap();
+    assert_eq!(
+        stats.unresolved, 0,
+        "both calls should resolve, got stats: {stats:?}"
+    );
+
+    let conn = env.store.connection().unwrap();
+    let q = infigraph_core::graph::GraphQuery::new(&conn);
+
+    let render_callees = q.callees_of("widget.py::Widget::render").unwrap();
+    assert_eq!(
+        render_callees,
+        vec!["widget.py::Widget::helper".to_string()],
+        "self-call inside Widget::render should resolve to the sibling method, got: {:?}",
+        render_callees
+    );
+
+    let standalone_callees = q.callees_of("widget.py::standalone").unwrap();
+    assert_eq!(
+        standalone_callees,
+        vec!["widget.py::helper".to_string()],
+        "call from a free function should resolve to the free function, got: {:?}",
+        standalone_callees
+    );
+}
+
+#[test]
 fn test_resolve_unresolvable_builtin() {
     let extractions = vec![FileExtraction {
         file: "main.py".to_string(),
