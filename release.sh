@@ -23,6 +23,17 @@ fi
 SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
 cd "$SCRIPT_DIR"
 
+# Guard: the tag must match the workspace version, or the binaries built
+# below will report a version (via clap's `version` from CARGO_PKG_VERSION)
+# that disagrees with the release tag they're uploaded under.
+CARGO_VERSION="$(grep -m1 '^version = ' Cargo.toml | sed -E 's/version = "(.*)"/\1/')"
+TAG_VERSION="${VERSION#v}"
+if [ "$TAG_VERSION" != "$CARGO_VERSION" ]; then
+  echo "Error: release tag ${VERSION} does not match [workspace.package].version ${CARGO_VERSION} in Cargo.toml."
+  echo "Bump the workspace version to ${TAG_VERSION}, or run: $0 v${CARGO_VERSION}"
+  exit 1
+fi
+
 # Detect current platform
 OS="$(uname -s)"
 
