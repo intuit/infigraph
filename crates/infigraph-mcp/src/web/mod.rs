@@ -106,8 +106,14 @@ use handlers_git::api_git_summary;
 use handlers_symbol::*;
 
 /// Start the web UI server on the given port. Runs in a background thread.
+///
+/// Binds to loopback (`127.0.0.1`) by default so the unauthenticated Web UI/API
+/// (including `/api/query`, which runs raw Cypher) is not reachable from other
+/// hosts on the network. Set `INFIGRAPH_UI_BIND` to override the bind address
+/// (e.g. `0.0.0.0`) when intentionally exposing the UI.
 pub fn start_ui_server(port: u16) -> bool {
-    let addr = format!("0.0.0.0:{}", port);
+    let host = std::env::var("INFIGRAPH_UI_BIND").unwrap_or_else(|_| "127.0.0.1".to_string());
+    let addr = format!("{}:{}", host, port);
     // Pre-check: try binding before spawning thread so caller knows outcome
     let server = match Server::http(&addr) {
         Ok(s) => s,
@@ -879,6 +885,29 @@ mod tests {
         let (status, body) = http_get(port, "/webhook/status");
         assert_eq!(status, 200);
         assert!(body.contains("reindexing"), "body: {}", body);
+    }
+
+    #[test]
+    fn test_ui_server_binds_loopback_not_wildcard_by_default() {
+        let _guard = TEST_LOCK.lock().unwrap();
+        unsafe {
+            std::env::remove_var("INFIGRAPH_UI_BIND");
+        }
+        let port = free_port();
+        assert!(start_ui_server(port), "UI server should start on loopback");
+        thread::sleep(std::time::Duration::from_millis(100));
+
+        // Reachable on loopback...
+        let (status, _) = http_get(port, "/api/health");
+        assert_eq!(status, 200, "UI should be reachable on 127.0.0.1");
+
+        // ...but the wildcard address must still be free, proving the UI server
+        // did NOT bind 0.0.0.0 (all interfaces). If it had, this bind would fail
+        // with AddrInUse — which is exactly the ADV-2598 exposure.
+        assert!(
+            TcpListener::bind(format!("0.0.0.0:{}", port)).is_ok(),
+            "UI server must not bind 0.0.0.0 by default (ADV-2598)"
+        );
     }
 
     #[test]
