@@ -399,8 +399,10 @@ pub fn load_embeddings(path: &Path) -> Result<Vec<(String, Vec<f32>)>> {
         let float_bytes = dim * 4;
         anyhow::ensure!(pos + float_bytes <= data.len(), "truncated embeddings file");
         let vec: Vec<f32> = data[pos..pos + float_bytes]
-            .chunks_exact(4)
-            .map(|chunk| f32::from_le_bytes(chunk.try_into().unwrap()))
+            .as_chunks::<4>()
+            .0
+            .iter()
+            .map(|chunk| f32::from_le_bytes(*chunk))
             .collect();
         pos += float_bytes;
         result.push((id, vec));

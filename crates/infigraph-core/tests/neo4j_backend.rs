@@ -35,6 +35,7 @@ fn sym(id: &str, name: &str, kind: SymbolKind, file: &str, start: u32, end: u32)
         complexity: 1,
         parameters: None,
         return_type: None,
+        scip_id: None,
     }
 }
 

@@ -18,6 +18,7 @@ fn make_extraction(file: &str) -> FileExtraction {
         language: "python".to_string(),
         content_hash: format!("hash_{file}"),
         symbols: vec![Symbol {
+            scip_id: None,
             id: format!("{file}::func"),
             name: "func".to_string(),
             kind: SymbolKind::Function,
