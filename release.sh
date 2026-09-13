@@ -23,6 +23,18 @@ fi
 SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
 cd "$SCRIPT_DIR"
 
+# Guard against releasing a binary whose baked-in CARGO_PKG_VERSION doesn't
+# match the release tag. Cutting a release with a stale workspace version
+# ships a binary that reports the wrong `infigraph --version` (see #49) --
+# fail loudly here instead of silently uploading a mismatched build.
+VERSION_NUM="${VERSION#v}"
+CARGO_VERSION="$(awk -F'"' '/^\[workspace\.package\]/{f=1} f && /^version[[:space:]]*=/{print $2; exit}' Cargo.toml)"
+if [ "$CARGO_VERSION" != "$VERSION_NUM" ]; then
+  echo "error: release tag is ${VERSION} (${VERSION_NUM}) but Cargo.toml [workspace.package] version is ${CARGO_VERSION}."
+  echo "Bump the workspace version in Cargo.toml to ${VERSION_NUM} and commit it before releasing."
+  exit 1
+fi
+
 # Detect current platform
 OS="$(uname -s)"
 
