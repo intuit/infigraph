@@ -18,7 +18,7 @@ anyhow.workspace = true
 thiserror.workspace = true
 # lbug is a maintained fork of Kuzu (columnar embedded graph DB), published to crates.io.
 # Aliased as `kuzu` to match the upstream Kuzu API surface used throughout the codebase.
-kuzu = { package = "lbug", version = "= 0.16.0" }
+kuzu = { package = "lbug", version = "= 0.19.1" }
 cozo = { version = "0.7.6", features = ["storage-sqlite"] }
 rayon = "1"
 sha2 = "0.10"
