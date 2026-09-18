@@ -689,6 +689,7 @@ impl CozoStore {
             "parameters".into(),
             "return_type".into(),
             "category".into(),
+            "scip_id".into(),
         ];
         let data_rows: Vec<Vec<DataValue>> = rows
             .iter()
@@ -709,6 +710,7 @@ impl CozoStore {
                     DataValue::Str(r.12.clone().into()),
                     DataValue::Str(r.13.clone().into()),
                     DataValue::Str("impl".into()),
+                    DataValue::Str("".into()),
                 ]
             })
             .collect();
@@ -1699,7 +1701,7 @@ pub fn cozo_schema_ddl() -> Vec<&'static str> {
 }
 
 const COZO_SCHEMA: &[&str] = &[
-    ":create symbol {id: String => name: String, kind: String, file: String, start_line: Int, end_line: Int, signature_hash: String default \"\", language: String default \"\", visibility: String default \"\", parent: String default \"\", docstring: String default \"\", complexity: Int default 1, parameters: String default \"\", return_type: String default \"\", category: String default \"impl\"}",
+    ":create symbol {id: String => name: String, kind: String, file: String, start_line: Int, end_line: Int, signature_hash: String default \"\", language: String default \"\", visibility: String default \"\", parent: String default \"\", docstring: String default \"\", complexity: Int default 1, parameters: String default \"\", return_type: String default \"\", category: String default \"impl\", scip_id: String default \"\"}",
     ":create module {id: String => name: String, file: String, language: String, content_hash: String default \"\", summary: String default \"\"}",
     ":create cluster {id: String => name: String, description: String default \"\"}",
     ":create file {id: String => name: String, path: String, language: String, symbol_count: Int default 0}",

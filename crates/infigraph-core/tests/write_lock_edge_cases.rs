@@ -203,6 +203,7 @@ fn test_write_during_read_query() {
         language: "python".to_string(),
         content_hash: "h".to_string(),
         symbols: vec![Symbol {
+            scip_id: None,
             id: "seed::f".to_string(),
             name: "f".to_string(),
             kind: SymbolKind::Function,
@@ -243,6 +244,7 @@ fn test_write_during_read_query() {
                 language: "python".to_string(),
                 content_hash: format!("h{i}"),
                 symbols: vec![Symbol {
+                    scip_id: None,
                     id: format!("w{i}::g"),
                     name: "g".to_string(),
                     kind: SymbolKind::Function,

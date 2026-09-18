@@ -13,6 +13,7 @@ fn span(file: &str, start: u32, end: u32) -> Span {
 
 fn sym(id: &str, name: &str, kind: SymbolKind, file: &str, start: u32, end: u32) -> Symbol {
     Symbol {
+        scip_id: None,
         id: id.to_string(),
         name: name.to_string(),
         kind,
@@ -38,6 +39,7 @@ fn sym_complex(
     complexity: u32,
 ) -> Symbol {
     Symbol {
+        scip_id: None,
         id: id.to_string(),
         name: name.to_string(),
         kind,

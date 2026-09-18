@@ -5,10 +5,135 @@ pub use relations::{extract_relations, extract_relations_with_custom_edges};
 
 use anyhow::Result;
 use sha2::{Digest, Sha256};
+use tree_sitter::{Node, Query, QueryCursor, StreamingIterator};
 
 use crate::analysis::extract_statements;
 use crate::lang::{LanguagePack, ParserBackend};
 use crate::model::{FileExtraction, Relation, RelationKind, Span, Statement, SymbolKind};
+
+pub(super) fn node_text(node: Node, source: &[u8]) -> String {
+    node.utf8_text(source).unwrap_or("").to_string()
+}
+
+/// Descend through declarator wrappers (pointer/reference return types, e.g.
+/// `const char* Class::method()`) to find a `qualified_identifier` — the
+/// `Class::method` name node in an out-of-line C++ method definition.
+pub(super) fn find_qualified_identifier(node: Node) -> Option<Node> {
+    if node.kind() == "qualified_identifier" {
+        return Some(node);
+    }
+    if node.kind() == "function_declarator" {
+        return node
+            .child_by_field_name("declarator")
+            .and_then(find_qualified_identifier);
+    }
+    node.child_by_field_name("declarator")
+        .and_then(find_qualified_identifier)
+}
+
+/// Walk up the AST to find the enclosing class/impl/namespace and return its name.
+///
+/// Consolidated from what used to be two independently-drifted copies
+/// (`entities.rs`'s `find_parent_class`, `relations.rs`'s `find_enclosing_class`) —
+/// one had struct_specifier and the C++ out-of-line-method branch, the other had
+/// Elixir's `defmodule` and Pascal's `declClass`/`declIntf`. This is the union of
+/// both, so both extraction passes now use the same, correctly-scoped answer.
+pub(super) fn find_parent_class(node: Node, source: &[u8]) -> Option<String> {
+    const CLASS_KINDS: &[&str] = &[
+        "class_definition",  // Python
+        "class_declaration", // Java, TS, JS, C#, Kotlin, Swift
+        "class",             // Ruby
+        "class_specifier",   // C/C++
+        "struct_specifier",  // C/C++ struct
+        "impl_item",         // Rust
+        "struct_item",       // Rust
+        "defmodule",         // Elixir
+    ];
+    let mut current = node.parent();
+    while let Some(n) = current {
+        if CLASS_KINDS.contains(&n.kind()) {
+            if let Some(name_node) = n.child_by_field_name("name") {
+                return Some(node_text(name_node, source));
+            }
+        }
+        if n.kind() == "namespace_definition" {
+            if let Some(name_node) = n.child_by_field_name("name") {
+                return Some(node_text(name_node, source));
+            }
+        }
+        if n.kind() == "function_definition" {
+            if let Some(declarator) = n.child_by_field_name("declarator") {
+                if let Some(qualified) = find_qualified_identifier(declarator) {
+                    if let Some(scope) = qualified.child_by_field_name("scope") {
+                        return Some(node_text(scope, source));
+                    }
+                }
+            }
+        }
+        // Pascal: declClass/declIntf is child of declType which has the name
+        if n.kind() == "declClass" || n.kind() == "declIntf" {
+            if let Some(parent) = n.parent() {
+                if parent.kind() == "declType" {
+                    if let Some(name_node) = parent.child_by_field_name("name") {
+                        return Some(node_text(name_node, source));
+                    }
+                }
+            }
+        }
+        // Protobuf: an `rpc` lives inside a `service` node. The service name has
+        // no "name" field — it's a `service_name` child. Without this, proto RPC
+        // methods get an empty parent, so gRPC contract extraction (which groups
+        // RPCs under their service) finds nothing (AIF3X-331 #21).
+        if n.kind() == "service" {
+            let mut cursor = n.walk();
+            let name = n
+                .children(&mut cursor)
+                .find(|c| c.kind() == "service_name" || c.kind() == "message_name")
+                .map(|name_node| node_text(name_node, source));
+            if let Some(name) = name {
+                return Some(name);
+            }
+        }
+        current = n.parent();
+    }
+    None
+}
+
+/// Resolve a captured compound node (generic type, qualified/scoped identifier,
+/// member expression) down to its base identifier text. If `decompose_query` is
+/// present, iteratively re-applies it to descend through wrapper nodes (e.g.
+/// `generic_type`'s `type:` field, `scoped_type_identifier`'s `name:` field)
+/// until it bottoms out at a plain identifier; otherwise returns the node's own
+/// text unchanged. Shared by relation extraction (`@inherit.parent`/`@inherit.child`)
+/// and entity extraction (e.g. Rust's `@method.parent` on a compound impl type).
+pub(super) fn resolve_compound_node_text(
+    node: Node,
+    source: &[u8],
+    decompose_query: Option<&Query>,
+) -> String {
+    let Some(query) = decompose_query else {
+        return node_text(node, source);
+    };
+
+    let mut current = node;
+    loop {
+        let mut cursor = QueryCursor::new();
+        let mut matches = cursor.matches(query, current, source);
+        let mut next = None;
+        'outer: while let Some(m) = matches.next() {
+            for capture in m.captures {
+                if capture.node.parent().map(|p| p.id()) == Some(current.id()) {
+                    next = Some(capture.node);
+                    break 'outer;
+                }
+            }
+        }
+        match next {
+            Some(n) => current = n,
+            None => return node_text(current, source),
+        }
+    }
+}
 
 thread_local! {
     static TS_PARSER: std::cell::RefCell<tree_sitter::Parser> = std::cell::RefCell::new(tree_sitter::Parser::new());
@@ -32,7 +157,14 @@ pub fn extract_file(path: &str, source: &[u8], pack: &LanguagePack) -> Result<Fi
 
             let root = tree.root_node();
 
-            let symbols = extract_entities(path, source, root, entity_query, &pack.name);
+            let symbols = extract_entities(
+                path,
+                source,
+                root,
+                entity_query,
+                &pack.name,
+                inherit_decompose_query.as_deref(),
+            );
             let relations = if pack.custom_edges.is_empty() {
                 extract_relations(
                     path,

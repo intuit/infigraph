@@ -1,5 +1,6 @@
 use tree_sitter::{Node, Query, QueryCursor, StreamingIterator};
 
+use super::{find_parent_class, node_text, resolve_compound_node_text};
 use crate::lang::CustomEdgeDef;
 use crate::model::{Relation, RelationKind, Span};
 
@@ -13,7 +14,7 @@ use crate::model::{Relation, RelationKind, Span};
 ///
 /// `decompose_query`, when present, resolves compound `@inherit.parent`/`@inherit.child`
 /// captures (generics, qualified names, member expressions) down to their base identifier
-/// — see `resolve_inherit_text`.
+/// — see `resolve_compound_node_text`.
 pub fn extract_relations(
     file: &str,
     source: &[u8],
@@ -83,13 +84,13 @@ pub fn extract_relations_with_custom_edges(
                     source_name = Some(file.to_string());
                 }
                 "inherit.child" => {
-                    source_name = Some(resolve_inherit_text(node, source, decompose_query));
+                    source_name = Some(resolve_compound_node_text(node, source, decompose_query));
                     if rel_kind.is_none() {
                         rel_kind = Some(RelationKind::Inherits);
                     }
                 }
                 "inherit.parent" => {
-                    target_name = Some(resolve_inherit_text(node, source, decompose_query));
+                    target_name = Some(resolve_compound_node_text(node, source, decompose_query));
                     rel_kind = Some(RelationKind::Inherits);
                 }
                 other => {
@@ -171,7 +172,7 @@ pub fn extract_relations_with_custom_edges(
             if let Some(ref recv) = receiver_text {
                 if recv == "self" || recv == "this" || recv == "@" {
                     if let Some(site) = site_node {
-                        if let Some(cls) = find_enclosing_class(site, source) {
+                        if let Some(cls) = find_parent_class(site, source) {
                             receiver_text = Some(cls);
                         }
                     }
@@ -342,39 +343,6 @@ fn find_enclosing_function(node: Node, source: &[u8]) -> Option<String> {
             if let Some(id) = n.child(0) {
                 if id.kind() == "identifier" {
                     return Some(node_text(id, source));
-                }
-            }
-        }
-        current = n.parent();
-    }
-    None
-}
-
-/// Walk up the AST to find the enclosing class/struct/impl and return its name.
-fn find_enclosing_class(node: Node, source: &[u8]) -> Option<String> {
-    let class_kinds = [
-        "class_definition",  // Python
-        "class_declaration", // Java, TS, JS, C#, Kotlin, Swift
-        "class",             // Ruby
-        "class_specifier",   // C/C++
-        "impl_item",         // Rust
-        "struct_item",       // Rust
-        "defmodule",         // Elixir
-    ];
-    let mut current = node.parent();
-    while let Some(n) = current {
-        if class_kinds.contains(&n.kind()) {
-            if let Some(name_node) = n.child_by_field_name("name") {
-                return Some(node_text(name_node, source));
-            }
-        }
-        // Pascal: declClass/declIntf is child of declType which has the name
-        if n.kind() == "declClass" || n.kind() == "declIntf" {
-            if let Some(parent) = n.parent() {
-                if parent.kind() == "declType" {
-                    if let Some(name_node) = parent.child_by_field_name("name") {
-                        return Some(node_text(name_node, source));
-                    }
                 }
             }
         }
@@ -607,42 +575,4 @@ fn strip_type_qualifiers(raw: String) -> String {
         .unwrap_or(&cleaned)
         .trim()
         .to_string()
-}
-
-/// Resolve a captured `@inherit.parent`/`@inherit.child` node down to its base identifier
-/// text. If `decompose_query` is present, recursively descends through compound wrapper
-/// nodes (generics, qualified/dotted names, member expressions) — each iteration re-runs
-/// the query against the current node, keeping only captures whose direct parent is the
-/// current node (never a deeper descendant, which would risk matching e.g. a generic type
-/// parameter instead of the real base type). Bottoms out — and falls back to the node's own
-/// raw text — as soon as the query finds nothing further, or if no decompose query exists
-/// for this language at all. Never guesses: an unrecognized compound shape just yields its
-/// own raw text, same as today's pre-fix behavior, rather than resolving to the wrong name.
-fn resolve_inherit_text(node: Node, source: &[u8], decompose_query: Option<&Query>) -> String {
-    let Some(query) = decompose_query else {
-        return node_text(node, source);
-    };
-
-    let mut current = node;
-    loop {
-        let mut cursor = QueryCursor::new();
-        let mut matches = cursor.matches(query, current, source);
-        let mut next = None;
-        'outer: while let Some(m) = matches.next() {
-            for capture in m.captures {
-                if capture.node.parent().map(|p| p.id()) == Some(current.id()) {
-                    next = Some(capture.node);
-                    break 'outer;
-                }
-            }
-        }
-        match next {
-            Some(n) => current = n,
-            None => return node_text(current, source),
-        }
-    }
-}
-
-fn node_text(node: Node, source: &[u8]) -> String {
-    node.utf8_text(source).unwrap_or("").to_string()
 }
