@@ -3,7 +3,7 @@ use serde::Serialize;
 use std::collections::HashMap;
 use std::path::Path;
 
-use crate::graph::GraphBackend;
+use crate::graph::{GraphBackend, ResolvesToEdge};
 
 #[derive(Debug, Clone, Serialize)]
 pub struct ReflectionSite {
@@ -143,7 +143,19 @@ pub fn detect_reflection_sites(
     }
 
     if !sites.is_empty() {
-        write_resolves_to(backend, &sites)?;
+        let edges: Vec<ResolvesToEdge> = sites
+            .iter()
+            .filter_map(|site| {
+                let target = site.resolved_to.as_ref()?;
+                Some(ResolvesToEdge {
+                    caller_symbol: site.caller_symbol.clone(),
+                    target: target.clone(),
+                    mechanism: site.mechanism.to_string(),
+                    config_source: site.config_source.clone().unwrap_or_default(),
+                })
+            })
+            .collect();
+        backend.replace_resolves_to(&edges)?;
     }
 
     Ok(sites)
@@ -338,30 +350,6 @@ fn try_resolve(
     }
 
     (None, None)
-}
-
-fn write_resolves_to(backend: &dyn GraphBackend, sites: &[ReflectionSite]) -> Result<()> {
-    backend.raw_query("BEGIN TRANSACTION")?;
-
-    let _ = backend.raw_query("MATCH ()-[r:RESOLVES_TO]->() DELETE r");
-
-    for site in sites {
-        if let Some(ref target) = site.resolved_to {
-            let src_esc = crate::escape_str(&site.caller_symbol);
-            let tgt_esc = crate::escape_str(target);
-            let mech_esc = crate::escape_str(site.mechanism);
-            let cfg_esc = crate::escape_str(site.config_source.as_deref().unwrap_or(""));
-
-            let _ = backend.raw_query(&format!(
-                "MATCH (s:Symbol), (t:Symbol) WHERE s.id = '{src_esc}' AND t.id = '{tgt_esc}' \
-                 CREATE (s)-[:RESOLVES_TO {{mechanism: '{mech_esc}', config_source: '{cfg_esc}'}}]->(t)"
-            ));
-        }
-    }
-
-    backend.raw_query("COMMIT")?;
-
-    Ok(())
 }
 
 pub fn format_reflection_sites(sites: &[ReflectionSite]) -> String {

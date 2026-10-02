@@ -7,7 +7,7 @@ use crate::learned::LearnedStore;
 use crate::model::FileExtraction;
 use crate::resolve::ResolveStats;
 
-use super::backend::{CallsServiceEdge, GraphBackend};
+use super::backend::{CallsServiceEdge, Concern, GraphBackend, ResolvesToEdge};
 use super::queries::GraphQuery;
 use super::store::GraphStore;
 use super::{
@@ -479,28 +479,62 @@ impl GraphBackend for KuzuBackend {
         if edges.is_empty() {
             return Ok(());
         }
-        let conn = self.store.connection()?;
-        conn.query("BEGIN TRANSACTION")
-            .map_err(|e| anyhow::anyhow!("failed to begin transaction: {e}"))?;
-        for edge in edges {
-            let src_esc = crate::escape_str(&edge.symbol_id);
-            let tgt_esc = crate::escape_str(&edge.target_id);
-            let method_esc = crate::escape_str(&edge.method);
-            let path_esc = crate::escape_str(&edge.path);
-            if let Err(e) = conn.query(&format!(
-                "MATCH (s:Symbol), (t:Symbol) WHERE s.id = '{src_esc}' AND t.id = '{tgt_esc}' \
-                 CREATE (s)-[:CALLS_SERVICE {{method: '{method_esc}', path: '{path_esc}', target_service: ''}}]->(t)"
-            )) {
-                // Roll back so we don't leave a half-applied batch or a
-                // dangling open transaction on this connection, then
-                // surface the real error instead of masking it.
-                let _ = conn.query("ROLLBACK");
-                return Err(anyhow::anyhow!("failed to create CALLS_SERVICE edge: {e}"));
+        self.store.transaction(|conn| {
+            for edge in edges {
+                let src_esc = crate::escape_str(&edge.symbol_id);
+                let tgt_esc = crate::escape_str(&edge.target_id);
+                let method_esc = crate::escape_str(&edge.method);
+                let path_esc = crate::escape_str(&edge.path);
+                conn.query(&format!(
+                    "MATCH (s:Symbol), (t:Symbol) WHERE s.id = '{src_esc}' AND t.id = '{tgt_esc}' \
+                     CREATE (s)-[:CALLS_SERVICE {{method: '{method_esc}', path: '{path_esc}', target_service: ''}}]->(t)"
+                ))
+                .map_err(|e| anyhow::anyhow!("failed to create CALLS_SERVICE edge: {e}"))?;
             }
-        }
-        conn.query("COMMIT")
-            .map_err(|e| anyhow::anyhow!("failed to commit CALLS_SERVICE edges: {e}"))?;
-        Ok(())
+            Ok(())
+        })
+    }
+
+    fn replace_concerns(&self, concerns: &[Concern]) -> Result<()> {
+        self.store.transaction(|conn| {
+            conn.query("MATCH (c:Concern) DETACH DELETE c")
+                .map_err(|e| anyhow::anyhow!("failed to clear existing concerns: {e}"))?;
+            for c in concerns {
+                let sym_esc = crate::escape_str(&c.symbol_id);
+                let kind_esc = crate::escape_str(&c.kind);
+                let detail_esc = crate::escape_str(&c.detail);
+                let concern_id = format!("{}::{}", c.symbol_id, c.kind);
+                let id_esc = crate::escape_str(&concern_id);
+                conn.query(&format!(
+                    "CREATE (c:Concern {{id: '{id_esc}', kind: '{kind_esc}', detail: '{detail_esc}'}})"
+                ))
+                .map_err(|e| anyhow::anyhow!("failed to create Concern node: {e}"))?;
+                conn.query(&format!(
+                    "MATCH (s:Symbol), (c:Concern) WHERE s.id = '{sym_esc}' AND c.id = '{id_esc}' CREATE (s)-[:HAS_CONCERN]->(c)"
+                ))
+                .map_err(|e| anyhow::anyhow!("failed to link Concern to its symbol: {e}"))?;
+            }
+            Ok(())
+        })
+    }
+
+    fn replace_resolves_to(&self, edges: &[ResolvesToEdge]) -> Result<()> {
+        self.store.transaction(|conn| {
+            conn.query("MATCH ()-[r:RESOLVES_TO]->() DELETE r")
+                .map_err(|e| anyhow::anyhow!("failed to clear existing RESOLVES_TO edges: {e}"))?;
+            for edge in edges {
+                let src_esc = crate::escape_str(&edge.caller_symbol);
+                let tgt_esc = crate::escape_str(&edge.target);
+                let mech_esc = crate::escape_str(&edge.mechanism);
+                let cfg_esc = crate::escape_str(&edge.config_source);
+                conn.query(&format!(
+                    "MATCH (s:Symbol), (t:Symbol) WHERE s.id = '{src_esc}' AND t.id = '{tgt_esc}' \
+                     CREATE (s)-[:RESOLVES_TO {{mechanism: '{mech_esc}', config_source: '{cfg_esc}'}}]->(t)"
+                ))
+                .map_err(|e| anyhow::anyhow!("failed to create RESOLVES_TO edge: {e}"))?;
+            }
+            Ok(())
+        })
     }
 
     // ── Resolve ──────────────────────────────────────────────────────
