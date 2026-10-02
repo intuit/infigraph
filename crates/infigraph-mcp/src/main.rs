@@ -227,6 +227,10 @@ fn acquire_instance_lock() -> Option<std::fs::File> {
     }
 }
 
+fn ui_enabled_from(args: &[String]) -> bool {
+    args.iter().any(|a| a == "--ui" || a.starts_with("--ui="))
+}
+
 fn run() -> Result<()> {
     let instance_lock = acquire_instance_lock();
     let is_primary = instance_lock.is_some();
@@ -237,9 +241,7 @@ fn run() -> Result<()> {
     }
 
     let args: Vec<String> = std::env::args().collect();
-    let ui_enabled = args
-        .iter()
-        .any(|a| a == "--ui" || a.starts_with("--ui=") || a == "--mcp");
+    let ui_enabled = ui_enabled_from(&args);
     let port: u16 = args
         .iter()
         .find(|a| a.starts_with("--port="))
@@ -386,4 +388,40 @@ fn handle_tools_list(id: &Value) -> Value {
 
 fn handle_tools_call(id: &Value, request: &Value) -> Value {
     infigraph_mcp::handle_tools_call(id, request)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn args(strs: &[&str]) -> Vec<String> {
+        strs.iter().map(|s| s.to_string()).collect()
+    }
+
+    #[test]
+    fn bare_mcp_flag_does_not_enable_ui() {
+        // Regression test: `--mcp` alone previously triggered the UI keep-alive
+        // loop, leaking a worker process that never exits on stdin EOF.
+        assert!(!ui_enabled_from(&args(&["--mcp"])));
+    }
+
+    #[test]
+    fn no_flags_does_not_enable_ui() {
+        assert!(!ui_enabled_from(&args(&[])));
+    }
+
+    #[test]
+    fn ui_flag_enables_ui() {
+        assert!(ui_enabled_from(&args(&["--ui"])));
+    }
+
+    #[test]
+    fn ui_flag_with_value_enables_ui() {
+        assert!(ui_enabled_from(&args(&["--ui=3000"])));
+    }
+
+    #[test]
+    fn mcp_and_ui_together_enables_ui() {
+        assert!(ui_enabled_from(&args(&["--mcp", "--ui"])));
+    }
 }
