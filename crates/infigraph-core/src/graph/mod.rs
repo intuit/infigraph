@@ -15,7 +15,7 @@ pub(crate) mod store_util;
 mod store_write;
 pub mod test_templates;
 
-pub use backend::{filter_dead_code_candidates, CallsServiceEdge, GraphBackend};
+pub use backend::{filter_dead_code_candidates, CallsServiceEdge, GraphBackend, TaintFlowEdge};
 pub use cozo_store::CozoStore;
 pub use kuzu_backend::KuzuBackend;
 #[cfg(feature = "neo4j")]
