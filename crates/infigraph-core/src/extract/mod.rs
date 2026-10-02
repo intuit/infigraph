@@ -4,7 +4,6 @@ pub use entities::extract_entities;
 pub use relations::{extract_relations, extract_relations_with_custom_edges};
 
 use anyhow::Result;
-use sha2::{Digest, Sha256};
 
 use crate::analysis::extract_statements;
 use crate::lang::{LanguagePack, ParserBackend};
@@ -63,11 +62,7 @@ pub fn extract_file(path: &str, source: &[u8], pack: &LanguagePack) -> Result<Fi
     // Generate CALLS edges from Route symbols to their handler functions
     generate_route_handler_edges(path, &symbols, &mut relations);
 
-    let content_hash = {
-        let mut hasher = Sha256::new();
-        hasher.update(source);
-        format!("{:x}", hasher.finalize())
-    };
+    let content_hash = pack.content_fingerprint(source);
 
     Ok(FileExtraction {
         file: path.to_string(),

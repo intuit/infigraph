@@ -1,5 +1,5 @@
 use infigraph_core::extract::extract_file;
-use infigraph_core::lang::LanguagePack;
+use infigraph_core::lang::{CustomEdgeDef, LanguagePack};
 use infigraph_core::model::{RelationKind, SymbolKind};
 
 const PYTHON_ENTITIES: &str = r#"
@@ -280,6 +280,140 @@ fn test_extract_content_hash_changes() {
     let ext1 = extract_file("f.py", b"def a(): pass", &pack).unwrap();
     let ext2 = extract_file("f.py", b"def b(): pass", &pack).unwrap();
     assert_ne!(ext1.content_hash, ext2.content_hash);
+}
+
+// ---------- extractor-aware cache invalidation ----------
+
+/// The incremental skip gate in `Infigraph::index` hashes a file before it has
+/// an extraction to compare against, so it calls `content_fingerprint` directly.
+/// If that formula ever drifts from what `extract_file` stores, no file is ever
+/// skipped again and every index becomes a full reindex.
+#[test]
+fn test_content_fingerprint_matches_stored_content_hash() {
+    let src = b"def foo():\n    pass\n";
+    let pack = python_pack();
+    let ext = extract_file("foo.py", src, &pack).unwrap();
+    assert_eq!(pack.content_fingerprint(src), ext.content_hash);
+}
+
+/// A query-file fix must invalidate the cache for files it affects, otherwise
+/// users who upgrade keep the graph the old, buggy extractor produced.
+#[test]
+fn test_content_hash_changes_when_entity_query_changes() {
+    let src = b"def foo():\n    pass\n";
+
+    let before = python_pack();
+    let after = LanguagePack::new(
+        "python",
+        vec![".py"],
+        tree_sitter_python::LANGUAGE.into(),
+        // Stand-in for an extractor fix: one extra pattern in entities.scm.
+        &format!("{PYTHON_ENTITIES}\n(lambda) @func.def\n"),
+        PYTHON_RELATIONS,
+    )
+    .unwrap();
+
+    assert_ne!(
+        before.content_fingerprint(src),
+        after.content_fingerprint(src),
+        "an entity-query change must produce a different fingerprint for identical source"
+    );
+}
+
+#[test]
+fn test_content_hash_changes_when_relation_query_changes() {
+    let src = b"def foo():\n    bar()\n";
+
+    let before = python_pack();
+    let after = LanguagePack::new(
+        "python",
+        vec![".py"],
+        tree_sitter_python::LANGUAGE.into(),
+        PYTHON_ENTITIES,
+        &format!(
+            "{PYTHON_RELATIONS}\n(await (call function: (identifier) @call.name)) @call.site\n"
+        ),
+    )
+    .unwrap();
+
+    assert_ne!(
+        before.content_fingerprint(src),
+        after.content_fingerprint(src)
+    );
+}
+
+/// The fingerprint is derived per pack rather than from a global index version,
+/// so an extractor fix for one language leaves other languages cached. (Mixing
+/// in the Infigraph crate version instead would make every release a full
+/// reindex.) `test_extractor_change_reindexes_unedited_files` in `index_perf.rs`
+/// covers the same property end-to-end through `index()`.
+#[test]
+fn test_pack_fingerprint_is_scoped_to_its_own_inputs() {
+    let py = python_pack();
+    let py_upgraded = LanguagePack::new(
+        "python",
+        vec![".py"],
+        tree_sitter_python::LANGUAGE.into(),
+        &format!("{PYTHON_ENTITIES}\n(lambda) @func.def\n"),
+        PYTHON_RELATIONS,
+    )
+    .unwrap();
+
+    // Same grammar and same queries, different pack — the fingerprint must still
+    // distinguish them, so packs can be invalidated independently.
+    let other = LanguagePack::new(
+        "python-other",
+        vec![".pyi"],
+        tree_sitter_python::LANGUAGE.into(),
+        PYTHON_ENTITIES,
+        PYTHON_RELATIONS,
+    )
+    .unwrap();
+
+    assert_ne!(
+        py.fingerprint(),
+        py_upgraded.fingerprint(),
+        "the edited pack must be invalidated"
+    );
+    assert_ne!(
+        py.fingerprint(),
+        other.fingerprint(),
+        "distinct packs must not share a fingerprint"
+    );
+}
+
+/// Fingerprints are compared across processes and across runs, so they must not
+/// depend on anything address- or run-specific.
+#[test]
+fn test_pack_fingerprint_is_stable_across_rebuilds() {
+    assert_eq!(python_pack().fingerprint(), python_pack().fingerprint());
+}
+
+#[test]
+fn test_inherit_decompose_query_affects_fingerprint() {
+    let plain = python_pack();
+    let decomposed = python_pack()
+        .with_inherit_decompose("(subscript value: (identifier) @base)")
+        .unwrap();
+    assert_ne!(plain.fingerprint(), decomposed.fingerprint());
+}
+
+#[test]
+fn test_custom_edges_affect_fingerprint() {
+    let plain = python_pack();
+    let with_edges = LanguagePack::new_with_custom_edges(
+        "python",
+        vec![".py"],
+        tree_sitter_python::LANGUAGE.into(),
+        PYTHON_ENTITIES,
+        PYTHON_RELATIONS,
+        vec![CustomEdgeDef {
+            name: "PUBLISHES".to_string(),
+            capture: "publish".to_string(),
+        }],
+    )
+    .unwrap();
+    assert_ne!(plain.fingerprint(), with_edges.fingerprint());
 }
 
 #[test]

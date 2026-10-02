@@ -3,7 +3,8 @@ mod plugin;
 
 pub use driver::GrammarDriver;
 pub use plugin::{
-    discover_plugins, GrammarPlugin, GrammarPluginConfig, ProjectConfig, ProjectPreprocessorConfig,
+    discover_plugins, plugin_fingerprint, GrammarPlugin, GrammarPluginConfig, ProjectConfig,
+    ProjectPreprocessorConfig,
 };
 
 use std::path::Path;
@@ -125,6 +126,8 @@ pub fn register_grammar_plugins(
     for (config, dir) in all_plugins {
         let name = config.language.name.clone();
         let extensions = config.language.extensions.clone();
+        // Computed before `config`/`dir` move into the plugin.
+        let fingerprint = plugin_fingerprint(&config, &dir);
 
         let plugin = GrammarPlugin::new(config, dir, Arc::clone(&driver), project_pp.clone());
 
@@ -136,7 +139,8 @@ pub fn register_grammar_plugins(
             continue;
         }
 
-        let pack = LanguagePack::new_custom(&name, extensions, Box::new(plugin));
+        let pack = LanguagePack::new_custom(&name, extensions, Box::new(plugin))
+            .with_fingerprint_part(&fingerprint);
         registry.register(pack);
     }
 
