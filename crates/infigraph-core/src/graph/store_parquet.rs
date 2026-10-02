@@ -1,4 +1,3 @@
-use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 
 use anyhow::Result;
@@ -11,16 +10,8 @@ use super::store::GraphStore;
 use super::store_util::{
     copy_edges_with_bad_record_retry, escape, fwd_slash_path, unwind_edges_from_pairs,
 };
+use crate::graph::store_util::unique_tmp_dir;
 use crate::model::{FileExtraction, RelationKind};
-
-fn unique_tmp_dir() -> std::path::PathBuf {
-    static COUNTER: AtomicU64 = AtomicU64::new(0);
-    let id = COUNTER.fetch_add(1, Ordering::Relaxed);
-    let pid = std::process::id();
-    let dir = std::env::temp_dir().join(format!("infigraph_pq_{}_{}", pid, id));
-    let _ = std::fs::create_dir_all(&dir);
-    dir
-}
 
 impl GraphStore {
     /// Create Folder nodes and edges for a set of file paths in bulk.
@@ -554,13 +545,13 @@ impl GraphStore {
             }
             let edge_pq = tmp.join(format!("infigraph_index_{}.parquet", table.to_lowercase()));
             copy_edges_with_bad_record_retry(
-                conn,
+                self,
                 table,
                 pairs.to_vec(),
                 src_label,
                 dst_label,
                 &edge_pq,
-            );
+            )?;
         }
 
         // Custom edge tables
@@ -574,13 +565,13 @@ impl GraphStore {
                 edge_name.to_lowercase()
             ));
             copy_edges_with_bad_record_retry(
-                conn,
+                self,
                 edge_name,
                 pairs.to_vec(),
                 "Symbol",
                 "Symbol",
                 &edge_pq,
-            );
+            )?;
         }
 
         // Cleanup node parquet files
