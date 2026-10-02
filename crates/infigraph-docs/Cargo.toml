@@ -18,7 +18,7 @@ anyhow.workspace = true
 rayon = "1"
 sha2 = "0.10"
 regex = "1"
-kuzu = { package = "lbug", version = "= 0.16.0" }
+kuzu = { package = "lbug", version = "= 0.19.1" }
 parquet = "58.3"
 arrow = { version = "58.3", features = ["prettyprint"] }
 tempfile = "3"
