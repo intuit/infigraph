@@ -140,7 +140,7 @@ fn test_context_runs_in_the_cli_process() {
         String::from_utf8_lossy(&test_context.stderr)
     );
     assert!(
-        String::from_utf8_lossy(&test_context.stdout).contains("Test Context"),
+        String::from_utf8_lossy(&test_context.stdout).contains("Test Generation Context"),
         "unexpected test-context output: {}",
         String::from_utf8_lossy(&test_context.stdout)
     );
