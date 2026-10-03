@@ -211,11 +211,11 @@ This means:
 Serve Infigraph as a **remote MCP server** over HTTP, giving your entire team access to the code intelligence graph without local setup.
 
 ```bash
-# Start HTTP server (default port 8642)
+# Start a loopback-only HTTP server (default port 8642)
 infigraph-mcp --serve
 
-# Custom port + API key auth
-INFIGRAPH_API_KEY=your-secret infigraph-mcp --serve --mcp-port=9000
+# Intentionally expose the HTTP server with a custom port + API key auth
+INFIGRAPH_MCP_BIND=0.0.0.0 INFIGRAPH_API_KEY=your-secret infigraph-mcp --serve --mcp-port=9000
 
 # Combine with stdio MCP (serve both transports)
 infigraph-mcp --mcp --serve
@@ -721,7 +721,7 @@ export INFIGRAPH_ML_COMPRESSION=kompress
 # optional: export INFIGRAPH_KOMPRESS_DIR=/path/to/kompress-small
 ```
 
-Requires a build with the `kompress` Cargo feature (default on most release targets; Intel Mac release builds may omit it). If the model download or inference fails, Infigraph falls back to extractive compression.
+Requires a build with the `kompress` Cargo feature (`cargo build --release -p infigraph-cli --features kompress`); it is opt-in because the prebuilt ONNX Runtime archive requires newer x86 CPU instructions. If the model download or inference fails, Infigraph falls back to extractive compression.
 
 ## Troubleshooting
 

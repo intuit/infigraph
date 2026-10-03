@@ -1,4 +1,5 @@
 use std::collections::HashSet;
+use std::fs;
 use std::process::Command;
 
 fn get_cli_subcommands() -> HashSet<String> {
@@ -91,5 +92,56 @@ fn allowlist_covers_all_mcp_tools() {
     assert!(
         missing.is_empty(),
         "MCP tools not in Claude Code allowlist: {missing:?}"
+    );
+}
+
+#[test]
+fn test_context_runs_in_the_cli_process() {
+    let project = tempfile::tempdir().expect("create temporary project");
+    let source_dir = project.path().join("src");
+    fs::create_dir_all(&source_dir).expect("create source directory");
+    fs::write(
+        source_dir.join("calculator.py"),
+        "def add(left, right):\n    return left + right\n",
+    )
+    .expect("write source file");
+
+    let cli = env!("CARGO_BIN_EXE_infigraph");
+    let index = Command::new(cli)
+        .args([
+            "--root",
+            project.path().to_str().unwrap(),
+            "index",
+            "--no-embed",
+        ])
+        .output()
+        .expect("run index");
+    assert!(
+        index.status.success(),
+        "index failed: {}",
+        String::from_utf8_lossy(&index.stderr)
+    );
+
+    let test_context = Command::new(cli)
+        .args([
+            "--root",
+            project.path().to_str().unwrap(),
+            "test-context",
+            "--file",
+            "src/calculator.py",
+            "--limit",
+            "1",
+        ])
+        .output()
+        .expect("run test-context");
+    assert!(
+        test_context.status.success(),
+        "test-context failed: {}",
+        String::from_utf8_lossy(&test_context.stderr)
+    );
+    assert!(
+        String::from_utf8_lossy(&test_context.stdout).contains("Test Generation Context"),
+        "unexpected test-context output: {}",
+        String::from_utf8_lossy(&test_context.stdout)
     );
 }

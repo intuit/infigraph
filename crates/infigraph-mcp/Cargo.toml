@@ -36,7 +36,9 @@ ndarray = { version = "0.16", optional = true }
 tokenizers = { version = "0.21", default-features = false, features = ["onig"], optional = true }
 
 [features]
-default = ["kompress"]
+# The prebuilt static ONNX Runtime archive targets newer x86 CPUs. It is only
+# needed for opt-in ML output compression, so do not link it into every server.
+default = []
 kompress = ["dep:ort", "dep:ndarray", "dep:tokenizers"]
 neo4j = ["infigraph-core/neo4j"]
 postgres = ["infigraph-core/postgres"]
