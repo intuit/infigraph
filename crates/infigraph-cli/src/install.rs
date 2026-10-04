@@ -4,40 +4,7 @@ use anyhow::{Context, Result};
 
 use crate::config_targets::{self, ConfigFormat, AGENT_TARGETS};
 
-/// Locate the infigraph-mcp binary: first check the same directory as the running
-/// binary, then fall back to searching PATH.
-pub(crate) fn find_mcp_binary() -> Result<PathBuf> {
-    let bin_name = if cfg!(windows) {
-        "infigraph-mcp.exe"
-    } else {
-        "infigraph-mcp"
-    };
-
-    // Check sibling of the running binary
-    if let Ok(exe) = std::env::current_exe() {
-        let sibling = exe.parent().unwrap().join(bin_name);
-        if sibling.is_file() {
-            return Ok(sibling);
-        }
-    }
-
-    // Fall back to PATH (use `where` on Windows, `which` elsewhere)
-    let lookup = if cfg!(windows) { "where" } else { "which" };
-    if let Ok(output) = std::process::Command::new(lookup).arg(bin_name).output() {
-        if output.status.success() {
-            let stdout = String::from_utf8_lossy(&output.stdout);
-            let path = stdout.lines().next().unwrap_or("").trim().to_string();
-            if !path.is_empty() {
-                return Ok(PathBuf::from(path));
-            }
-        }
-    }
-
-    anyhow::bail!(
-        "Could not find infigraph-mcp binary. \
-         Build it with `cargo build -p infigraph-mcp` or ensure it is on your PATH."
-    )
-}
+pub(crate) use infigraph_core::installation::find_mcp_binary;
 
 pub(crate) fn cmd_install() -> Result<()> {
     let mcp_path = find_mcp_binary()?;

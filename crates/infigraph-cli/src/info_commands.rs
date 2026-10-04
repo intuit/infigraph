@@ -465,7 +465,7 @@ pub(crate) fn cmd_index_docs(root: &Path, namespace: Option<&str>) -> Result<()>
         let changed_refs: Vec<&str> = result.changed_files.iter().map(|s| s.as_str()).collect();
         let count = infigraph_docs::embed::update_doc_embeddings_remote(
             store,
-            &pg,
+            pg,
             &chunk_refs,
             &changed_refs,
         )?;

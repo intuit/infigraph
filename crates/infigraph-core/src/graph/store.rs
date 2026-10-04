@@ -72,10 +72,14 @@ impl GraphStore {
     /// Open an existing Kuzu database in read-only mode.
     /// Safe for concurrent access while a watcher is writing.
     pub fn open_read_only(path: &Path) -> Result<Self> {
+        Self::open_read_only_with_config(path, SystemConfig::default())
+    }
+
+    /// Read-only open with caller-specified resource limits. Read-only mode is
+    /// enforced here, regardless of the supplied configuration.
+    pub fn open_read_only_with_config(path: &Path, config: SystemConfig) -> Result<Self> {
         let lock_path = path.with_extension("lock");
-        let config = SystemConfig::default()
-            .read_only(true)
-            .throw_on_wal_replay_failure(false);
+        let config = config.read_only(true).throw_on_wal_replay_failure(false);
         let db = Database::new(path, config)
             .map_err(|e| anyhow::anyhow!("failed to open kuzu db (read-only): {e}"))?;
         Ok(Self { db, lock_path })

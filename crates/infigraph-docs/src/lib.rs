@@ -224,7 +224,7 @@ impl DocIndex {
             #[cfg(feature = "remote")]
             if is_remote_mode() {
                 if let Ok(pg) = infigraph_core::meta::PostgresMetaStore::connect_from_env_cached() {
-                    embed::update_doc_embeddings_remote(store, &pg, &all_chunks, &changed_files)?;
+                    embed::update_doc_embeddings_remote(store, pg, &all_chunks, &changed_files)?;
                 } else {
                     eprintln!(
                         "Warning: remote mode but Postgres unavailable, skipping doc embeddings"

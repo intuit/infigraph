@@ -179,3 +179,65 @@ pub fn acquire(path: &Path, role: &str, timeout: Duration) -> Result<LockFile> {
         delay = (delay * 2).min(Duration::from_millis(500));
     }
 }
+
+/// Observe an existing advisory lock without creating or changing its payload.
+/// A free lock returns a shared guard: retaining it prevents exclusive writers
+/// during a read-only inspection. Dropping it only releases the kernel lock.
+#[derive(Debug)]
+pub enum Observation {
+    Missing,
+    Free(File),
+    Held,
+}
+
+pub fn observe(path: &Path) -> std::io::Result<Observation> {
+    match path.metadata() {
+        Ok(meta) if !meta.is_file() => {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidInput,
+                "lock is not a regular file",
+            ))
+        }
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(Observation::Missing),
+        Err(e) => return Err(e),
+        _ => {}
+    }
+    let file = match File::open(path) {
+        Ok(file) => file,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(Observation::Missing),
+        Err(e) => return Err(e),
+    };
+    match fs2::FileExt::try_lock_shared(&file) {
+        Ok(()) => Ok(Observation::Free(file)),
+        Err(e) if e.kind() == std::io::ErrorKind::WouldBlock || e.raw_os_error() == Some(33) => {
+            Ok(Observation::Held)
+        }
+        Err(e) => Err(e),
+    }
+}
+
+#[cfg(test)]
+mod observation_tests {
+    use super::*;
+    #[test]
+    fn observation_preserves_payload_and_does_not_create_locks() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("state.lock");
+        assert!(matches!(observe(&path).unwrap(), Observation::Missing));
+        assert!(!path.exists());
+        std::fs::write(&path, b"retained identity").unwrap();
+        let shared = observe(&path).unwrap();
+        assert!(matches!(shared, Observation::Free(_)));
+        assert!(try_acquire(&path, "test").unwrap().is_none());
+        drop(shared);
+        assert_eq!(std::fs::read(&path).unwrap(), b"retained identity");
+        let exclusive = try_acquire(&path, "test").unwrap().unwrap();
+        assert!(matches!(observe(&path).unwrap(), Observation::Held));
+        drop(exclusive);
+    }
+    #[test]
+    fn non_file_lock_is_unknown() {
+        let dir = tempfile::tempdir().unwrap();
+        assert!(observe(dir.path()).is_err());
+    }
+}

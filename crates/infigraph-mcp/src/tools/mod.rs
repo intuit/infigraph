@@ -1,4 +1,5 @@
 pub mod analysis;
+pub mod diagnostics;
 pub mod docs;
 pub mod graph;
 pub mod groups;

@@ -341,16 +341,24 @@ pub fn best_embedder() -> Box<dyn EmbedProvider> {
 
 /// Count the number of embeddings in the binary file at `root/.infigraph/embeddings.bin`.
 pub fn embedding_count(root: &Path) -> usize {
+    embedding_count_checked(root).unwrap_or(0)
+}
+
+/// Read just the embedding header, preserving missing/invalid state for
+/// diagnostics. Does not load models, mmap assets, or validate all entries.
+pub fn embedding_count_checked(root: &Path) -> std::io::Result<usize> {
     let path = root.join(".infigraph").join("embeddings.bin");
-    let Ok(file) = std::fs::File::open(&path) else {
-        return 0;
-    };
+    if !path.metadata()?.is_file() {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            "embeddings are not a regular file",
+        ));
+    }
+    let file = std::fs::File::open(&path)?;
     let mut r = BufReader::new(file);
     let mut buf4 = [0u8; 4];
-    if r.read_exact(&mut buf4).is_err() {
-        return 0;
-    }
-    u32::from_le_bytes(buf4) as usize
+    r.read_exact(&mut buf4)?;
+    Ok(u32::from_le_bytes(buf4) as usize)
 }
 
 /// Save symbol embeddings to a binary file.
@@ -381,6 +389,9 @@ pub fn load_embeddings(path: &Path) -> Result<Vec<(String, Vec<f32>)>> {
 
     anyhow::ensure!(data.len() >= 4, "embeddings file too small");
     let count = u32::from_le_bytes(data[0..4].try_into().unwrap()) as usize;
+    // Each entry needs at least an ID length and a dimension (two u32s).
+    // Validate the untrusted count before reserving memory from it.
+    anyhow::ensure!(count <= (data.len() - 4) / 8, "truncated embeddings file");
     let mut result = Vec::with_capacity(count);
     let mut pos = 4usize;
 
@@ -399,8 +410,10 @@ pub fn load_embeddings(path: &Path) -> Result<Vec<(String, Vec<f32>)>> {
         let float_bytes = dim * 4;
         anyhow::ensure!(pos + float_bytes <= data.len(), "truncated embeddings file");
         let vec: Vec<f32> = data[pos..pos + float_bytes]
-            .chunks_exact(4)
-            .map(|chunk| f32::from_le_bytes(chunk.try_into().unwrap()))
+            .as_chunks::<4>()
+            .0
+            .iter()
+            .map(|chunk| f32::from_le_bytes(*chunk))
             .collect();
         pos += float_bytes;
         result.push((id, vec));
