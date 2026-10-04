@@ -192,9 +192,15 @@ infigraph query "MATCH (...)"              # Cypher queries
 infigraph trace-callers "function_name"   # Who calls this?
 infigraph dead-code                        # Find unused functions
 infigraph impact "auth.py::authenticate"   # Blast radius
+infigraph doctor                          # Read-only diagnostics
+infigraph doctor --json                   # Stable JSON for agents
 ```
 
 ---
+
+Doctor and MCP `diagnose` inspect local state without repair or network access.
+For `INDEX_STALE`, run `infigraph index`, then rerun doctor. See
+[checks, exit codes, and safety limits](docs/DOCTOR.md).
 
 ## Offline-First Design
 

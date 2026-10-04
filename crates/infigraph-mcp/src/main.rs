@@ -7,6 +7,9 @@ use serde_json::{json, Value};
 use infigraph_mcp::web;
 
 fn main() -> Result<()> {
+    if let Some(code) = infigraph_core::diagnostics::run_probe_if_requested() {
+        std::process::exit(code);
+    }
     let args: Vec<String> = std::env::args().collect();
 
     if args.iter().any(|a| a == "--worker") {
@@ -333,7 +336,11 @@ fn run() -> Result<()> {
         let id = request.get("id").cloned().unwrap_or(Value::Null);
         let method = request.get("method").and_then(|m| m.as_str()).unwrap_or("");
 
-        mcp_log("DEBUG", &format!("method={method}"));
+        let diagnosing = method == "tools/call"
+            && request.pointer("/params/name").and_then(Value::as_str) == Some("diagnose");
+        if !diagnosing {
+            mcp_log("DEBUG", &format!("method={method}"));
+        }
 
         let response = match method {
             "initialize" => handle_initialize(&id, is_primary),
@@ -343,7 +350,9 @@ fn run() -> Result<()> {
                     .pointer("/params/name")
                     .and_then(|n| n.as_str())
                     .unwrap_or("?");
-                mcp_log("DEBUG", &format!("tool_call={tool}"));
+                if !diagnosing {
+                    mcp_log("DEBUG", &format!("tool_call={tool}"));
+                }
                 handle_tools_call(&id, &request)
             }
             "notifications/initialized" | "notifications/cancelled" => continue,
