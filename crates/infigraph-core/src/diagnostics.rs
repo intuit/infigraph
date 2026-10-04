@@ -651,6 +651,28 @@ mod tests {
         assert_eq!(std::fs::read(path).unwrap(), before);
     }
     #[test]
+    fn graph_observation_holds_shared_lock_through_probe() {
+        let dir = fixture();
+        let path = dir.path().join(".infigraph/graph.lock");
+        std::fs::write(&path, b"retained lock payload").unwrap();
+        let result = diagnose_with(
+            dir.path(),
+            &|_| {
+                assert!(lockfile::try_acquire(&path, "competing writer")?.is_none());
+                Ok(GraphCounts {
+                    files: 1,
+                    symbols: 1,
+                })
+            },
+            &|| Ok(Registry::default()),
+        );
+        assert_eq!(result.status, Health::Healthy);
+        assert_eq!(std::fs::read(&path).unwrap(), b"retained lock payload");
+        assert!(lockfile::try_acquire(&path, "writer after probe")
+            .unwrap()
+            .is_some());
+    }
+    #[test]
     fn registry_revision_change_is_stale_without_timing() {
         use crate::multi::RepoEntry;
         let dir = fixture();

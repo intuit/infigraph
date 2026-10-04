@@ -8,6 +8,8 @@ text in the existing MCP response format, without compression.
 
 Exit codes: 0 healthy, 1 degraded (warnings), 2 unhealthy (errors). Informational
 checks, including unsupported optional capabilities, do not change health.
+The human summary prints index freshness beside overall health; a recorded
+revision match still prints UNKNOWN for working-tree freshness.
 UNKNOWN is explicit; a healthy report means the implemented required checks
 passed, not that every optional capability or index freshness was verified.
 

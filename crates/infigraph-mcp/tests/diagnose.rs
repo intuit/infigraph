@@ -139,3 +139,60 @@ fn diagnose_reports_unavailable_pending_state_without_panicking() {
             && c["severity"] == "warning"));
     assert!(!project.path().join(".infigraph").exists());
 }
+
+#[test]
+fn direct_worker_initializes_and_diagnoses_over_clean_stdio() {
+    use std::io::Write;
+    use std::process::{Command, Stdio};
+    let project = tempfile::tempdir().unwrap();
+    let home = tempfile::tempdir().unwrap();
+    let requests = [
+        json!({"jsonrpc":"2.0", "id":1, "method":"initialize", "params":{"protocolVersion":"2024-11-05", "capabilities":{}, "clientInfo":{"name":"diagnostic-test", "version":"1"}}}),
+        json!({"jsonrpc":"2.0", "method":"notifications/initialized"}),
+        json!({"jsonrpc":"2.0", "id":2, "method":"tools/list"}),
+        json!({"jsonrpc":"2.0", "id":3, "method":"tools/call", "params":{"name":"diagnose", "arguments":{"path":project.path()}}}),
+    ];
+    let mut child = Command::new(env!("CARGO_BIN_EXE_infigraph-mcp"))
+        .args(["--worker", "--mcp"])
+        .env("HOME", home.path())
+        .env("INFIGRAPH_REGISTRY_HOME", home.path())
+        .env("INFIGRAPH_BACKEND", "kuzu")
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .unwrap();
+    let mut stdin = child.stdin.take().unwrap();
+    for request in requests {
+        writeln!(stdin, "{request}").unwrap();
+    }
+    drop(stdin);
+    let output = child.wait_with_output().unwrap();
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let responses: Vec<Value> = String::from_utf8(output.stdout)
+        .unwrap()
+        .lines()
+        .map(|line| serde_json::from_str(line).unwrap())
+        .collect();
+    assert_eq!(responses.len(), 3);
+    assert!(responses[0]["result"]["protocolVersion"].is_string());
+    assert!(responses[1]["result"]["tools"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .any(|t| t["name"] == "diagnose"));
+    let report: Value = serde_json::from_str(
+        responses[2]["result"]["content"][0]["text"]
+            .as_str()
+            .unwrap(),
+    )
+    .unwrap();
+    assert_eq!(report["schema_version"], 1);
+    assert_eq!(report["status"], "unhealthy");
+    assert_eq!(std::fs::read_dir(project.path()).unwrap().count(), 0);
+    assert!(!home.path().join(".infigraph/registry.json").exists());
+}

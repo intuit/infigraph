@@ -2,7 +2,7 @@ use std::io::Write;
 use std::path::Path;
 
 use anyhow::Result;
-use infigraph_core::diagnostics::{diagnose, CheckStatus, Health};
+use infigraph_core::diagnostics::{diagnose, CheckStatus, DiagnosticCode, Health};
 
 pub(crate) fn run(root: &Path, json: bool) -> Result<i32> {
     let report = diagnose(root);
@@ -42,7 +42,22 @@ pub(crate) fn run(root: &Path, json: bool) -> Result<i32> {
             Health::Degraded => "DEGRADED",
             Health::Unhealthy => "UNHEALTHY",
         };
-        writeln!(out, "\nResult: {status}")?;
+        let freshness = if report
+            .checks
+            .iter()
+            .any(|c| c.code == DiagnosticCode::IndexStale)
+        {
+            "STALE REVISION (working-tree freshness unverified)"
+        } else if report
+            .checks
+            .iter()
+            .any(|c| c.code == DiagnosticCode::IndexRevisionMatch)
+        {
+            "UNKNOWN (recorded revision matches; working-tree freshness unverified)"
+        } else {
+            "UNKNOWN (working-tree freshness unverified)"
+        };
+        writeln!(out, "\nResult: {status}\nIndex freshness: {freshness}")?;
     }
     out.flush()?;
     Ok(report.exit_code())
