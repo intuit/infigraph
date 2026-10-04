@@ -11,6 +11,7 @@ pub use tools::watch::auto_start_watch;
 /// Maps MCP tool names to their CLI subcommand names.
 /// Used by parity tests to verify every MCP tool has a CLI equivalent.
 pub const MCP_TO_CLI_MAP: &[(&str, &str)] = &[
+    ("diagnose", "doctor"),
     ("index_project", "index"),
     ("search", "search"),
     ("query_graph", "query"),
@@ -113,6 +114,7 @@ pub const MCP_ONLY_TOOLS: &[&str] = &[
 ];
 
 pub const MCP_TOOL_NAMES: &[&str] = &[
+    "diagnose",
     "index_project",
     "search",
     "search_symbols",
@@ -235,6 +237,7 @@ fn tool_compress(args: &Value) -> Result<String, anyhow::Error> {
 
 pub fn dispatch_tool(tool_name: &str, args: &Value) -> Result<String, anyhow::Error> {
     match tool_name {
+        "diagnose" => tools::diagnostics::tool_diagnose(args),
         "index_project" => tools::index::tool_index_project(args),
         "search" => tools::search::tool_search(args),
         "search_symbols" => tools::search::tool_search_symbols(args),
@@ -373,6 +376,7 @@ fn p(path: bool, symbol: bool, file: bool, extra: Value) -> Value {
 }
 pub fn build_tools_list() -> Vec<Value> {
     vec![
+        tools::diagnostics::definition(),
         tool_def("index_project", "REQUIRED FIRST STEP: Parse all source files and build the code knowledge graph. Must run before any other infigraph tool. Auto-indexes 60+ languages.",
             p(true,false,false,json!({})), &["path"]),
         tool_def("search", "PRIMARY: Unified search — finds symbols by name, meaning, or text pattern in one call. Runs keyword-hybrid (BM25+vector) AND semantic-hybrid AND regex grep together, merges and deduplicates results. Auto-escalates internally when results are weak — no need to retry with different tools. Use this INSTEAD OF grep/ripgrep/find for ALL search. Set scope='docs' for document-only search.",
@@ -677,6 +681,18 @@ pub fn handle_tools_call(id: &Value, request: &Value) -> Value {
     let tool_name = params.get("name").and_then(|n| n.as_str()).unwrap_or("");
     let args = params.get("arguments").cloned().unwrap_or(json!({}));
 
+    // Diagnostics must remain read-only and machine-readable: no activity
+    // files, session mutations, focus recording, or text compression.
+    if tool_name == "diagnose" {
+        return match dispatch_tool(tool_name, &args) {
+            Ok(content) => {
+                json!({"jsonrpc":"2.0", "id":id, "result":{"content":[{"type":"text", "text":content}]}})
+            }
+            Err(_) => {
+                json!({"jsonrpc":"2.0", "id":id, "result":{"isError":true, "content":[{"type":"text", "text":"diagnose requires a string path"}]}})
+            }
+        };
+    }
     tools::helpers::log_activity(tool_name, &args);
 
     let metrics_enabled = std::env::var("INFIGRAPH_METRICS").is_ok_and(|v| v == "1");
