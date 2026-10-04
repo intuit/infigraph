@@ -70,7 +70,7 @@ fn test_doc_embeddings_remote_stores_to_pgvector() {
         text: "This is test content".into(),
         page_count: None,
     };
-    let chunks = vec![
+    let chunks = [
         make_chunk(
             "test_doc.md::chunk_0",
             "test_doc.md",
@@ -145,7 +145,7 @@ fn test_doc_embeddings_remote_incremental() {
         text: "Incremental test".into(),
         page_count: None,
     };
-    let chunks = vec![make_chunk(
+    let chunks = [make_chunk(
         "incr_test.md::chunk_0",
         "incr_test.md",
         "Initial chunk",
