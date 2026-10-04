@@ -192,7 +192,9 @@ fn install_panic_hook() {
             .unwrap_or_else(|| "unknown".to_string());
         let bt = std::backtrace::Backtrace::force_capture();
         mcp_log("PANIC", &format!("{payload} at {location}\n{bt}"));
-        eprintln!("PANIC: {payload} at {location}");
+        let stderr = io::stderr();
+        let mut stderr = stderr.lock();
+        let _ = writeln!(stderr, "PANIC: {payload} at {location}");
     }));
 }
 
@@ -423,5 +425,39 @@ mod tests {
     #[test]
     fn mcp_and_ui_together_enables_ui() {
         assert!(ui_enabled_from(&args(&["--mcp", "--ui"])));
+    }
+
+    const PANIC_HOOK_CHILD: &str = "INFIGRAPH_PANIC_HOOK_TEST_CHILD";
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn panic_hook_tolerates_stderr_write_failure() {
+        if std::env::var_os(PANIC_HOOK_CHILD).is_some() {
+            install_panic_hook();
+            let result = std::panic::catch_unwind(|| panic!("panic hook test"));
+            assert!(result.is_err());
+            return;
+        }
+
+        let stderr = std::fs::OpenOptions::new()
+            .write(true)
+            .open("/dev/full")
+            .expect("failed to open /dev/full");
+        let home = tempfile::tempdir().expect("failed to create temporary home");
+        let status = std::process::Command::new(
+            std::env::current_exe().expect("failed to locate test executable"),
+        )
+        .args([
+            "--exact",
+            "tests::panic_hook_tolerates_stderr_write_failure",
+            "--nocapture",
+        ])
+        .env(PANIC_HOOK_CHILD, "1")
+        .env("HOME", home.path())
+        .stderr(std::process::Stdio::from(stderr))
+        .status()
+        .expect("failed to run panic hook test subprocess");
+
+        assert!(status.success(), "panic hook subprocess failed: {status}");
     }
 }
