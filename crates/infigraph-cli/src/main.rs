@@ -580,6 +580,8 @@ enum Commands {
     /// Background SCIP enrichment (spawned by index)
     #[command(hide = true)]
     ScipEnrich {
+        #[arg(long)]
+        run_id: Option<String>,
         /// Comma-separated detected languages
         languages: String,
     },
@@ -809,6 +811,9 @@ fn main() -> Result<()> {
             | Commands::Install
             | Commands::Uninstall
             | Commands::Init { .. }
+            | Commands::Callers { .. }
+            | Commands::Callees { .. }
+            | Commands::Impact { .. }
             | Commands::Languages
             | Commands::Repos
             | Commands::CleanRuntimes
@@ -1014,14 +1019,13 @@ fn run(command: Commands, root: &Path) -> Result<()> {
         Commands::DetectPatterns { pattern, json } => {
             cmd_detect_patterns(root, pattern.as_deref(), json)
         }
-        Commands::ScipEnrich { languages } => {
+        Commands::ScipEnrich { languages, run_id } => {
             let detected: std::collections::HashSet<String> = languages
                 .split(',')
                 .map(|s| s.trim().to_string())
                 .filter(|s| !s.is_empty())
                 .collect();
-            index::cmd_scip_enrich(root, &detected);
-            Ok(())
+            index::cmd_scip_enrich(root, &detected, run_id.as_deref())
         }
         Commands::CleanRuntimes => {
             scip_download::clean_runtimes();

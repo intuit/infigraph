@@ -18,7 +18,7 @@ use crate::model::{Relation, Symbol};
 /// `infigraph index` instead of leaving existing indexes on the old behavior.
 ///
 /// Query-file and grammar changes are detected automatically and need no bump.
-pub const EXTRACTOR_SCHEMA_VERSION: u32 = 1;
+pub const EXTRACTOR_SCHEMA_VERSION: u32 = 2;
 
 /// Combine `parts` into one fingerprint, length-prefixing each so that different
 /// splits can't collide (`"ab" + "c"` must not fingerprint the same as

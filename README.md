@@ -914,6 +914,26 @@ max_dead = 20
 ### SCIP Integration (Compiler-grade Enrichment)
 Infigraph natively imports [SCIP](https://sourcegraph.com/blog/announcing-scip) indexes to enrich the graph with precise compiler-grade symbols, types, and cross-file relationships. SCIP indexers are **auto-downloaded** — `infigraph index` detects project languages and fetches the right indexer binaries (with portable runtimes for Node.js, JRE, .NET, Dart, PHP) on first use:
 
+Local indexing records analysis-stage outcomes in `.infigraph/index-status.json`.
+With `--no-embed`, compiler enrichment runs in the foreground: if call resolution
+or an applicable SCIP indexer fails, indexing exits with code 1 and retains the
+usable syntax graph. Normal indexing reports background SCIP as pending; its
+final outcome is saved by the child process. Missing optional project
+prerequisites are recorded as skipped. Caller, callee, and impact queries show
+coverage notices, including after restarting the CLI or MCP worker. Missing,
+invalid, or obsolete receipts report unknown coverage. These receipts describe
+stage execution, not working-tree freshness or proof that every caller is known.
+Remote graph queries report unknown coverage. Re-running local indexing retries
+failed or interrupted enrichment even when source files are unchanged. Successful
+stages are reused when indexed-file fingerprints match; library-only no-op
+indexing preserves previous failures.
+
+TypeScript and TSX calls belong to the innermost extracted function, method, or
+test. Anonymous callbacks fall back to an enclosing callable; arbitrary function
+factory results remain variables. SCIP ownership uses callable spans and leaves
+boundary-line owners, indistinguishable inline owners, or ambiguous targets
+unresolved. Tree-sitter ownership uses full line and column spans.
+
 ```bash
 # Generate SCIP index with an existing indexer
 scip-typescript index --cwd .          # TypeScript/JavaScript

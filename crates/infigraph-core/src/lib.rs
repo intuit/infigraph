@@ -11,6 +11,7 @@ pub mod embed;
 pub mod export;
 pub mod extract;
 pub mod graph;
+pub mod index_status;
 pub mod lang;
 pub mod learned;
 pub mod lockfile;
@@ -276,6 +277,12 @@ impl Infigraph {
         }
     }
 
+    /// Execution coverage for the current local graph, without a freshness claim.
+    pub fn coverage_notice(&self) -> String {
+        let local = matches!(self.backend_kind, BackendKind::Kuzu(_));
+        index_status::coverage_notice(&self.root, if local { self.backend() } else { None })
+    }
+
     /// Index all supported files in the project, building the graph.
     /// Skips files whose content hash matches the stored hash (incremental).
     pub fn index(&self) -> Result<IndexResult> {
@@ -285,6 +292,11 @@ impl Infigraph {
 
     /// Backend-agnostic index path (used for Neo4j and future backends).
     fn index_via_backend(&self, backend: &dyn graph::GraphBackend) -> Result<IndexResult> {
+        let status = if matches!(self.backend_kind, BackendKind::Kuzu(_)) {
+            Some(index_status::AstRun::begin(&self.root)?)
+        } else {
+            None
+        };
         let files = self.collect_files()?;
         let total = files.len();
 
@@ -363,9 +375,11 @@ impl Infigraph {
         if !extractions.is_empty() {
             eprintln!("Resolving: calls + inheritance for {} files", indexed);
         }
+        let mut resolution_failed = false;
         let resolve_stats = backend
             .resolve_calls(&extractions, None)
             .unwrap_or_else(|e| {
+                resolution_failed = true;
                 eprintln!("warning: call resolution failed: {e}");
                 resolve::ResolveStats {
                     total_calls: 0,
@@ -384,6 +398,9 @@ impl Infigraph {
             );
         }
 
+        if let Some(status) = status {
+            status.finish(backend, resolution_failed, !extractions.is_empty())?;
+        }
         Ok(IndexResult {
             total_files: total,
             indexed_files: indexed,
@@ -518,13 +535,20 @@ impl Infigraph {
         let indexed = extractions.len();
 
         let backend = self.backend().context("call init() first")?;
+        let status = if matches!(self.backend_kind, BackendKind::Kuzu(_)) {
+            Some(index_status::AstRun::begin(&self.root)?)
+        } else {
+            None
+        };
         if !extractions.is_empty() {
             let existing_hashes = backend.get_file_hashes().unwrap_or_default();
             backend.upsert_files_bulk(&extractions, existing_hashes.is_empty())?;
         }
+        let mut resolution_failed = false;
         let resolve_stats = backend
             .resolve_calls(&extractions, None)
             .unwrap_or_else(|e| {
+                resolution_failed = true;
                 eprintln!("warning: call resolution failed: {e}");
                 resolve::ResolveStats {
                     total_calls: 0,
@@ -535,6 +559,9 @@ impl Infigraph {
                 }
             });
 
+        if let Some(status) = status {
+            status.finish(backend, resolution_failed, !extractions.is_empty())?;
+        }
         Ok(IndexResult {
             total_files: paths.len(),
             indexed_files: indexed,

@@ -58,6 +58,10 @@ pub fn import_scip_index(
 
     let index = Index::parse_from_bytes(&bytes)
         .with_context(|| format!("failed to parse SCIP index: {}", index_path.display()))?;
+    let scratch = tempfile::Builder::new()
+        .prefix("infigraph-scip-import-")
+        .tempdir()
+        .context("failed to create SCIP import scratch directory")?;
 
     let mut stats = ImportStats::default();
     let _lock = store.write_lock()?;
@@ -99,11 +103,12 @@ pub fn import_scip_index(
     // and file -> sorted Vec<(start_line, end_line, symbol_id)> for containment lookup
     let mut file_name_to_ids: HashMap<(String, String), Vec<String>> = HashMap::new();
     let mut file_symbols: HashMap<String, Vec<(u32, u32, String)>> = HashMap::new();
+    let mut typescript_callables: HashMap<String, Vec<(u32, u32, String)>> = HashMap::new();
 
-    let q = "MATCH (s:Symbol) RETURN s.id, s.file, s.name, s.start_line, s.end_line";
+    let q = "MATCH (s:Symbol) RETURN s.id, s.file, s.name, s.start_line, s.end_line, s.kind, s.language";
     if let Ok(rows) = conn.query(q) {
         for row in rows {
-            if row.len() < 5 {
+            if row.len() < 7 {
                 continue;
             }
             let sid = row[0].to_string().trim_matches('"').to_string();
@@ -111,6 +116,18 @@ pub fn import_scip_index(
             let sname = row[2].to_string().trim_matches('"').to_string();
             let sstart: u32 = row[3].to_string().trim_matches('"').parse().unwrap_or(0);
             let send: u32 = row[4].to_string().trim_matches('"').parse().unwrap_or(0);
+            let kind = row[5].to_string().trim_matches('"').to_string();
+            let language = row[6].to_string().trim_matches('"').to_string();
+            if matches!(language.as_str(), "typescript" | "tsx")
+                && ["Function", "Method", "Test"]
+                    .iter()
+                    .any(|k| kind.eq_ignore_ascii_case(k))
+            {
+                typescript_callables
+                    .entry(sfile.clone())
+                    .or_default()
+                    .push((sstart, send, sid.clone()));
+            }
 
             file_name_to_ids
                 .entry((sfile.clone(), sname))
@@ -126,6 +143,9 @@ pub fn import_scip_index(
 
     // Sort file_symbols by span size (smallest first) for containment lookup
     for syms in file_symbols.values_mut() {
+        syms.sort_by_key(|(s, e, _)| *e as i64 - *s as i64);
+    }
+    for syms in typescript_callables.values_mut() {
         syms.sort_by_key(|(s, e, _)| *e as i64 - *s as i64);
     }
 
@@ -232,8 +252,7 @@ pub fn import_scip_index(
     const CHUNK: usize = 2000;
     const MAX_SYMBOL_RETRIES: usize = 20;
     if !new_symbols.is_empty() {
-        let tmp = std::env::temp_dir();
-        let sym_pq = tmp.join("infigraph_scip_symbols.parquet");
+        let sym_pq = scratch.path().join("symbols.parquet");
 
         let mut seen_ids = std::collections::HashSet::with_capacity(new_symbols.len());
         let mut remaining: Vec<_> = new_symbols
@@ -398,8 +417,32 @@ pub fn import_scip_index(
             }
 
             let ref_line = occ.range.first().copied().unwrap_or(0) as u32;
+            let typescript = matches!(
+                Path::new(file).extension().and_then(|e| e.to_str()),
+                Some("ts" | "tsx" | "mts" | "cts")
+            );
 
-            let container_id = if let Some(syms) = file_symbols.get(file.as_str()) {
+            let container_id = if typescript {
+                // SCIP positions are zero-based; extracted spans are one-based.
+                // Only extracted callables may own inferred TypeScript calls.
+                // Line-only spans cannot verify boundary columns or distinguish
+                // inline siblings; leave those owners unresolved, not guessed.
+                typescript_callables.get(file.as_str()).and_then(|syms| {
+                    let line = u32::try_from(*occ.range.first()?).ok()?.checked_add(1)?;
+                    let mut candidates = syms
+                        .iter()
+                        .filter(|(start, end, _)| line >= *start && line <= *end);
+                    let owner = candidates.next()?;
+                    if line == owner.0
+                        || line == owner.1
+                        || candidates.any(|other| (other.0, other.1) == (owner.0, owner.1))
+                    {
+                        None
+                    } else {
+                        Some(owner.2.clone())
+                    }
+                })
+            } else if let Some(syms) = file_symbols.get(file.as_str()) {
                 syms.iter()
                     .find(|(start, end, _)| ref_line >= *start && ref_line <= *end)
                     .map(|(_, _, id)| id.clone())
@@ -413,7 +456,11 @@ pub fn import_scip_index(
             let target_id = if let Some((tfile, tname)) = scip_sym_to_file_name.get(&occ.symbol) {
                 file_name_to_ids
                     .get(&(tfile.clone(), tname.clone()))
-                    .and_then(|ids| ids.first())
+                    .and_then(|ids| {
+                        (!typescript || ids.len() == 1)
+                            .then(|| ids.first())
+                            .flatten()
+                    })
                     .cloned()
             } else {
                 None
@@ -464,8 +511,7 @@ pub fn import_scip_index(
     // Bulk write CALLS edges via Parquet COPY FROM, dropping any bad-PK
     // record and retrying rather than falling back to UNWIND for the batch.
     if !calls_to_create.is_empty() {
-        let tmp = std::env::temp_dir();
-        let edge_pq = tmp.join("infigraph_scip_calls.parquet");
+        let edge_pq = scratch.path().join("calls.parquet");
         stats.references_added = calls_to_create.len();
         copy_edges_with_bad_record_retry(
             &conn,
@@ -532,8 +578,7 @@ pub fn import_scip_index(
     // Bulk write INHERITS edges via Parquet COPY FROM, dropping any bad-PK
     // record and retrying rather than falling back to UNWIND for the batch.
     if !inherits_to_create.is_empty() {
-        let tmp = std::env::temp_dir();
-        let edge_pq = tmp.join("infigraph_scip_inherits.parquet");
+        let edge_pq = scratch.path().join("inherits.parquet");
         stats.relations_added = inherits_to_create.len();
         copy_edges_with_bad_record_retry(
             &conn,
@@ -1058,6 +1103,104 @@ mod tests {
             vec!["mintFn".to_string()],
             "no node should exist for the parameter descriptor, and its name must not \
              leak through as a raw unparsed moniker on any node"
+        );
+    }
+
+    #[test]
+    fn typescript_scip_callers_use_callables_and_one_based_lines() {
+        let env = TestEnv::new();
+        let conn = env.store.connection().unwrap();
+        for (id, kind, start, end, file, name) in [
+            ("outer", "Function", 1, 20, "test.ts", "outer"),
+            ("inner", "Function", 4, 10, "test.ts", "inner"),
+            ("value", "Variable", 7, 7, "test.ts", "value"),
+            ("testCaller", "Test", 12, 18, "test.ts", "testCaller"),
+            ("helper", "Function", 30, 35, "test.ts", "helper"),
+            ("Client::run", "Method", 1, 5, "view.tsx", "run"),
+            ("first", "Function", 1, 1, "inline.ts", "first"),
+            ("second", "Function", 1, 1, "inline.ts", "second"),
+            ("only", "Function", 1, 1, "boundary.ts", "only"),
+            ("A::collision", "Method", 40, 45, "test.ts", "collision"),
+            ("B::collision", "Method", 40, 45, "test.ts", "collision"),
+        ] {
+            conn.query(&format!("CREATE (:Symbol {{id: '{file}::{id}', name: '{name}', kind: '{kind}', file: '{file}', start_line: {start}, end_line: {end}, signature_hash: '', language: 'typescript', visibility: 'public', parent: '', docstring: '', complexity: 0, parameters: '', return_type: ''}})")) .unwrap();
+        }
+        let helper = "scip-test npm test 1.0.0 `test.ts`/helper().";
+        let occurrence = |line, definition| Occurrence {
+            range: vec![line, 0, 6],
+            symbol: helper.into(),
+            symbol_roles: if definition {
+                SymbolRole::Definition as i32
+            } else {
+                0
+            },
+            ..Default::default()
+        };
+        let index = Index {
+            documents: vec![
+                Document {
+                    relative_path: "test.ts".into(),
+                    occurrences: vec![
+                        occurrence(29, true),
+                        occurrence(3, false),
+                        occurrence(7, false),
+                        occurrence(13, false),
+                        Occurrence {
+                            range: vec![39, 0, 9],
+                            symbol: "scip-test npm test 1.0.0 `test.ts`/A#collision().".into(),
+                            symbol_roles: SymbolRole::Definition as i32,
+                            ..Default::default()
+                        },
+                        Occurrence {
+                            range: vec![5, 0, 9],
+                            symbol: "scip-test npm test 1.0.0 `test.ts`/A#collision().".into(),
+                            ..Default::default()
+                        },
+                    ],
+                    ..Default::default()
+                },
+                Document {
+                    relative_path: "view.tsx".into(),
+                    occurrences: vec![occurrence(1, false)],
+                    ..Default::default()
+                },
+                Document {
+                    relative_path: "inline.ts".into(),
+                    occurrences: vec![occurrence(0, false)],
+                    ..Default::default()
+                },
+                Document {
+                    relative_path: "boundary.ts".into(),
+                    occurrences: vec![occurrence(0, false)],
+                    ..Default::default()
+                },
+            ],
+            ..Default::default()
+        };
+        let artifact = env._dir.path().join("index.scip");
+        std::fs::write(&artifact, index.write_to_bytes().unwrap()).unwrap();
+        import_scip_index(&artifact, &env.store, None).unwrap();
+        assert!(conn
+            .query("MATCH (a:Symbol)-[:CALLS]->(b:Symbol) WHERE b.name = 'collision' RETURN a.id")
+            .unwrap()
+            .next()
+            .is_none());
+        let mut ids: Vec<_> = conn
+            .query(
+                "MATCH (a:Symbol)-[:CALLS]->(b:Symbol) WHERE b.id = 'test.ts::helper' RETURN a.id",
+            )
+            .unwrap()
+            .map(|row| row[0].to_string().trim_matches('"').to_string())
+            .collect();
+        ids.sort();
+        ids.dedup();
+        assert_eq!(
+            ids,
+            vec![
+                "test.ts::inner",
+                "test.ts::testCaller",
+                "view.tsx::Client::run"
+            ]
         );
     }
 

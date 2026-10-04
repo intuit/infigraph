@@ -32,24 +32,17 @@ pub fn extract_file(path: &str, source: &[u8], pack: &LanguagePack) -> Result<Fi
             let root = tree.root_node();
 
             let symbols = extract_entities(path, source, root, entity_query, &pack.name);
-            let relations = if pack.custom_edges.is_empty() {
-                extract_relations(
-                    path,
-                    source,
-                    root,
-                    relation_query,
-                    inherit_decompose_query.as_deref(),
-                )
-            } else {
-                extract_relations_with_custom_edges(
-                    path,
-                    source,
-                    root,
-                    relation_query,
-                    &pack.custom_edges,
-                    inherit_decompose_query.as_deref(),
-                )
-            };
+            let owners =
+                matches!(pack.name.as_str(), "typescript" | "tsx").then_some(symbols.as_slice());
+            let relations = relations::extract_relations_with_owners(
+                path,
+                source,
+                root,
+                relation_query,
+                &pack.custom_edges,
+                inherit_decompose_query.as_deref(),
+                owners,
+            );
             let stmts = extract_statements_for_symbols(root, source, &symbols);
             Ok((symbols, relations, stmts))
         })?,
