@@ -381,6 +381,9 @@ pub fn load_embeddings(path: &Path) -> Result<Vec<(String, Vec<f32>)>> {
 
     anyhow::ensure!(data.len() >= 4, "embeddings file too small");
     let count = u32::from_le_bytes(data[0..4].try_into().unwrap()) as usize;
+    // Each entry needs at least an ID length and a dimension (two u32s).
+    // Validate the untrusted count before reserving memory from it.
+    anyhow::ensure!(count <= (data.len() - 4) / 8, "truncated embeddings file");
     let mut result = Vec::with_capacity(count);
     let mut pos = 4usize;
 
