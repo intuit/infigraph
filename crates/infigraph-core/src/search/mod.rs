@@ -388,85 +388,56 @@ pub fn grep_search(
         .map_err(|e| anyhow::anyhow!("invalid file pattern: {}", e))?;
 
     let mut matches = Vec::new();
-    walk_and_search(root, root, &re, &glob_pat, limit, &mut matches)?;
+    walk_and_search(root, &re, &glob_pat, limit, &mut matches)?;
     Ok(matches)
 }
 
-/// Directories to skip during the grep walk (same set as Infigraph::walk_dir).
-const IGNORE_DIRS: &[&str] = &[
-    ".infigraph",
-    ".git",
-    "node_modules",
-    "__pycache__",
-    ".venv",
-    "venv",
-    "target",
-    "build",
-    "dist",
-    ".tox",
-];
-
 fn walk_and_search(
     base: &Path,
-    dir: &Path,
     re: &Regex,
     glob_pat: &Option<glob::Pattern>,
     limit: usize,
     matches: &mut Vec<GrepMatch>,
 ) -> Result<()> {
-    if matches.len() >= limit {
-        return Ok(());
-    }
-
-    let entries = match std::fs::read_dir(dir) {
-        Ok(e) => e,
-        Err(_) => return Ok(()), // skip unreadable dirs
-    };
-
-    for entry in entries {
+    for result in crate::ignore_rules::walk_builder(base).build() {
         if matches.len() >= limit {
             return Ok(());
         }
-        let entry = entry?;
+        let entry = match result {
+            Ok(e) => e,
+            Err(_) => continue,
+        };
+        if !entry.file_type().is_some_and(|ft| ft.is_file()) {
+            continue;
+        }
         let path = entry.path();
-        let name = entry.file_name();
-        let name_str = name.to_string_lossy();
+        let rel = path
+            .strip_prefix(base)
+            .unwrap_or(path)
+            .to_string_lossy()
+            .replace('\\', "/");
 
-        if path.is_dir() {
-            if !IGNORE_DIRS.contains(&name_str.as_ref()) && !name_str.starts_with('.') {
-                walk_and_search(base, &path, re, glob_pat, limit, matches)?;
+        if let Some(ref gp) = glob_pat {
+            if !gp.matches(&rel) {
+                continue;
             }
-        } else if path.is_file() {
-            let rel = path
-                .strip_prefix(base)
-                .unwrap_or(&path)
-                .to_string_lossy()
-                .replace('\\', "/");
+        }
 
-            // Apply optional file-name glob filter
-            if let Some(ref gp) = glob_pat {
-                if !gp.matches(&rel) {
-                    continue;
-                }
+        let content = match std::fs::read_to_string(path) {
+            Ok(c) => c,
+            Err(_) => continue,
+        };
+
+        for (idx, line) in content.lines().enumerate() {
+            if matches.len() >= limit {
+                return Ok(());
             }
-
-            // Skip binary files — try to read as UTF-8
-            let content = match std::fs::read_to_string(&path) {
-                Ok(c) => c,
-                Err(_) => continue,
-            };
-
-            for (idx, line) in content.lines().enumerate() {
-                if matches.len() >= limit {
-                    return Ok(());
-                }
-                if re.is_match(line) {
-                    matches.push(GrepMatch {
-                        file: rel.clone(),
-                        line_number: idx + 1,
-                        line_text: line.to_string(),
-                    });
-                }
+            if re.is_match(line) {
+                matches.push(GrepMatch {
+                    file: rel.clone(),
+                    line_number: idx + 1,
+                    line_text: line.to_string(),
+                });
             }
         }
     }
