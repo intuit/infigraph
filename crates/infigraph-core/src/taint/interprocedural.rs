@@ -166,7 +166,7 @@ fn find_sources_and_sinks_from_cache(
             if !found_source {
                 for src in super::sources::TAINT_SOURCES {
                     for &pat in src.patterns {
-                        if lower.contains(&pat.to_lowercase()) {
+                        if lower.contains(pat) {
                             sources.push((func.id.clone(), src.kind.to_string()));
                             found_source = true;
                             break;
@@ -181,7 +181,7 @@ fn find_sources_and_sinks_from_cache(
             if !found_sink {
                 for sink in TAINT_SINKS {
                     for &pat in sink.patterns {
-                        if lower.contains(&pat.to_lowercase()) {
+                        if lower.contains(pat) {
                             sinks.insert(
                                 func.id.clone(),
                                 (sink.kind.to_string(), sink.category.to_string()),
@@ -243,7 +243,7 @@ fn find_source_functions(backend: &dyn GraphBackend, root: &Path) -> Result<Vec<
             let lower = line.to_lowercase();
             for src in TAINT_SOURCES {
                 for &pat in src.patterns {
-                    if lower.contains(&pat.to_lowercase()) {
+                    if lower.contains(pat) {
                         sources.push((id.clone(), src.kind.to_string()));
                         break;
                     }
@@ -302,7 +302,7 @@ fn find_sink_functions(
             let lower = line.to_lowercase();
             for sink in TAINT_SINKS {
                 for &pat in sink.patterns {
-                    if lower.contains(&pat.to_lowercase()) {
+                    if lower.contains(pat) {
                         sinks.insert(
                             id.clone(),
                             (sink.kind.to_string(), sink.category.to_string()),
