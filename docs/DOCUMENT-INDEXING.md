@@ -512,26 +512,29 @@ Embedding logic is in `embed.rs`.
 
 ## Search
 
-### hybrid_doc_search (`search.rs:97-201`)
+### hybrid_doc_search (`search.rs:206-218`)
 
-The primary search entry point, called from `tool_search_docs`:
+The primary search entry point, called from `tool_search_docs`. Delegates to `hybrid_doc_search_in_dir` (`search.rs:257-360`) for local mode:
 
-1. Load all chunks from store
-2. Build a fresh `DocBM25Index` in-memory (rebuilt per query — no persistent BM25 on disk)
-3. BM25 search for top `limit * 3` results
-4. Normalize BM25 scores by max score
-5. Vector search: embed query → HNSW search (or brute-force linear scan if no HNSW index)
-6. Normalize vector scores by max
-7. Combine: `score = (1 - alpha) * bm25 + alpha * vector` (default `alpha = 0.5`)
-8. Sort, truncate to `limit`, hydrate full chunk details
+1. Load or build a `DocBM25Index` (see Persistent cache below)
+2. BM25 search for top `limit * 3` results
+3. Normalize BM25 scores by max score
+4. Vector search: embed query → HNSW search (or brute-force linear scan if no HNSW index)
+5. Normalize vector scores by max
+6. Combine: `score = (1 - alpha) * bm25 + alpha * vector` (default `alpha = 0.5`)
+7. Sort, truncate to `limit`, hydrate full chunk details
 
-### DocBM25Index (`search.rs:28-94`)
+### DocBM25Index (`search.rs:31-204`)
 
 Standard Okapi BM25 implementation:
 
 - `build(docs)`: tokenizes all docs, builds inverted index `term → [(doc_idx, term_freq)]`, tracks `avg_doc_len`
 - `search(query, limit)`: IDF = `ln((N - df + 0.5) / (df + 0.5) + 1)`, standard TF normalization with K1 and B parameters
 - Tokenizer: simple whitespace splitting + lowercasing
+
+### Persistent cache
+
+BM25 index is persisted as `.infigraph/docs_bm25_cache.bin`, valid only when at least as new as `docs_embeddings.bin` (the freshness anchor — the same pattern code search uses for `bm25_cache.bin`), so a doc reindex that rewrites embeddings automatically invalidates the cache. A missing, stale, or corrupt cache is not an error: `load_or_build_doc_index` silently falls back to rebuilding the index in-memory from the store and best-effort re-saves it (save failures are non-fatal). The cache is only written when `docs_embeddings.bin` already exists and the chunk set is non-empty — without an anchor there is no invalidation signal, so no cache is written.
 
 ### Result format
 
