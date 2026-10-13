@@ -1,7 +1,7 @@
 use anyhow::Result;
 use serde::Serialize;
 
-use crate::graph::GraphBackend;
+use crate::graph::{Concern, GraphBackend};
 
 #[derive(Debug, Clone, Serialize)]
 pub struct ConcernMatch {
@@ -290,7 +290,15 @@ pub fn detect_cross_cutting(backend: &dyn GraphBackend) -> Result<Vec<ConcernMat
     }
 
     if !matches.is_empty() {
-        write_concerns(backend, &matches)?;
+        let concerns: Vec<Concern> = matches
+            .iter()
+            .map(|m| Concern {
+                symbol_id: m.symbol_id.clone(),
+                kind: m.kind.to_string(),
+                detail: m.detail.clone(),
+            })
+            .collect();
+        backend.replace_concerns(&concerns)?;
     }
 
     Ok(matches)
@@ -303,31 +311,6 @@ fn extract_matched_line(docstring: &str, pattern: &str) -> String {
         }
     }
     pattern.to_string()
-}
-
-fn write_concerns(backend: &dyn GraphBackend, matches: &[ConcernMatch]) -> Result<()> {
-    backend.raw_query("BEGIN TRANSACTION")?;
-
-    let _ = backend.raw_query("MATCH (c:Concern) DETACH DELETE c");
-
-    for m in matches {
-        let sym_esc = crate::escape_str(&m.symbol_id);
-        let kind_esc = crate::escape_str(m.kind);
-        let detail_esc = crate::escape_str(&m.detail);
-        let concern_id = format!("{}::{}", m.symbol_id, m.kind);
-        let id_esc = crate::escape_str(&concern_id);
-
-        let _ = backend.raw_query(&format!(
-            "CREATE (c:Concern {{id: '{id_esc}', kind: '{kind_esc}', detail: '{detail_esc}'}})"
-        ));
-        let _ = backend.raw_query(&format!(
-            "MATCH (s:Symbol), (c:Concern) WHERE s.id = '{sym_esc}' AND c.id = '{id_esc}' CREATE (s)-[:HAS_CONCERN]->(c)"
-        ));
-    }
-
-    backend.raw_query("COMMIT")?;
-
-    Ok(())
 }
 
 pub fn format_concerns(matches: &[ConcernMatch]) -> String {
