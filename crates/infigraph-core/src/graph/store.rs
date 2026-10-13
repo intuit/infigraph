@@ -38,6 +38,79 @@ impl WriteLock {
     }
 }
 
+/// Every WAL-family sibling of the database at `db_path` that currently
+/// exists: `<db>.wal` plus the `<db>.wal.*` family.
+///
+/// Kuzu's on-disk WAL filename APPENDS ".wal" to the full db filename
+/// (e.g. "graph" -> "graph.wal", "docs.kuzu" -> "docs.kuzu.wal"). It does
+/// NOT replace the extension the way `Path::with_extension` does.
+fn wal_family_paths(db_path: &Path) -> Vec<PathBuf> {
+    let mut found = Vec::new();
+    let wal = PathBuf::from(format!("{}.wal", db_path.display()));
+    if wal.exists() {
+        found.push(wal);
+    }
+    if let (Some(parent), Some(name)) = (db_path.parent(), db_path.file_name()) {
+        let prefix = format!("{}.wal.", name.to_string_lossy());
+        if let Ok(entries) = std::fs::read_dir(parent) {
+            for e in entries.flatten() {
+                if e.file_name().to_string_lossy().starts_with(&prefix) {
+                    found.push(e.path());
+                }
+            }
+        }
+    }
+    found
+}
+
+/// Whether a process with this PID is currently running.
+fn pid_is_alive(pid: u32) -> bool {
+    let spid = sysinfo::Pid::from_u32(pid);
+    let mut sys = sysinfo::System::new();
+    sys.refresh_processes(sysinfo::ProcessesToUpdate::Some(&[spid]), true);
+    sys.process(spid).is_some()
+}
+
+/// If `db_path`'s graph shows signs of an unclean shutdown that can make
+/// Kuzu's WAL-replay-on-open crash the whole process, returns the dead
+/// holder's PID. `None` means it's safe to proceed to `Database::new` as
+/// normal.
+///
+/// Observed directly: a stale WAL left by a process that died without a
+/// clean checkpoint made `Database::new`'s WAL replay
+/// (`WALReplayer::replayNodeTableInsertRecord` -> `NodeTable::insert` ->
+/// `DiskArrayInternal::get`) hit `SIGBUS`/`EXC_BAD_ACCESS` and abort the
+/// whole process -- on a plain **read-only** open reached by an ordinary
+/// query, not just a risky write path, and before any `Result` existed for
+/// calling code to catch.
+///
+/// Two signals together, deliberately not either alone:
+/// - A WAL-family sibling exists (`wal_family_paths`) -- Kuzu did not
+///   complete a clean checkpoint before this graph was last closed. This
+///   alone is completely routine: a live writer mid-transaction, or a
+///   replay that would succeed fine, both leave a WAL sibling in place.
+/// - The write lock's recorded holder is confirmed dead (the OS reports no
+///   such process running right now). This is what turns "needs replay"
+///   (routine) into "the process that would have driven that
+///   replay/checkpoint died before finishing it" (suspect).
+///
+/// Requiring both keeps this from flagging the common, harmless case (a
+/// live writer's WAL, or a replay that would just work) while still
+/// catching the crash scenario above. A lock file that's absent, empty, or
+/// unparseable reads as "can't confirm a dead holder" and does not flag --
+/// conservative by design, since a false positive here means refusing to
+/// open a perfectly good graph.
+fn unclean_shutdown_wal_holder(db_path: &Path, lock_path: &Path) -> Option<u32> {
+    if wal_family_paths(db_path).is_empty() {
+        return None;
+    }
+    let holder = lockfile::read_holder(lock_path)?;
+    if pid_is_alive(holder.pid) {
+        return None; // holder is alive -- not our call to intervene
+    }
+    Some(holder.pid)
+}
+
 /// Persistent graph store backed by Kuzu.
 pub struct GraphStore {
     db: Database,
@@ -51,6 +124,15 @@ impl GraphStore {
             std::fs::create_dir_all(parent)?;
         }
         let lock_path = path.with_extension("lock");
+        if let Some(pid) = unclean_shutdown_wal_holder(path, &lock_path) {
+            anyhow::bail!(
+                "graph {} has an unreplayed WAL from process {pid}, which is no longer \
+                 running (unclean shutdown) -- refusing to open it directly, since WAL \
+                 replay in this state has been observed to crash the whole process with \
+                 SIGBUS; delete the graph directory to rebuild, or restore from a backup",
+                path.display()
+            );
+        }
         let db = Database::new(path, SystemConfig::default())
             .map_err(|e| anyhow::anyhow!("failed to open kuzu db: {e}"))?;
         let store = Self { db, lock_path };
@@ -73,6 +155,15 @@ impl GraphStore {
     /// Safe for concurrent access while a watcher is writing.
     pub fn open_read_only(path: &Path) -> Result<Self> {
         let lock_path = path.with_extension("lock");
+        if let Some(pid) = unclean_shutdown_wal_holder(path, &lock_path) {
+            anyhow::bail!(
+                "graph {} has an unreplayed WAL from process {pid}, which is no longer \
+                 running (unclean shutdown) -- refusing to open it directly, since WAL \
+                 replay in this state has been observed to crash the whole process with \
+                 SIGBUS; rebuild the graph or restore from a backup",
+                path.display()
+            );
+        }
         let config = SystemConfig::default()
             .read_only(true)
             .throw_on_wal_replay_failure(false);
@@ -264,4 +355,112 @@ fn count_query(conn: &Connection, query: &str) -> Result<u64> {
         }
     }
     Ok(0)
+}
+
+#[cfg(test)]
+mod unclean_shutdown_wal_tests {
+    use super::*;
+
+    fn write_holder_lock(lock_path: &Path, pid: u32) {
+        if let Some(parent) = lock_path.parent() {
+            std::fs::create_dir_all(parent).unwrap();
+        }
+        let info = lockfile::LockInfo {
+            pid,
+            role: "test".to_string(),
+            build_hash: "test".to_string(),
+            acquired_at: 0,
+        };
+        std::fs::write(lock_path, serde_json::to_string(&info).unwrap()).unwrap();
+    }
+
+    /// A PID essentially guaranteed not to be a running process, standing
+    /// in for "the write lock's recorded holder is dead" across these tests.
+    const DEAD_PID: u32 = 999_999;
+
+    #[test]
+    fn unclean_shutdown_wal_holder_flags_wal_plus_dead_holder() {
+        let dir = tempfile::tempdir().unwrap();
+        let db_path = dir.path().join("graph");
+        std::fs::write(dir.path().join("graph.wal"), b"wal").unwrap();
+        let lock_path = db_path.with_extension("lock");
+        write_holder_lock(&lock_path, DEAD_PID);
+
+        assert_eq!(
+            unclean_shutdown_wal_holder(&db_path, &lock_path),
+            Some(DEAD_PID)
+        );
+    }
+
+    #[test]
+    fn unclean_shutdown_wal_holder_ignores_a_live_holder() {
+        let dir = tempfile::tempdir().unwrap();
+        let db_path = dir.path().join("graph");
+        std::fs::write(dir.path().join("graph.wal"), b"wal").unwrap();
+        let lock_path = db_path.with_extension("lock");
+        write_holder_lock(&lock_path, std::process::id());
+
+        assert_eq!(
+            unclean_shutdown_wal_holder(&db_path, &lock_path),
+            None,
+            "a live writer's WAL is routine, not a signal to refuse opening"
+        );
+    }
+
+    #[test]
+    fn unclean_shutdown_wal_holder_ignores_no_wal_even_with_a_dead_holder() {
+        let dir = tempfile::tempdir().unwrap();
+        let db_path = dir.path().join("graph");
+        let lock_path = db_path.with_extension("lock");
+        write_holder_lock(&lock_path, DEAD_PID);
+
+        assert_eq!(
+            unclean_shutdown_wal_holder(&db_path, &lock_path),
+            None,
+            "a dead holder alone (no WAL) means nothing was left mid-replay"
+        );
+    }
+
+    #[test]
+    fn unclean_shutdown_wal_holder_ignores_a_wal_with_no_lock_file() {
+        let dir = tempfile::tempdir().unwrap();
+        let db_path = dir.path().join("graph");
+        std::fs::write(dir.path().join("graph.wal"), b"wal").unwrap();
+        let lock_path = db_path.with_extension("lock");
+
+        assert_eq!(
+            unclean_shutdown_wal_holder(&db_path, &lock_path),
+            None,
+            "can't confirm a dead holder without a lock payload to read -- conservative by design"
+        );
+    }
+
+    /// Regression test: a stale WAL from a dead process used to be handed
+    /// straight to `kuzu::Database::new`, which crashed the whole process
+    /// with SIGBUS deep inside WAL replay -- before any `Result` existed to
+    /// catch it. Both `open` and `open_read_only` must refuse up front
+    /// instead.
+    #[test]
+    fn open_refuses_a_graph_with_an_unreplayed_wal_from_a_dead_process() {
+        let dir = tempfile::tempdir().unwrap();
+        let db_path = dir.path().join("graph");
+        std::fs::write(
+            &db_path,
+            b"not a real kuzu db, doesn't matter for this test",
+        )
+        .unwrap();
+        std::fs::write(dir.path().join("graph.wal"), b"wal").unwrap();
+        write_holder_lock(&db_path.with_extension("lock"), DEAD_PID);
+
+        let err = GraphStore::open(&db_path)
+            .map(|_| ())
+            .expect_err("must refuse rather than attempt Database::new");
+        assert!(err.to_string().contains("unreplayed WAL"), "{err}");
+        assert!(err.to_string().contains(&DEAD_PID.to_string()), "{err}");
+
+        let err = GraphStore::open_read_only(&db_path)
+            .map(|_| ())
+            .expect_err("read-only open must refuse too");
+        assert!(err.to_string().contains("unreplayed WAL"), "{err}");
+    }
 }
