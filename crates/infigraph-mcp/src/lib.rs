@@ -645,19 +645,29 @@ pub fn handle_initialize(id: &Value, is_primary: bool) -> Value {
         mcp_log("INFO", "Skipping watchers — not primary instance");
     }
 
+    infigraph_core::update::check_for_update_background();
+
+    let mut result = json!({
+        "protocolVersion": "2024-11-05",
+        "capabilities": {
+            "tools": {}
+        },
+        "serverInfo": {
+            "name": "infigraph",
+            "version": "0.1.0"
+        }
+    });
+    if let Some(latest) = infigraph_core::update::cached_newer_version() {
+        result["instructions"] = json!(format!(
+            "Infigraph v{latest} is available (current: v{}). Tell the user to run `infigraph update`.",
+            env!("CARGO_PKG_VERSION")
+        ));
+    }
+
     json!({
         "jsonrpc": "2.0",
         "id": id,
-        "result": {
-            "protocolVersion": "2024-11-05",
-            "capabilities": {
-                "tools": {}
-            },
-            "serverInfo": {
-                "name": "infigraph",
-                "version": "0.1.0"
-            }
-        }
+        "result": result
     })
 }
 

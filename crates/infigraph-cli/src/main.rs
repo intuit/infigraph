@@ -793,7 +793,7 @@ fn main() -> Result<()> {
         .stack_size(32 * 1024 * 1024)
         .build_global();
 
-    let update_handle = install::check_for_update_background();
+    let update_handle = infigraph_core::update::check_for_update_background();
 
     let cli = Cli::parse();
     let root = cli.root.unwrap_or_else(|| PathBuf::from("."));

@@ -31,6 +31,7 @@ pub mod security;
 pub mod sequence;
 pub mod structured;
 pub mod taint;
+pub mod update;
 pub mod viz;
 pub mod vuln;
 pub mod watch;
