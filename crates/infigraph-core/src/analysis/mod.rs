@@ -57,7 +57,12 @@ fn node_condition_text<'a>(node: Node<'a>, source: &'a [u8], kind: &str) -> Stri
 fn truncate_condition(text: &str) -> String {
     let cleaned: String = text.chars().filter(|c| !c.is_control()).collect();
     if cleaned.len() > 120 {
-        format!("{}...", &cleaned[..117])
+        // Cut at a char boundary so a multi-byte character at byte 117 doesn't panic.
+        let end = (0..=117)
+            .rev()
+            .find(|&i| cleaned.is_char_boundary(i))
+            .unwrap_or(0);
+        format!("{}...", &cleaned[..end])
     } else {
         cleaned
     }
@@ -332,5 +337,45 @@ mod tests {
         let stmts = parse_python(source);
         let kinds: Vec<&str> = stmts.iter().map(|s| s.kind.as_str()).collect();
         assert!(kinds.contains(&"If"), "expected If, got {:?}", kinds);
+    }
+
+    #[test]
+    fn test_python_long_non_ascii_condition() {
+        let source = format!(
+            "def authorize(request):\n    if request.user == \"{}\":\n        return True\n    return False\n",
+            "国".repeat(40)
+        );
+        let stmts = parse_python(&source);
+        let cond = &stmts
+            .iter()
+            .find(|s| s.kind.as_str() == "If")
+            .unwrap()
+            .condition;
+        assert!(
+            cond.ends_with("..."),
+            "expected a truncated condition, got {cond:?}"
+        );
+        assert!(cond.len() <= 120, "condition is {} bytes", cond.len());
+    }
+
+    #[test]
+    fn test_truncate_condition_char_boundaries() {
+        for prefix in ["", "a", "ab"] {
+            for unit in ["国", "é", "😀"] {
+                let text = format!("{prefix}{}", unit.repeat(70));
+                let truncated = truncate_condition(&text);
+                assert!(truncated.ends_with("..."));
+                assert!(truncated.len() <= 120);
+                assert!(text.starts_with(truncated.trim_end_matches("...")));
+            }
+        }
+    }
+
+    #[test]
+    fn test_truncate_condition_ascii() {
+        let long = "x".repeat(200);
+        assert_eq!(truncate_condition(&long), format!("{}...", "x".repeat(117)));
+        let short = "x".repeat(120);
+        assert_eq!(truncate_condition(&short), short);
     }
 }
