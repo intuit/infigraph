@@ -1,6 +1,7 @@
 use std::path::{Path, PathBuf};
 
 use anyhow::{Context, Result};
+use infigraph_core::update::{self, fetch_latest_version, update_cache_path, version_newer};
 
 use crate::config_targets::{self, ConfigFormat, AGENT_TARGETS};
 
@@ -598,102 +599,12 @@ pub(crate) fn print_capabilities_summary(configured: &[&str]) {
     println!();
 }
 
-pub(crate) fn update_cache_path() -> Option<PathBuf> {
-    dirs::home_dir().map(|h| h.join(".infigraph").join("update_check.json"))
-}
-
-pub(crate) fn fetch_latest_version() -> Option<String> {
-    let gh_host = std::env::var("INFIGRAPH_GH_HOST").unwrap_or_else(|_| "github.com".to_string());
-    let gh_owner = std::env::var("INFIGRAPH_GH_OWNER").unwrap_or_else(|_| "intuit".to_string());
-    let gh_repo = "infigraph";
-
-    let mut args = vec!["api"];
-    let api_path = format!("repos/{gh_owner}/{gh_repo}/releases/latest");
-    if gh_host != "github.com" {
-        args.extend(["--hostname", &gh_host]);
-    }
-    args.push(&api_path);
-    args.extend(["--jq", ".tag_name"]);
-
-    let output = std::process::Command::new("gh").args(&args).output().ok()?;
-    if !output.status.success() {
-        return None;
-    }
-    let tag = String::from_utf8_lossy(&output.stdout).trim().to_string();
-    let version = tag.strip_prefix('v').unwrap_or(&tag).to_string();
-    if version.is_empty() {
-        None
-    } else {
-        Some(version)
-    }
-}
-
-pub(crate) fn version_newer(latest: &str, current: &str) -> bool {
-    let parse = |s: &str| -> Vec<u32> { s.split('.').filter_map(|p| p.parse().ok()).collect() };
-    parse(latest) > parse(current)
-}
-
-pub(crate) fn check_for_update_background() -> Option<std::thread::JoinHandle<()>> {
-    let cache_path = update_cache_path()?;
-
-    if let Ok(content) = std::fs::read_to_string(&cache_path) {
-        if let Ok(cached) = serde_json::from_str::<serde_json::Value>(&content) {
-            if let Some(ts) = cached.get("checked_at").and_then(|v| v.as_i64()) {
-                let now = std::time::SystemTime::now()
-                    .duration_since(std::time::UNIX_EPOCH)
-                    .unwrap_or_default()
-                    .as_secs() as i64;
-                if now - ts < 86400 {
-                    return None;
-                }
-            }
-        }
-    }
-
-    Some(std::thread::spawn(move || {
-        let Some(latest) = fetch_latest_version() else {
-            return;
-        };
-        let now = std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .unwrap_or_default()
-            .as_secs() as i64;
-        let cache = serde_json::json!({
-            "latest_version": latest,
-            "current_version": env!("CARGO_PKG_VERSION"),
-            "checked_at": now,
-        });
-        if let Some(parent) = cache_path.parent() {
-            let _ = std::fs::create_dir_all(parent);
-        }
-        let _ = std::fs::write(
-            &cache_path,
-            serde_json::to_string(&cache).unwrap_or_default(),
-        );
-    }))
-}
-
 pub(crate) fn print_update_hint(handle: Option<std::thread::JoinHandle<()>>) {
     if let Some(h) = handle {
         let _ = h.join();
     }
-    let Some(cache_path) = update_cache_path() else {
-        return;
-    };
-    let content = match std::fs::read_to_string(&cache_path) {
-        Ok(c) => c,
-        Err(_) => return,
-    };
-    let cached: serde_json::Value = match serde_json::from_str(&content) {
-        Ok(v) => v,
-        Err(_) => return,
-    };
-    let latest = cached
-        .get("latest_version")
-        .and_then(|v| v.as_str())
-        .unwrap_or("");
-    let current = env!("CARGO_PKG_VERSION");
-    if version_newer(latest, current) {
+    if let Some(latest) = update::cached_newer_version() {
+        let current = env!("CARGO_PKG_VERSION");
         eprintln!(
             "\n  infigraph v{latest} available (current: v{current}). Run `infigraph update` to upgrade.\n"
         );
