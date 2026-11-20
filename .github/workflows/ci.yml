@@ -1,7 +1,7 @@
 name: CI
 
-# TEMPORARY debug workflow (draft PR, do not merge): capture native backtraces
-# for the SIGSEGVs seen on #90/#91.
+# TEMPORARY debug workflow (draft PR, do not merge): diagnose the Ubuntu
+# SIGSEGV in lbug::Database::initBufferManager -> std::vformat.
 on:
   pull_request:
     branches: [main]
@@ -12,58 +12,54 @@ env:
   RUST_BACKTRACE: full
 
 jobs:
-  segv:
-    name: SIGSEGV (${{ matrix.os }})
-    runs-on: ${{ matrix.os }}
-    strategy:
-      fail-fast: false
-      matrix:
-        include:
-          - os: macos-latest
-            pkg: infigraph-mcp
-            target: --test concurrent_writer_reader
-          - os: ubuntu-latest
-            pkg: infigraph-cli
-            target: --bin infigraph
+  facts:
+    name: Ubuntu toolchain facts + duplicate symbols
+    runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
-      - name: Link OpenSSL (macOS)
-        if: runner.os == 'macOS'
-        run: |
-          brew list openssl@3 >/dev/null 2>&1 || brew install openssl@3
-          echo "LIBRARY_PATH=$(brew --prefix openssl@3)/lib" >> "$GITHUB_ENV"
-      - name: Install gdb (Ubuntu)
-        if: runner.os == 'Linux'
-        run: sudo apt-get update -qq && sudo apt-get install -y -qq gdb
       - uses: dtolnay/rust-toolchain@stable
       - uses: Swatinem/rust-cache@v2
         with:
-          key: ci-${{ matrix.os }}
+          key: ci-ubuntu-latest
           save-if: false
-      - name: Build test binary
+      - name: Toolchain facts
         run: |
-          cargo test -p ${{ matrix.pkg }} ${{ matrix.target }} --no-run --message-format=json \
-            | jq -r 'select(.executable != null) | .executable' | tail -1 > test-bin.txt
-          echo "TEST_BIN=$(cat test-bin.txt)" >> "$GITHUB_ENV"
-          cat test-bin.txt
-      - name: Run (macOS, 8 attempts under lldb)
-        if: runner.os == 'macOS'
+          set -x
+          cat /etc/os-release | head -3
+          gcc --version | head -1; g++ --version | head -1; c++ --version | head -1
+          ls /usr/include/c++/
+          ls -l /usr/bin/g++ /etc/alternatives/c++ 2>&1 || true
+          strings -a /usr/lib/x86_64-linux-gnu/libstdc++.so.6 | grep -E '^GLIBCXX_3\.4\.[0-9]+$' | sort -V | tail -2
+      - name: Fetch prebuilt lbug (build once with default flags)
+        run: cargo build -p infigraph-core --lib
+      - name: Prebuilt lbug compiler stamp
         run: |
-          for i in 1 2 3 4 5 6 7 8; do
-            echo "=== attempt $i"
-            lldb --batch -o run -k "thread backtrace all" -k quit -- "$TEST_BIN" --nocapture 2>&1 | tee attempt.log
-            if grep -q "stop reason = EXC_BAD_ACCESS\|stop reason = signal SIGSEGV" attempt.log; then
-              echo "=== CRASH CAPTURED on attempt $i"; exit 1
-            fi
+          for a in $(find ~/.cargo/registry/src -path '*lbug-0.19.1/.cache*' -name '*.a'); do
+            echo "== $a"; strings -a "$a" | grep -oE 'GCC: \([^)]*\) [0-9.]+' | sort | uniq -c
           done
-          echo "=== no crash in 8 attempts"
-      - name: Run (Ubuntu, default threads under gdb)
-        if: runner.os == 'Linux'
+      - name: Link WITHOUT --allow-multiple-definition (list duplicate symbols)
+        env:
+          CARGO_TARGET_X86_64_UNKNOWN_LINUX_GNU_RUSTFLAGS: ""
         run: |
-          gdb -batch -ex run -ex "thread apply all bt" --args "$TEST_BIN" 2>&1 | tail -400 | tee run-parallel.log
-          grep -q "SIGSEGV" run-parallel.log && echo "=== CRASH CAPTURED (parallel)" || echo "=== no crash (parallel)"
-      - name: Run (Ubuntu, --test-threads=1 under gdb)
-        if: always() && runner.os == 'Linux'
+          cargo test -p infigraph-cli --bin infigraph --no-run 2>&1 \
+            | grep -E 'multiple definition|first defined here|error:' | sed 's/^.*: //' | sort | uniq -c | sort -rn | head -60 || true
+
+  from-source:
+    name: Ubuntu with lbug built from source
+    runs-on: ubuntu-latest
+    env:
+      LBUG_BUILD_FROM_SOURCE: "1"
+    steps:
+      - uses: actions/checkout@v4
+      - name: Free disk space
         run: |
-          gdb -batch -ex run -ex "thread apply all bt" --args "$TEST_BIN" --test-threads=1 2>&1 | tail -400 | tee run-serial.log
-          grep -q "SIGSEGV" run-serial.log && echo "=== CRASH CAPTURED (serial)" || echo "=== no crash (serial)"
+          sudo rm -rf /usr/share/dotnet /usr/local/lib/android /opt/ghc /opt/hostedtoolcache/CodeQL
+          df -h /
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: debug-lbug-from-source
+      - name: Build CLI test binary (lbug from source)
+        run: cargo test -p infigraph-cli --bin infigraph --no-run
+      - name: Run CLI unit tests
+        run: cargo test -p infigraph-cli --bin infigraph
