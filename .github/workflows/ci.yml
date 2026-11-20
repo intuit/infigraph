@@ -1,71 +1,69 @@
 name: CI
 
+# TEMPORARY debug workflow (draft PR, do not merge): capture native backtraces
+# for the SIGSEGVs seen on #90/#91.
 on:
-  push:
-    branches: [main]
   pull_request:
     branches: [main]
 
 env:
   CARGO_TERM_COLOR: always
   CARGO_INCREMENTAL: 0
+  RUST_BACKTRACE: full
 
 jobs:
-  fmt:
-    name: Format
-    runs-on: ubuntu-latest
-    steps:
-      - uses: actions/checkout@v4
-      - uses: dtolnay/rust-toolchain@stable
-        with:
-          components: rustfmt
-      - run: cargo fmt --all -- --check
-
-  check:
-    name: Check (${{ matrix.os }})
+  segv:
+    name: SIGSEGV (${{ matrix.os }})
     runs-on: ${{ matrix.os }}
     strategy:
       fail-fast: false
       matrix:
-        os: [macos-latest, ubuntu-latest, windows-latest]
+        include:
+          - os: macos-latest
+            pkg: infigraph-mcp
+            target: --test concurrent_writer_reader
+          - os: ubuntu-latest
+            pkg: infigraph-cli
+            target: --bin infigraph
     steps:
       - uses: actions/checkout@v4
-      - name: Free disk space (Ubuntu)
-        if: runner.os == 'Linux'
-        run: |
-          sudo rm -rf /usr/share/dotnet /usr/local/lib/android /opt/ghc \
-            /usr/share/swift /usr/local/share/powershell /usr/local/share/chromium \
-            /usr/local/lib/node_modules /opt/hostedtoolcache/CodeQL
-          sudo docker image prune --all --force || true
-          df -h
-      # lbug's static lib links `ssl`/`crypto` (lbug build.rs, static mode).
       - name: Link OpenSSL (macOS)
         if: runner.os == 'macOS'
         run: |
           brew list openssl@3 >/dev/null 2>&1 || brew install openssl@3
           echo "LIBRARY_PATH=$(brew --prefix openssl@3)/lib" >> "$GITHUB_ENV"
-      - name: Link OpenSSL (Windows)
-        if: runner.os == 'Windows'
-        shell: pwsh
-        run: |
-          vcpkg install openssl:x64-windows
-          $root = "$env:VCPKG_INSTALLATION_ROOT\installed\x64-windows"
-          # OpenSSL 3 ships libssl.lib/libcrypto.lib; lbug asks the linker for ssl.lib/crypto.lib.
-          $libdir = "$env:RUNNER_TEMP\openssl-lib"
-          New-Item -ItemType Directory -Force $libdir | Out-Null
-          Copy-Item "$root\lib\libssl.lib" "$libdir\ssl.lib"
-          Copy-Item "$root\lib\libcrypto.lib" "$libdir\crypto.lib"
-          "LIB=$libdir;$env:LIB" >> $env:GITHUB_ENV
-          "$root\bin" >> $env:GITHUB_PATH
+      - name: Install gdb (Ubuntu)
+        if: runner.os == 'Linux'
+        run: sudo apt-get update -qq && sudo apt-get install -y -qq gdb
       - uses: dtolnay/rust-toolchain@stable
-        with:
-          components: clippy
       - uses: Swatinem/rust-cache@v2
         with:
           key: ci-${{ matrix.os }}
-          save-if: ${{ github.ref == 'refs/heads/main' }}
-          cache-on-failure: true
-      - name: Clippy
-        run: cargo clippy --all-targets -- -D warnings
-      - name: Test
-        run: cargo test --all
+          save-if: false
+      - name: Build test binary
+        run: |
+          cargo test -p ${{ matrix.pkg }} ${{ matrix.target }} --no-run --message-format=json \
+            | jq -r 'select(.executable != null) | .executable' | tail -1 > test-bin.txt
+          echo "TEST_BIN=$(cat test-bin.txt)" >> "$GITHUB_ENV"
+          cat test-bin.txt
+      - name: Run (macOS, 8 attempts under lldb)
+        if: runner.os == 'macOS'
+        run: |
+          for i in 1 2 3 4 5 6 7 8; do
+            echo "=== attempt $i"
+            lldb --batch -o run -k "thread backtrace all" -k quit -- "$TEST_BIN" --nocapture 2>&1 | tee attempt.log
+            if grep -q "stop reason = EXC_BAD_ACCESS\|stop reason = signal SIGSEGV" attempt.log; then
+              echo "=== CRASH CAPTURED on attempt $i"; exit 1
+            fi
+          done
+          echo "=== no crash in 8 attempts"
+      - name: Run (Ubuntu, default threads under gdb)
+        if: runner.os == 'Linux'
+        run: |
+          gdb -batch -ex run -ex "thread apply all bt" --args "$TEST_BIN" 2>&1 | tail -400 | tee run-parallel.log
+          grep -q "SIGSEGV" run-parallel.log && echo "=== CRASH CAPTURED (parallel)" || echo "=== no crash (parallel)"
+      - name: Run (Ubuntu, --test-threads=1 under gdb)
+        if: always() && runner.os == 'Linux'
+        run: |
+          gdb -batch -ex run -ex "thread apply all bt" --args "$TEST_BIN" --test-threads=1 2>&1 | tail -400 | tee run-serial.log
+          grep -q "SIGSEGV" run-serial.log && echo "=== CRASH CAPTURED (serial)" || echo "=== no crash (serial)"
