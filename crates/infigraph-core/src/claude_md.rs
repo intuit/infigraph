@@ -2,7 +2,7 @@ use std::path::Path;
 
 use anyhow::Result;
 
-const VERSION: u32 = 2;
+const VERSION: u32 = 3;
 
 /// Write/update project-level `.claude/CLAUDE.md` with infigraph instructions.
 /// Uses sentinel markers for idempotent managed-block replacement.
@@ -17,36 +17,33 @@ pub fn ensure_project_claude_md(project_root: &Path) -> Result<()> {
 {begin_marker}
 ## Infigraph — Code Intelligence (auto-generated)
 
-This project is indexed by Infigraph. Use Infigraph MCP tools FIRST for all code tasks.
-Fall back to grep/Read only if Infigraph returns nothing or for non-code files.
+This project is indexed by Infigraph, which is available here as the `infigraph` MCP server.
+Its tools query a prebuilt code graph, so for code questions they are usually faster and more
+precise than grep. Plain grep/Read remain fine for non-code files or when Infigraph returns nothing.
 
-### Tool Preferences
-1. **`search`** for ALL code search — hybrid BM25+vector+grep in one call
-2. **`get_doc_context`** before editing any function — returns source+callers+callees
-3. **`trace_callers`** / **`find_all_references`** before refactoring — never grep for callers
-4. **`trace_callees`** / **`transitive_impact`** for blast radius
-5. Read files directly only for non-code files or Edit tool line-number context
+### Suggested tool choices
+- `search` for code search: combines keyword, semantic and regex matching in one call.
+- `get_doc_context` before editing a function: returns its source, callers and callees together.
+- `trace_callers` / `find_all_references` before refactoring: grep can miss indirect callers.
+- `trace_callees` / `transitive_impact` to estimate blast radius.
+- Read files directly for non-code files, or when the Edit tool needs line numbers.
 
-### Subagent Rules
-Do NOT spawn these agent types for code tasks — they lack MCP access:
-- **Explore** → use `search`, `search_code`, `search_symbols` directly
-- **Plan** → use `get_architecture`, `get_skeleton`, `get_stats` directly
-- **code-reviewer** → use `get_doc_context`, `get_code_snippet`, `review` directly
+### Subagents
+Explore, Plan and code-reviewer subagents don't have access to MCP tools, so in this project they
+fall back to grep. A general-purpose subagent does have access. For simple lookups, calling
+`search`, `get_architecture` or `get_doc_context` directly avoids a subagent altogether.
 
-For tasks requiring a subagent, use **general-purpose** — it has full MCP/infigraph access.
+### Large outputs
+These tools can return a lot of text, so running them in a subagent keeps the main context small:
+`get_architecture`, `transitive_impact`, `detect_dead_code`, `detect_clusters`, `detect_clones`,
+`export_graph`, `query_graph`, deep `trace_callers`/`trace_callees`, `group_query`, `group_index`.
 
-### Verbose tools — delegate to subagent
-`get_architecture`, `transitive_impact`, `detect_dead_code`, `detect_clusters`,
-`detect_clones`, `export_graph`, `query_graph`, `trace_callers`/`trace_callees` (deep),
-`group_query`, `group_index`
-
-### Context Compression
-Tool outputs are automatically compressed to save context window budget.
-- Compression scales with session length (Off → Summary → Aggressive → Minimal)
-- `search` results are capped at Summary level to preserve result quality
-- Security tools (`detect_security_issues`, `detect_taint_flows`, etc.) are never compressed
-- `get_code_snippet` passes through uncompressed for edit accuracy
-- No action needed — compression is transparent and automatic
+### Context compression
+Infigraph compresses its own tool output to save context, and nothing needs to be done for it.
+- The level grows with session length (Off → Summary → Aggressive → Minimal).
+- `search` results stay at Summary level at most, to keep result quality.
+- Security tools (`detect_security_issues`, `detect_taint_flows`, etc.) are never compressed.
+- `get_code_snippet` is never compressed, so edits see the exact source.
 {end_marker}
 "#
     );
