@@ -251,7 +251,7 @@ pub(crate) fn cmd_index(root: &Path, full: bool, no_embed: bool) -> Result<()> {
             let backend = prism.backend().context("graph not initialized")?;
             let pg = infigraph_core::meta::PostgresMetaStore::connect_from_env_cached()?;
             pg.init_schema()?;
-            let count = infigraph_core::embed::update_embeddings_remote(backend, &pg, &changed)?;
+            let count = infigraph_core::embed::update_embeddings_remote(backend, pg, &changed)?;
             println!("Saved {} embeddings to Postgres pgvector", count);
             done = true;
         }
