@@ -25,6 +25,7 @@ jobs:
     name: Check (${{ matrix.os }})
     runs-on: ${{ matrix.os }}
     strategy:
+      fail-fast: false
       matrix:
         os: [macos-latest, ubuntu-latest, windows-latest]
     steps:
@@ -37,6 +38,25 @@ jobs:
             /usr/local/lib/node_modules /opt/hostedtoolcache/CodeQL
           sudo docker image prune --all --force || true
           df -h
+      # lbug's static lib links `ssl`/`crypto` (lbug build.rs, static mode).
+      - name: Link OpenSSL (macOS)
+        if: runner.os == 'macOS'
+        run: |
+          brew list openssl@3 >/dev/null 2>&1 || brew install openssl@3
+          echo "LIBRARY_PATH=$(brew --prefix openssl@3)/lib" >> "$GITHUB_ENV"
+      - name: Link OpenSSL (Windows)
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: |
+          vcpkg install openssl:x64-windows
+          $root = "$env:VCPKG_INSTALLATION_ROOT\installed\x64-windows"
+          # OpenSSL 3 ships libssl.lib/libcrypto.lib; lbug asks the linker for ssl.lib/crypto.lib.
+          $libdir = "$env:RUNNER_TEMP\openssl-lib"
+          New-Item -ItemType Directory -Force $libdir | Out-Null
+          Copy-Item "$root\lib\libssl.lib" "$libdir\ssl.lib"
+          Copy-Item "$root\lib\libcrypto.lib" "$libdir\crypto.lib"
+          "LIB=$libdir;$env:LIB" >> $env:GITHUB_ENV
+          "$root\bin" >> $env:GITHUB_PATH
       - uses: dtolnay/rust-toolchain@stable
         with:
           components: clippy

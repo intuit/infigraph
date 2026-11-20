@@ -270,9 +270,9 @@ Automatically reindex on PR merge via GitHub webhook push events. See **[docs/WE
 
 | Platform | Required |
 |----------|----------|
-| macOS | Rust (rustup), `brew install cmake` |
-| Linux | Rust (rustup), `sudo apt install cmake` |
-| Windows | Rust (rustup), Visual Studio Build Tools (C++20) |
+| macOS | Rust (rustup), `brew install cmake openssl@3` |
+| Linux | Rust (rustup), `sudo apt install cmake libssl-dev` |
+| Windows | Rust (rustup), Visual Studio Build Tools (C++20), OpenSSL (see [Windows (native build)](#windows-native-build)) |
 
 **No Docker, no Python, no Node.js required** — everything is self-contained.
 
@@ -283,7 +283,7 @@ cargo install infigraph-cli infigraph-mcp
 infigraph install
 ```
 
-Works on macOS, Windows, and Linux. Requires [Rust](https://rustup.rs/) and `cmake`.
+Works on macOS, Windows, and Linux. Requires [Rust](https://rustup.rs/), `cmake` and OpenSSL (see [System Requirements](#system-requirements)).
 
 ### macOS / Linux (one-liner)
 
@@ -298,8 +298,9 @@ This:
 - Registers MCP server for all 11 AI coding agents
 - Writes primary search instructions to `~/.claude/CLAUDE.md`
 
-> **System dependency:** `cmake` is required to build the graph database.
-> Install before building: `brew install cmake` (macOS) or `sudo apt install cmake` (Linux).
+> **System dependencies:** `cmake` and OpenSSL are required to build the graph database.
+> Install before building: `brew install cmake openssl@3` (macOS) or `sudo apt install cmake libssl-dev` (Linux).
+> On macOS, Homebrew's OpenSSL isn't on the linker path by default: `export LIBRARY_PATH="$(brew --prefix openssl@3)/lib"` before `cargo build`.
 
 ### Windows
 
@@ -556,14 +557,15 @@ generate_test_context(path="/your/project", file="src/auth.py", test_type="unit"
 
 | Platform | Required |
 |----------|---------|
-| macOS | `brew install cmake`, Rust (`rustup`) |
-| Linux | `sudo apt install cmake`, Rust (`rustup`) |
+| macOS | `brew install cmake openssl@3`, Rust (`rustup`) |
+| Linux | `sudo apt install cmake libssl-dev`, Rust (`rustup`) |
 | Windows | Rust (`rustup`), Docker (for cross-compilation) |
 
 ### macOS (native — ARM64 or x86_64)
 
 ```bash
-brew install cmake
+brew install cmake openssl@3
+export LIBRARY_PATH="$(brew --prefix openssl@3)/lib"
 git clone https://github.com/intuit/infigraph.git
 cd infigraph
 cargo build --release -p infigraph-cli -p infigraph-mcp
@@ -574,7 +576,7 @@ infigraph install
 ### Linux (x86_64 or ARM64)
 
 ```bash
-sudo apt update && sudo apt install -y cmake
+sudo apt update && sudo apt install -y cmake libssl-dev
 git clone https://github.com/intuit/infigraph.git
 cd infigraph
 cargo build --release -p infigraph-cli -p infigraph-mcp
@@ -595,6 +597,14 @@ winget install Kitware.CMake
 
 # Install Visual Studio Build Tools with C++ workload
 winget install Microsoft.VisualStudio.2022.BuildTools
+
+# Install OpenSSL (linked by lbug) via vcpkg; lbug looks for ssl.lib/crypto.lib
+vcpkg install openssl:x64-windows
+$ossl = "$env:VCPKG_ROOT\installed\x64-windows"
+Copy-Item "$ossl\lib\libssl.lib" "$ossl\lib\ssl.lib"
+Copy-Item "$ossl\lib\libcrypto.lib" "$ossl\lib\crypto.lib"
+$env:LIB = "$ossl\lib;$env:LIB"
+$env:PATH = "$ossl\bin;$env:PATH"
 
 # Clone and build
 git clone https://github.com/intuit/infigraph.git
