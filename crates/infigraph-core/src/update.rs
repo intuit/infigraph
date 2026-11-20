@@ -8,20 +8,49 @@ pub fn fetch_latest_version() -> Option<String> {
     let gh_host = std::env::var("INFIGRAPH_GH_HOST").unwrap_or_else(|_| "github.com".to_string());
     let gh_owner = std::env::var("INFIGRAPH_GH_OWNER").unwrap_or_else(|_| "intuit".to_string());
     let gh_repo = "infigraph";
-
-    let mut args = vec!["api"];
     let api_path = format!("repos/{gh_owner}/{gh_repo}/releases/latest");
-    if gh_host != "github.com" {
-        args.extend(["--hostname", &gh_host]);
-    }
-    args.push(&api_path);
-    args.extend(["--jq", ".tag_name"]);
 
-    let output = std::process::Command::new("gh").args(&args).output().ok()?;
-    if !output.status.success() {
-        return None;
-    }
-    let tag = String::from_utf8_lossy(&output.stdout).trim().to_string();
+    // Public github.com releases need no auth, so don't require `gh`; GHE hosts still do.
+    // curl fallback: it uses the OS trust store, which corporate TLS-inspection CAs live in.
+    let tag = if gh_host == "github.com" {
+        let url = format!("https://api.github.com/{api_path}");
+        let ua = "infigraph-update-check";
+        let body = ureq::get(&url)
+            .set("User-Agent", ua)
+            .timeout(std::time::Duration::from_secs(5))
+            .call()
+            .ok()
+            .and_then(|r| r.into_string().ok())
+            .or_else(|| {
+                let out = std::process::Command::new("curl")
+                    .args(["-fsSL", "--max-time", "5", "-H"])
+                    .arg(format!("User-Agent: {ua}"))
+                    .arg(&url)
+                    .output()
+                    .ok()?;
+                out.status
+                    .success()
+                    .then(|| String::from_utf8_lossy(&out.stdout).into_owned())
+            })?;
+        let json: serde_json::Value = serde_json::from_str(&body).ok()?;
+        json.get("tag_name")?.as_str()?.to_string()
+    } else {
+        let output = std::process::Command::new("gh")
+            .args([
+                "api",
+                "--hostname",
+                &gh_host,
+                &api_path,
+                "--jq",
+                ".tag_name",
+            ])
+            .output()
+            .ok()?;
+        if !output.status.success() {
+            return None;
+        }
+        String::from_utf8_lossy(&output.stdout).trim().to_string()
+    };
     let version = tag.strip_prefix('v').unwrap_or(&tag).to_string();
     if version.is_empty() {
         None
