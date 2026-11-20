@@ -287,7 +287,9 @@ fn run() -> Result<()> {
 
     if serve_mode {
         if web::start_mcp_http_server(mcp_port, is_primary, &health_path) {
-            eprintln!("Infigraph MCP HTTP server at http://0.0.0.0:{}", mcp_port);
+            let host =
+                std::env::var("INFIGRAPH_MCP_BIND").unwrap_or_else(|_| "127.0.0.1".to_string());
+            eprintln!("Infigraph MCP HTTP server at http://{}:{}", host, mcp_port);
         } else {
             eprintln!("Infigraph MCP HTTP port {} already in use", mcp_port);
         }

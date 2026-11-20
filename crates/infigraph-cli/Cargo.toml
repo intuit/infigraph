@@ -35,7 +35,10 @@ name = "cozo_vs_kuzu"
 path = "src/bin/cozo_vs_kuzu.rs"
 
 [features]
-default = ["kompress"]
+# ONNX Runtime's downloaded Linux archive is compiled for newer x86 CPUs and is
+# statically linked. Keep ML output compression opt-in so its C++ symbols cannot
+# replace LadybugDB's baseline-compatible C++ helpers in every CLI invocation.
+default = []
 kompress = ["infigraph-mcp/kompress"]
 neo4j = ["infigraph-core/neo4j"]
 postgres = ["infigraph-core/postgres"]

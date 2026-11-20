@@ -167,7 +167,10 @@ pub fn start_ui_server(port: u16) -> bool {
 }
 
 pub fn start_mcp_http_server(port: u16, is_primary: bool, health_path: &str) -> bool {
-    let addr = format!("0.0.0.0:{}", port);
+    // The HTTP transport exposes graph and webhook endpoints. Keep it local by
+    // default; deployments that intentionally expose it can opt in explicitly.
+    let host = std::env::var("INFIGRAPH_MCP_BIND").unwrap_or_else(|_| "127.0.0.1".to_string());
+    let addr = format!("{}:{}", host, port);
     let server = match Server::http(&addr) {
         Ok(s) => s,
         Err(_) => return false,
@@ -907,6 +910,31 @@ mod tests {
         assert!(
             TcpListener::bind(format!("0.0.0.0:{}", port)).is_ok(),
             "UI server must not bind 0.0.0.0 by default (ADV-2598)"
+        );
+    }
+
+    #[test]
+    fn test_mcp_http_server_binds_loopback_not_wildcard_by_default() {
+        let _guard = TEST_LOCK.lock().unwrap();
+        unsafe {
+            std::env::remove_var("INFIGRAPH_MCP_BIND");
+        }
+        let port = free_port();
+        set_ready(true);
+        assert!(
+            start_mcp_http_server(port, false, "/health"),
+            "MCP HTTP server should start on loopback"
+        );
+        thread::sleep(std::time::Duration::from_millis(100));
+
+        let (status, _) = http_get(port, "/health");
+        assert_eq!(
+            status, 200,
+            "MCP HTTP server should be reachable on loopback"
+        );
+        assert!(
+            TcpListener::bind(format!("0.0.0.0:{}", port)).is_ok(),
+            "MCP HTTP server must not bind 0.0.0.0 by default"
         );
     }
 

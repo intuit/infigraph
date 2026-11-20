@@ -542,7 +542,7 @@ pub fn tool_group_build(args: &Value) -> Result<String> {
                     result.changed_files.iter().map(|s| s.as_str()).collect();
                 let _ = infigraph_docs::embed::update_doc_embeddings_remote(
                     store,
-                    &pg,
+                    pg,
                     &chunk_refs,
                     &changed_refs,
                 )?;
