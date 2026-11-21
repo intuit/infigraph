@@ -3,7 +3,7 @@ use infigraph_core::graph::{filter_dead_code_candidates, GraphBackend};
 use serde_json::Value;
 use std::path::Path;
 
-use super::super::helpers::{open_prism, save_analysis};
+use super::super::helpers::{open_prism, open_prism_read_only, save_analysis};
 
 /// Names referenced anywhere in a `.xaml` file's markup — command bindings
 /// (`Command="{x:Static ...}"`, `{Binding SomeCommand}`) and event-sink
@@ -87,7 +87,13 @@ pub fn tool_detect_dead_code(args: &Value) -> Result<String> {
 }
 
 pub fn tool_trace_callers(args: &Value) -> Result<String> {
-    let prism = open_prism(args)?;
+    let prism = open_prism_read_only(args)?;
+    let coverage = prism.coverage_notice();
+    let output = tool_trace_callers_body(args, &prism)?;
+    Ok(format!("{coverage}{output}"))
+}
+
+fn tool_trace_callers_body(args: &Value, prism: &infigraph_core::Infigraph) -> Result<String> {
     let symbol_id = args
         .get("symbol_id")
         .and_then(|s| s.as_str())
@@ -128,7 +134,10 @@ pub fn tool_trace_callers(args: &Value) -> Result<String> {
     };
 
     if callers.is_empty() {
-        return Ok(format!("No callers found for '{}'{}", symbol_id, suffix));
+        return Ok(format!(
+            "No callers found in the current graph for '{}'{}",
+            symbol_id, suffix
+        ));
     }
 
     let mut out = String::new();
@@ -151,7 +160,13 @@ pub fn tool_trace_callers(args: &Value) -> Result<String> {
 }
 
 pub fn tool_trace_callees(args: &Value) -> Result<String> {
-    let prism = open_prism(args)?;
+    let prism = open_prism_read_only(args)?;
+    let coverage = prism.coverage_notice();
+    let output = tool_trace_callees_body(args, &prism)?;
+    Ok(format!("{coverage}{output}"))
+}
+
+fn tool_trace_callees_body(args: &Value, prism: &infigraph_core::Infigraph) -> Result<String> {
     let symbol_id = args
         .get("symbol_id")
         .and_then(|s| s.as_str())
@@ -163,20 +178,31 @@ pub fn tool_trace_callees(args: &Value) -> Result<String> {
         .unwrap_or(true);
 
     let backend = prism.backend().context("not initialized")?;
-    let callees = backend.callees_of_filtered(symbol_id, include_tests)?;
+    let mut callees = backend.callees_of_filtered(symbol_id, include_tests)?;
+    callees.sort();
+    callees.dedup();
     if callees.is_empty() {
         let suffix = if include_tests {
             String::new()
         } else {
             " (excluding tests)".to_string()
         };
-        return Ok(format!("No callees found for '{}'{}", symbol_id, suffix));
+        return Ok(format!(
+            "No callees found in the current graph for '{}'{}",
+            symbol_id, suffix
+        ));
     }
     Ok(callees.join("\n"))
 }
 
 pub fn tool_transitive_impact(args: &Value) -> Result<String> {
-    let prism = open_prism(args)?;
+    let prism = open_prism_read_only(args)?;
+    let coverage = prism.coverage_notice();
+    let output = tool_transitive_impact_body(args, &prism)?;
+    Ok(format!("{coverage}{output}"))
+}
+
+fn tool_transitive_impact_body(args: &Value, prism: &infigraph_core::Infigraph) -> Result<String> {
     let symbol_id = args
         .get("symbol_id")
         .and_then(|s| s.as_str())
@@ -210,7 +236,10 @@ pub fn tool_transitive_impact(args: &Value) -> Result<String> {
     }
 
     if impacted.is_empty() {
-        return Ok(format!("No symbols affected by changes to '{}'", symbol_id));
+        return Ok(format!(
+            "No affected symbols found in the current graph for '{}'",
+            symbol_id
+        ));
     }
 
     let mut out = String::new();

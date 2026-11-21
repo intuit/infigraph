@@ -236,6 +236,14 @@ pub(crate) fn cmd_index(root: &Path, full: bool, no_embed: bool) -> Result<()> {
         eprintln!("      One entry per line. Lines starting with # are comments.");
     }
 
+    if local_run_id(root)?.is_some() {
+        let coverage = index_status::current_run(root)?;
+        anyhow::ensure!(
+            coverage.resolution.state != StageState::Failed,
+            "Partial index: call resolution failed; the syntax graph remains available"
+        );
+    }
+
     // Compute and save embeddings — only for new/changed symbols
     if no_embed {
         auto_scip(root, &result, prism.backend())?;
@@ -274,15 +282,14 @@ pub(crate) fn cmd_index(root: &Path, full: bool, no_embed: bool) -> Result<()> {
     }
 
     // Drop prism to release the GraphStore handle before background SCIP
-    let detected_languages: std::collections::HashSet<String> = result
-        .extractions
-        .iter()
-        .map(|e| e.language.clone())
-        .collect();
+    let detected_languages =
+        languages_for_index(prism.backend().context("graph not initialized")?, &result)?;
+    let run_id = local_run_id(root)?;
+    prepare_scip(root, &detected_languages, run_id.as_deref())?;
     drop(prism);
 
     // SCIP enrichment in a detached child process — parent returns immediately.
-    spawn_scip_child_process(root, &detected_languages);
+    spawn_scip_child_process(root, &detected_languages, run_id.as_deref())?;
 
     if let Err(e) = infigraph_core::claude_md::ensure_project_claude_md(root) {
         eprintln!("warning: failed to update project CLAUDE.md: {e}");
@@ -291,12 +298,22 @@ pub(crate) fn cmd_index(root: &Path, full: bool, no_embed: bool) -> Result<()> {
     Ok(())
 }
 
-fn spawn_scip_child_process(root: &Path, detected_languages: &std::collections::HashSet<String>) {
+fn spawn_scip_child_process(
+    root: &Path,
+    detected_languages: &std::collections::HashSet<String>,
+    run_id: Option<&str>,
+) -> Result<()> {
     use crate::scip_download;
 
-    let indexers = scip_download::indexers_for_languages(detected_languages);
+    let mut indexers = Vec::new();
+    for indexer in scip_download::indexers_for_languages(detected_languages) {
+        if should_run_indexer(root, indexer) && !scip_succeeded(root, run_id, indexer.binary_name)?
+        {
+            indexers.push(indexer);
+        }
+    }
     if indexers.is_empty() {
-        return;
+        return Ok(());
     }
 
     let count = indexers.len();
@@ -312,10 +329,7 @@ fn spawn_scip_child_process(root: &Path, detected_languages: &std::collections::
         .collect::<Vec<_>>()
         .join(",");
 
-    let exe = match std::env::current_exe() {
-        Ok(e) => e,
-        Err(_) => return,
-    };
+    let exe = std::env::current_exe()?;
 
     let log_path = root.join(".infigraph").join("scip-enrich.log");
     let stderr_target = match std::fs::File::create(&log_path) {
@@ -323,8 +337,12 @@ fn spawn_scip_child_process(root: &Path, detected_languages: &std::collections::
         Err(_) => std::process::Stdio::null(),
     };
 
-    match std::process::Command::new(exe)
-        .args(scip_enrich_args(&langs))
+    let mut command = std::process::Command::new(exe);
+    command.args(scip_enrich_args(&langs));
+    if let Some(run_id) = run_id {
+        command.args(["--run-id", run_id]);
+    }
+    match command
         .current_dir(root)
         .stdin(std::process::Stdio::null())
         .stdout(std::process::Stdio::null())
@@ -347,10 +365,21 @@ fn spawn_scip_child_process(root: &Path, detected_languages: &std::collections::
                 }
             });
         }
-        Err(e) => eprintln!("  Warning: failed to spawn scip-enrich: {e}"),
+        Err(e) => {
+            for indexer in &indexers {
+                record_scip(
+                    root,
+                    run_id,
+                    indexer.binary_name,
+                    StageOutcome::new(StageState::Failed, "SCIP_CHILD_LAUNCH_FAILED"),
+                )?;
+            }
+            return Err(e.into());
+        }
     }
 
     eprintln!("  Log: {}", log_path.display());
+    Ok(())
 }
 
 /// Args for respawning this binary as the hidden `scip-enrich` subcommand.
@@ -520,362 +549,276 @@ pub(crate) fn on_path(cmd: &str) -> bool {
         .unwrap_or(false)
 }
 
-pub(crate) fn import_scip_and_cleanup(
+use infigraph_core::index_status::{self, StageOutcome, StageState};
+
+fn record_scip(
     root: &Path,
-    scip_path: Option<&std::path::Path>,
-    existing_backend: Option<&dyn infigraph_core::graph::GraphBackend>,
-) {
-    let scip_out = scip_path
-        .map(|p| p.to_path_buf())
-        .unwrap_or_else(|| root.join("index.scip"));
-    if !scip_out.exists() {
-        return;
-    }
-
-    if let Some(backend) = existing_backend {
-        match backend.import_scip_index(&scip_out, Some(root)) {
-            Ok(stats) => println!(
-                "Auto-SCIP: enriched {} symbols, {} added, {} references, {} new symbols, {} corrections learned",
-                stats.symbols_enriched, stats.relations_added, stats.references_added, stats.symbols_added, stats.corrections_learned
-            ),
-            Err(e) => eprintln!("Auto-SCIP: import failed: {e}"),
-        }
-        let _ = std::fs::remove_file(&scip_out);
-        return;
-    }
-
-    let registry = match bundled_registry() {
-        Ok(r) => r,
-        Err(e) => {
-            eprintln!("Auto-SCIP: import failed: {e}");
-            return;
-        }
+    run_id: Option<&str>,
+    label: &str,
+    outcome: StageOutcome,
+) -> Result<bool> {
+    let Some(run_id) = run_id else {
+        return Ok(true);
     };
-    let mut prism = match Infigraph::open(root, registry) {
-        Ok(p) => p,
-        Err(e) => {
-            eprintln!("Auto-SCIP: import failed: {e}");
-            return;
-        }
-    };
-    if prism.init().is_err() {
-        return;
-    }
-    let backend = match prism.backend() {
-        Some(b) => b,
-        None => return,
-    };
-    match backend.import_scip_index(&scip_out, Some(root)) {
-        Ok(stats) => println!(
-            "Auto-SCIP: enriched {} symbols, {} added, {} references, {} new symbols, {} corrections learned",
-            stats.symbols_enriched, stats.relations_added, stats.references_added, stats.symbols_added, stats.corrections_learned
-        ),
-        Err(e) => eprintln!("Auto-SCIP: import failed: {e}"),
-    }
-    let _ = std::fs::remove_file(&scip_out);
+    Ok(index_status::update_current(root, run_id, None, |report| {
+        report.scip.insert(label.into(), outcome);
+        Ok(())
+    })?
+    .is_some())
 }
 
-/// Foreground SCIP execution using scip_download catalog for all detected languages.
+fn local_run_id(root: &Path) -> Result<Option<String>> {
+    if cfg!(feature = "neo4j")
+        && std::env::var("INFIGRAPH_BACKEND").is_ok_and(|mode| mode == "neo4j")
+    {
+        return Ok(None);
+    }
+    Ok(Some(index_status::current_run(root)?.run_id))
+}
+
+fn scip_succeeded(root: &Path, run_id: Option<&str>, label: &str) -> Result<bool> {
+    let Some(run_id) = run_id else {
+        return Ok(false);
+    };
+    let report = index_status::current_run(root)?;
+    anyhow::ensure!(report.run_id == run_id, "obsolete enrichment run");
+    Ok(report
+        .scip
+        .get(label)
+        .is_some_and(|stage| stage.state == StageState::Succeeded))
+}
+
+fn indexed_languages(
+    backend: &dyn infigraph_core::graph::GraphBackend,
+) -> Result<std::collections::HashSet<String>> {
+    Ok(backend
+        .raw_query("MATCH (m:Module) RETURN DISTINCT m.language")?
+        .into_iter()
+        .filter_map(|row| row.into_iter().next())
+        .collect())
+}
+
+fn languages_for_index(
+    backend: &dyn infigraph_core::graph::GraphBackend,
+    result: &infigraph_core::IndexResult,
+) -> Result<std::collections::HashSet<String>> {
+    if cfg!(feature = "neo4j")
+        && std::env::var("INFIGRAPH_BACKEND").is_ok_and(|mode| mode == "neo4j")
+    {
+        // Preserve remote repo scoping; unfiltered raw Module queries would
+        // inspect every repo in the shared database.
+        return Ok(result
+            .extractions
+            .iter()
+            .map(|e| e.language.clone())
+            .collect());
+    }
+    indexed_languages(backend)
+}
+
+fn prepare_scip(
+    root: &Path,
+    languages: &std::collections::HashSet<String>,
+    run_id: Option<&str>,
+) -> Result<()> {
+    for indexer in crate::scip_download::indexers_for_languages(languages) {
+        if should_run_indexer(root, indexer) && scip_succeeded(root, run_id, indexer.binary_name)? {
+            continue;
+        }
+        let stage = if should_run_indexer(root, indexer) {
+            StageOutcome::new(StageState::Pending, "SCIP_PENDING")
+        } else {
+            StageOutcome::new(StageState::Skipped, "PROJECT_PREREQUISITE_MISSING")
+        };
+        if !record_scip(root, run_id, indexer.binary_name, stage)? {
+            anyhow::bail!("obsolete enrichment run");
+        }
+    }
+    Ok(())
+}
+
+/// Foreground and background use the same outcome/import pipeline.
+fn enrich_scip(
+    root: &Path,
+    languages: &std::collections::HashSet<String>,
+    run_id: Option<&str>,
+    backend: &dyn infigraph_core::graph::GraphBackend,
+) -> Result<()> {
+    enrich_scip_with_tools(
+        root,
+        languages,
+        run_id,
+        backend,
+        crate::scip_download::ensure_indexer,
+    )
+}
+
+fn enrich_scip_with_tools(
+    root: &Path,
+    languages: &std::collections::HashSet<String>,
+    run_id: Option<&str>,
+    backend: &dyn infigraph_core::graph::GraphBackend,
+    ensure_tool: impl Fn(&crate::scip_download::ScipIndexer) -> Option<std::path::PathBuf>,
+) -> Result<()> {
+    let mut failed = false;
+    for indexer in crate::scip_download::indexers_for_languages(languages) {
+        let label = indexer.binary_name;
+        if !should_run_indexer(root, indexer) {
+            continue;
+        }
+        if scip_succeeded(root, run_id, label)? {
+            continue;
+        }
+        if !record_scip(
+            root,
+            run_id,
+            label,
+            StageOutcome::new(StageState::Running, "SCIP_RUNNING"),
+        )? {
+            anyhow::bail!("obsolete enrichment run");
+        }
+        let Some(bin) = ensure_tool(indexer) else {
+            record_scip(
+                root,
+                run_id,
+                label,
+                StageOutcome::new(StageState::Failed, "SCIP_TOOL_UNAVAILABLE"),
+            )?;
+            eprintln!("Partial index: {label} failed (SCIP_TOOL_UNAVAILABLE)");
+            failed = true;
+            continue;
+        };
+        let scratch = match index_status::scip_scratch(root) {
+            Ok(scratch) => scratch,
+            Err(e) => {
+                record_scip(
+                    root,
+                    run_id,
+                    label,
+                    StageOutcome::new(StageState::Failed, "SCIP_ARTIFACT_SETUP_FAILED"),
+                )?;
+                eprintln!("Partial index: {label} artifact setup failed: {e}");
+                failed = true;
+                continue;
+            }
+        };
+        let output = scratch.path().join("index.scip");
+        let mut outcome = run_scip_indexer_to(root, &bin, indexer, &output);
+        if outcome.state == StageState::Succeeded {
+            let import = || -> Result<StageOutcome> {
+                match backend.import_scip_index(&output, Some(root)) {
+                    Ok(stats) => {
+                        eprintln!(
+                            "Auto-SCIP: {label} imported {} relations, {} references",
+                            stats.relations_added, stats.references_added
+                        );
+                        Ok(StageOutcome::new(StageState::Succeeded, "SCIP_IMPORTED"))
+                    }
+                    Err(e) => {
+                        eprintln!("Auto-SCIP: {label} import failed: {e}");
+                        Ok(StageOutcome::new(StageState::Failed, "SCIP_IMPORT_FAILED"))
+                    }
+                }
+            };
+            if let Some(run_id) = run_id {
+                let current =
+                    index_status::update_current(root, run_id, Some(backend), |report| {
+                        let imported = import()?;
+                        report.indexed_file_fingerprint = index_status::file_fingerprint(backend)?;
+                        report.scip.insert(label.into(), imported.clone());
+                        Ok(imported)
+                    })?;
+                let Some(imported) = current else {
+                    anyhow::bail!("obsolete enrichment artifact discarded");
+                };
+                outcome = imported;
+            } else {
+                outcome = import()?;
+            }
+        } else {
+            record_scip(root, run_id, label, outcome.clone())?;
+        }
+        if outcome.state == StageState::Failed {
+            eprintln!("Partial index: {label} failed ({})", outcome.reason);
+            failed = true;
+        }
+    }
+    if let Some(run_id) = run_id {
+        let report = index_status::current_run(root)?;
+        anyhow::ensure!(report.run_id == run_id, "obsolete enrichment run");
+        failed |= report.has_failures();
+    }
+    anyhow::ensure!(!failed, "Partial index: analysis failed; the syntax graph remains available. See .infigraph/index-status.json");
+    Ok(())
+}
+
 pub(crate) fn auto_scip(
     root: &Path,
     result: &infigraph_core::IndexResult,
     backend: Option<&dyn infigraph_core::graph::GraphBackend>,
 ) -> Result<()> {
-    use crate::scip_download;
-    use std::collections::HashSet;
-
-    let detected: HashSet<String> = result
-        .extractions
-        .iter()
-        .map(|e| e.language.clone())
-        .collect();
-    if detected.is_empty() {
-        return Ok(());
-    }
-
-    let indexers = scip_download::indexers_for_languages(&detected);
-    if indexers.is_empty() {
-        return Ok(());
-    }
-
-    println!(
-        "Auto-SCIP: found {} applicable indexer(s) for detected languages",
-        indexers.len()
-    );
-
-    // Parallel download: ensure all indexer binaries are available
-    let binaries: Vec<_> = std::thread::scope(|s| {
-        let handles: Vec<_> = indexers
-            .iter()
-            .map(|idx| s.spawn(move || (*idx, scip_download::ensure_indexer(idx))))
-            .collect();
-        handles.into_iter().map(|h| h.join().unwrap()).collect()
-    });
-
-    // Sequential run: each indexer produces index.scip, import, cleanup
-    for (indexer, bin_path) in &binaries {
-        let Some(bin) = bin_path else { continue };
-        if !should_run_indexer(root, indexer) {
-            continue;
-        }
-
-        let cmd_str = bin.to_string_lossy();
-        let extra = scip_download::extra_runtime_paths();
-        let extra_path = if extra.is_empty() {
-            None
-        } else {
-            Some(extra.as_str())
-        };
-
-        if indexer.binary_name == "scip-java" {
-            let has_gradle = root.join("build.gradle").exists()
-                || root.join("build.gradle.kts").exists()
-                || root.join("settings.gradle").exists()
-                || root.join("settings.gradle.kts").exists();
-            let has_maven = root.join("pom.xml").exists();
-
-            if has_gradle && has_maven {
-                let primary = if root.join("settings.gradle").exists()
-                    || root.join("settings.gradle.kts").exists()
-                {
-                    "gradle"
-                } else {
-                    "maven"
-                };
-                let fallback = if primary == "gradle" {
-                    "maven"
-                } else {
-                    "gradle"
-                };
-
-                println!("Auto-SCIP: detected both Maven and Gradle, trying {primary}");
-                let primary_args = ["index", "--build-tool", primary];
-                if run_scip_indexer(
-                    root,
-                    &cmd_str,
-                    &primary_args,
-                    indexer.binary_name,
-                    extra_path,
-                ) {
-                    import_scip_and_cleanup(root, None, backend);
-                } else {
-                    println!("Auto-SCIP: {primary} failed, falling back to {fallback}");
-                    let fallback_args = ["index", "--build-tool", fallback];
-                    if run_scip_indexer(
-                        root,
-                        &cmd_str,
-                        &fallback_args,
-                        indexer.binary_name,
-                        extra_path,
-                    ) {
-                        import_scip_and_cleanup(root, None, backend);
-                    }
-                }
-            } else if run_scip_indexer(
-                root,
-                &cmd_str,
-                indexer.scip_args,
-                indexer.binary_name,
-                extra_path,
-            ) {
-                import_scip_and_cleanup(root, None, backend);
-            }
-            continue;
-        }
-
-        if run_scip_indexer(
-            root,
-            &cmd_str,
-            indexer.scip_args,
-            indexer.binary_name,
-            extra_path,
-        ) {
-            import_scip_and_cleanup(root, None, backend);
-        }
-    }
-
-    Ok(())
+    let backend = backend.context("graph not initialized")?;
+    let languages = languages_for_index(backend, result)?;
+    let run_id = local_run_id(root)?;
+    prepare_scip(root, &languages, run_id.as_deref())?;
+    enrich_scip(root, &languages, run_id.as_deref(), backend)
 }
 
-pub(crate) fn run_scip_indexer(
+/// Hidden child entry point; generation is captured by the parent before spawn.
+pub(crate) fn cmd_scip_enrich(
     root: &Path,
-    cmd: &str,
-    args: &[&str],
-    label: &str,
-    extra_path: Option<&str>,
-) -> bool {
-    println!("Auto-SCIP: running {label}...");
-    let scip_out = root.join("index.scip");
-    let mut command = std::process::Command::new(cmd);
-    command.args(args).current_dir(root);
-    if let Some(extra) = extra_path {
-        let path = std::env::var("PATH").unwrap_or_default();
-        let sep = if cfg!(windows) { ";" } else { ":" };
-        command.env("PATH", format!("{extra}{sep}{path}"));
+    languages: &std::collections::HashSet<String>,
+    run_id: Option<&str>,
+) -> Result<()> {
+    if let Some(id) = run_id {
+        anyhow::ensure!(
+            index_status::current_run(root)?.run_id == id,
+            "obsolete enrichment run"
+        );
     }
-    {
-        let ig = crate::scip_download::infigraph_dir();
-        let java_macos = ig.join("java").join("Contents").join("Home");
-        if java_macos.exists() {
-            command.env("JAVA_HOME", &java_macos);
-        } else {
-            let java_home = ig.join("java");
-            if java_home.join("bin").exists() {
-                command.env("JAVA_HOME", &java_home);
-            }
-        }
-        let dotnet_root = ig.join("dotnet");
-        if dotnet_root.exists() {
-            command.env("DOTNET_ROOT", &dotnet_root);
-        }
-    }
-    match command.status() {
-        Ok(s) if s.success() && scip_out.exists() => true,
-        Ok(s) => {
-            eprintln!("Auto-SCIP: {label} exited with {s}");
-            false
-        }
+    let opened = (|| -> Result<Infigraph> {
+        let registry = bundled_registry()?;
+        let mut prism = Infigraph::open(root, registry)?;
+        prism.init()?;
+        Ok(prism)
+    })();
+    let prism = match opened {
+        Ok(prism) => prism,
         Err(e) => {
-            eprintln!("Auto-SCIP: failed to run {label}: {e}");
-            false
-        }
-    }
-}
-
-/// Entry point for the hidden `scip-enrich` subcommand (spawned by `index`).
-pub(crate) fn cmd_scip_enrich(root: &Path, detected_languages: &std::collections::HashSet<String>) {
-    auto_scip_background(root, detected_languages);
-}
-
-/// Background SCIP pipeline: download binaries, run indexers in parallel, import sequentially.
-fn auto_scip_background(root: &Path, detected_languages: &std::collections::HashSet<String>) {
-    use crate::scip_download;
-
-    let indexers = scip_download::indexers_for_languages(detected_languages);
-    if indexers.is_empty() {
-        return;
-    }
-
-    // Parallel download: ensure all indexer binaries are available
-    let binaries: Vec<_> = std::thread::scope(|s| {
-        let handles: Vec<_> = indexers
-            .iter()
-            .map(|idx| s.spawn(move || (*idx, scip_download::ensure_indexer(idx))))
-            .collect();
-        handles.into_iter().map(|h| h.join().unwrap()).collect()
-    });
-
-    // Filter to runnable indexers and build per-indexer tasks
-    let scip_tmp = root.join(".infigraph").join("scip-tmp");
-    let _ = std::fs::create_dir_all(&scip_tmp);
-
-    let tasks: Vec<_> = binaries
-        .into_iter()
-        .filter_map(|(indexer, bin_path)| {
-            let bin = bin_path?;
-            if !should_run_indexer(root, indexer) {
-                return None;
+            for indexer in crate::scip_download::indexers_for_languages(languages) {
+                if should_run_indexer(root, indexer) {
+                    record_scip(
+                        root,
+                        run_id,
+                        indexer.binary_name,
+                        StageOutcome::new(StageState::Failed, "SCIP_BACKEND_UNAVAILABLE"),
+                    )?;
+                }
             }
-            let output_path = scip_tmp.join(format!("{}.scip", indexer.binary_name));
-            Some((indexer, bin, output_path))
-        })
-        .collect();
-
-    if tasks.is_empty() {
-        let _ = std::fs::remove_dir_all(&scip_tmp);
-        return;
-    }
-
-    // Part A: Run indexers in parallel with per-indexer output paths
-    let results: Vec<_> = std::thread::scope(|s| {
-        let handles: Vec<_> = tasks
-            .iter()
-            .map(|(indexer, bin, output_path)| {
-                s.spawn(move || {
-                    let success = run_scip_indexer_to(root, bin, indexer, output_path);
-                    (indexer.binary_name, output_path.clone(), success)
-                })
-            })
-            .collect();
-        handles.into_iter().map(|h| h.join().unwrap()).collect()
-    });
-
-    // Part B: Import results sequentially (Kuzu graph is single-writer)
-    let registry = match bundled_registry() {
-        Ok(r) => r,
-        Err(e) => {
-            eprintln!("Auto-SCIP: import failed: {e}");
-            return;
+            return Err(e);
         }
     };
-    let mut prism = match Infigraph::open(root, registry) {
-        Ok(p) => p,
-        Err(e) => {
-            eprintln!("Auto-SCIP: import failed: {e}");
-            return;
-        }
-    };
-    if prism.init().is_err() {
-        return;
-    }
-    let backend = match prism.backend() {
-        Some(b) => b,
-        None => return,
-    };
-
-    for (label, scip_path, success) in &results {
-        if *success && scip_path.exists() {
-            match backend.import_scip_index(scip_path, Some(root)) {
-                Ok(stats) => eprintln!(
-                    "Auto-SCIP: {label} enriched {} symbols, {} added, {} references, {} new symbols, {} corrections learned",
-                    stats.symbols_enriched, stats.relations_added, stats.references_added, stats.symbols_added, stats.corrections_learned
-                ),
-                Err(e) => eprintln!("Auto-SCIP: {label} import failed: {e}"),
-            }
-        }
-        let _ = std::fs::remove_file(scip_path);
-    }
-
-    let _ = std::fs::remove_dir_all(&scip_tmp);
-
-    // Embed any new symbols SCIP added (skips existing embeddings)
-    let root_buf = root.to_path_buf();
-    let pre_count = infigraph_core::embed::embedding_count(&root_buf);
-    let Some(backend) = prism.backend() else {
-        return;
-    };
+    let backend = prism.backend().context("graph not initialized")?;
+    let result = enrich_scip(root, languages, run_id, backend);
+    // Preserve background embedding of compiler-added symbols. Foreground
+    // --no-embed never enters this child path.
     #[allow(unused_mut)]
-    let mut done = false;
+    let mut embedded_remotely = false;
     #[cfg(feature = "remote")]
     if is_neo4j_backend() {
         if let Ok(pg) = infigraph_core::meta::PostgresMetaStore::connect_from_env_cached() {
-            match infigraph_core::embed::update_embeddings_remote(backend, pg, &[]) {
-                Ok(n) => {
-                    let new = n.saturating_sub(pre_count);
-                    if new > 0 {
-                        eprintln!(
-                            "Auto-SCIP: embedded {new} new symbols to pgvector from SCIP enrichment"
-                        );
-                    }
-                }
-                Err(e) => eprintln!("Auto-SCIP: remote embedding update failed: {e}"),
+            if let Err(e) = infigraph_core::embed::update_embeddings_remote(backend, pg, &[]) {
+                eprintln!("Auto-SCIP: embedding update failed: {e}");
             }
-            done = true;
+        }
+        embedded_remotely = true;
+    }
+    if !embedded_remotely {
+        if let Err(e) = infigraph_core::embed::update_embeddings(backend, root, &[]) {
+            eprintln!("Auto-SCIP: embedding update failed: {e}");
         }
     }
-    if !done {
-        match infigraph_core::embed::update_embeddings(backend, &root_buf, &[]) {
-            Ok(n) => {
-                let new = n.saturating_sub(pre_count);
-                if new > 0 {
-                    eprintln!("Auto-SCIP: embedded {new} new symbols from SCIP enrichment");
-                }
-            }
-            Err(e) => eprintln!("Auto-SCIP: embedding update failed: {e}"),
-        }
-    }
-
-    eprintln!("Auto-SCIP: background enrichment complete.");
+    result
 }
 
 fn should_run_indexer(root: &Path, indexer: &crate::scip_download::ScipIndexer) -> bool {
@@ -904,7 +847,7 @@ fn run_scip_indexer_to(
     bin: &Path,
     indexer: &crate::scip_download::ScipIndexer,
     output_path: &Path,
-) -> bool {
+) -> StageOutcome {
     let label = indexer.binary_name;
     eprintln!("Auto-SCIP: running {label}...");
 
@@ -931,7 +874,12 @@ fn run_scip_indexer_to(
     )
 }
 
-fn run_scip_java(root: &Path, cmd: &str, output_path: &Path, extra_path: Option<&str>) -> bool {
+fn run_scip_java(
+    root: &Path,
+    cmd: &str,
+    output_path: &Path,
+    extra_path: Option<&str>,
+) -> StageOutcome {
     let has_gradle = root.join("build.gradle").exists()
         || root.join("build.gradle.kts").exists()
         || root.join("settings.gradle").exists()
@@ -953,7 +901,7 @@ fn run_scip_java(root: &Path, cmd: &str, output_path: &Path, extra_path: Option<
 
         eprintln!("Auto-SCIP: detected both Maven and Gradle, trying {primary}");
         let primary_args: Vec<&str> = vec!["index", "--build-tool", primary];
-        if run_scip_indexer_cmd(
+        let primary_result = run_scip_indexer_cmd(
             root,
             cmd,
             &primary_args,
@@ -961,8 +909,12 @@ fn run_scip_java(root: &Path, cmd: &str, output_path: &Path, extra_path: Option<
             extra_path,
             Some("--output"),
             output_path,
-        ) {
-            return true;
+        );
+        if primary_result.state == StageState::Succeeded {
+            return primary_result;
+        }
+        if output_path.exists() {
+            let _ = std::fs::remove_file(output_path);
         }
         eprintln!("Auto-SCIP: {primary} failed, falling back to {fallback}");
         let fallback_args: Vec<&str> = vec!["index", "--build-tool", fallback];
@@ -996,7 +948,7 @@ fn run_scip_indexer_cmd(
     extra_path: Option<&str>,
     output_flag: Option<&str>,
     output_path: &Path,
-) -> bool {
+) -> StageOutcome {
     let mut command = std::process::Command::new(cmd);
     command.args(args).current_dir(root);
 
@@ -1027,23 +979,58 @@ fn run_scip_indexer_cmd(
         }
     }
 
-    match command.status() {
-        Ok(s) if s.success() => {
-            if output_flag.is_none() {
-                let default_out = root.join("index.scip");
-                if default_out.exists() && default_out != output_path {
-                    let _ = std::fs::rename(&default_out, output_path);
-                }
-            }
-            output_path.exists()
+    let default_out = root.join("index.scip");
+    // Indexers without an output flag must not consume or overwrite a user's
+    // retained index.scip. Serialize their fixed output path across runs.
+    let _output_lock = if output_flag.is_none() {
+        match infigraph_core::lockfile::acquire(
+            &root.join(".infigraph/scip-output.lock"),
+            "scip-output",
+            std::time::Duration::from_secs(30),
+        ) {
+            Ok(lock) => Some(lock),
+            Err(_) => return StageOutcome::new(StageState::Failed, "SCIP_OUTPUT_BUSY"),
         }
-        Ok(s) => {
-            eprintln!("Auto-SCIP: {label} exited with {s}");
-            false
+    } else {
+        None
+    };
+    if std::fs::symlink_metadata(output_path).is_ok()
+        || (output_flag.is_none() && std::fs::symlink_metadata(&default_out).is_ok())
+    {
+        return StageOutcome::new(StageState::Failed, "SCIP_OUTPUT_CONFLICT");
+    }
+    let status = command.status();
+    if output_flag.is_none()
+        && default_out.exists()
+        && std::fs::rename(&default_out, output_path).is_err()
+    {
+        return StageOutcome::new(StageState::Failed, "SCIP_ARTIFACT_MOVE_FAILED");
+    }
+    match status {
+        Ok(status) if status.success() => match std::fs::symlink_metadata(output_path) {
+            Ok(meta) if meta.is_file() && meta.len() > 0 => {
+                StageOutcome::new(StageState::Succeeded, "SCIP_ARTIFACT_CREATED")
+            }
+            Ok(_) => StageOutcome::new(StageState::Failed, "SCIP_ARTIFACT_INVALID"),
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+                StageOutcome::new(StageState::Failed, "SCIP_ARTIFACT_MISSING")
+            }
+            Err(_) => StageOutcome::new(StageState::Failed, "SCIP_ARTIFACT_UNREADABLE"),
+        },
+        Ok(status) => {
+            eprintln!("Auto-SCIP: {label} exited with {status}");
+            let mut result = StageOutcome::new(StageState::Failed, "SCIP_PROCESS_FAILED");
+            result.exit_code = status.code();
+            #[cfg(unix)]
+            {
+                use std::os::unix::process::ExitStatusExt;
+                result.signal = status.signal();
+            }
+            result
         }
         Err(e) => {
-            eprintln!("Auto-SCIP: failed to run {label}: {e}");
-            false
+            eprintln!("Auto-SCIP: failed to launch {label}: {e}");
+            StageOutcome::new(StageState::Failed, "SCIP_LAUNCH_FAILED")
         }
     }
 }
@@ -1074,7 +1061,7 @@ mod tests {
             .expect("scip_enrich_args must parse under the ScipEnrich clap definition");
 
         assert!(
-            matches!(&cli.command, crate::Commands::ScipEnrich { languages } if languages == langs),
+            matches!(&cli.command, crate::Commands::ScipEnrich { languages, .. } if languages == langs),
             "expected Commands::ScipEnrich {{ languages: {langs:?} }}"
         );
     }
@@ -1651,5 +1638,253 @@ mod tests {
         // No .infigraph — should report not running without error
         let result = crate::info_commands::cmd_watch_status(tmp.path());
         assert!(result.is_ok());
+    }
+}
+
+#[cfg(all(test, unix))]
+mod outcome_tests {
+    use super::*;
+    use std::os::unix::fs::PermissionsExt;
+
+    fn fake_script(dir: &Path, text: &str) -> std::path::PathBuf {
+        let path = dir.join("fake-indexer");
+        std::fs::write(&path, format!("#!/bin/sh\n{text}\n")).unwrap();
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o700)).unwrap();
+        path
+    }
+
+    #[test]
+    fn empty_or_linked_artifacts_are_not_valid_current_attempt_outputs() {
+        let dir = tempfile::tempdir().unwrap();
+        let output = dir.path().join("attempt.scip");
+        let retained = dir.path().join("retained.scip");
+        std::fs::write(&retained, b"retained").unwrap();
+        for command in [": > \"$2\"", "ln -s retained.scip \"$2\""] {
+            let script = fake_script(dir.path(), command);
+            let result = run_scip_indexer_cmd(
+                dir.path(),
+                script.to_str().unwrap(),
+                &[],
+                "test",
+                None,
+                Some("--output"),
+                &output,
+            );
+            assert_eq!(result.reason, "SCIP_ARTIFACT_INVALID");
+            assert_eq!(std::fs::read(&retained).unwrap(), b"retained");
+            std::fs::remove_file(&output).unwrap();
+        }
+    }
+
+    #[test]
+    fn subprocess_failure_missing_output_and_retained_artifacts_are_distinct() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::create_dir(dir.path().join(".infigraph")).unwrap();
+        let output = dir.path().join("attempt.scip");
+        let script = fake_script(dir.path(), "exit 7");
+        let result = run_scip_indexer_cmd(
+            dir.path(),
+            script.to_str().unwrap(),
+            &[],
+            "test",
+            None,
+            Some("--output"),
+            &output,
+        );
+        assert_eq!(result.state, StageState::Failed);
+        assert_eq!(result.exit_code, Some(7));
+        fake_script(dir.path(), "kill -TERM $$");
+        let terminated = run_scip_indexer_cmd(
+            dir.path(),
+            script.to_str().unwrap(),
+            &[],
+            "test",
+            None,
+            Some("--output"),
+            &output,
+        );
+        assert_eq!(terminated.state, StageState::Failed);
+        assert_eq!(terminated.exit_code, None);
+        assert_eq!(terminated.signal, Some(15));
+        fake_script(dir.path(), "exit 0");
+        assert_eq!(
+            run_scip_indexer_cmd(
+                dir.path(),
+                script.to_str().unwrap(),
+                &[],
+                "test",
+                None,
+                Some("--output"),
+                &output
+            )
+            .reason,
+            "SCIP_ARTIFACT_MISSING"
+        );
+        assert_eq!(
+            run_scip_indexer_cmd(
+                dir.path(),
+                "/does-not-exist",
+                &[],
+                "test",
+                None,
+                Some("--output"),
+                &output
+            )
+            .reason,
+            "SCIP_LAUNCH_FAILED"
+        );
+        std::fs::write(dir.path().join("index.scip"), b"retained").unwrap();
+        assert_eq!(
+            run_scip_indexer_cmd(
+                dir.path(),
+                script.to_str().unwrap(),
+                &[],
+                "test",
+                None,
+                None,
+                &output
+            )
+            .reason,
+            "SCIP_OUTPUT_CONFLICT"
+        );
+        assert_eq!(
+            std::fs::read(dir.path().join("index.scip")).unwrap(),
+            b"retained"
+        );
+    }
+
+    #[test]
+    fn output_is_run_owned_and_failed_artifacts_are_cleaned() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::create_dir(dir.path().join(".infigraph")).unwrap();
+        let scratch = index_status::scip_scratch(dir.path()).unwrap();
+        let path = scratch.path().join("index.scip");
+        let script = fake_script(dir.path(), "printf '\\001' > \"$2\"");
+        let outcome = run_scip_indexer_cmd(
+            dir.path(),
+            script.to_str().unwrap(),
+            &[],
+            "test",
+            None,
+            Some("--output"),
+            &path,
+        );
+        assert_eq!(outcome.state, StageState::Succeeded);
+        drop(scratch);
+        assert!(!path.exists());
+    }
+}
+
+#[cfg(all(test, unix))]
+mod pipeline_tests {
+    use super::*;
+    use std::os::unix::fs::PermissionsExt;
+
+    #[test]
+    fn failed_enrichment_survives_noop_and_recovers_only_after_import() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("a.ts"), "const helper = () => 1;").unwrap();
+        let mut prism = Infigraph::open(dir.path(), bundled_registry().unwrap()).unwrap();
+        prism.init().unwrap();
+        prism.index().unwrap();
+        let backend = prism.backend().unwrap();
+        let languages = indexed_languages(backend).unwrap();
+        let run = local_run_id(dir.path()).unwrap().unwrap();
+        prepare_scip(dir.path(), &languages, Some(&run)).unwrap();
+        assert!(
+            enrich_scip_with_tools(dir.path(), &languages, Some(&run), backend, |_| None).is_err()
+        );
+        assert_eq!(
+            index_status::load(dir.path()).unwrap().scip["scip-typescript"].reason,
+            "SCIP_TOOL_UNAVAILABLE"
+        );
+        let script = dir.path().join("fake-indexer");
+        std::fs::write(&script, "#!/bin/sh\nexit 7\n").unwrap();
+        std::fs::set_permissions(&script, std::fs::Permissions::from_mode(0o700)).unwrap();
+        assert!(
+            enrich_scip_with_tools(dir.path(), &languages, Some(&run), backend, |_| Some(
+                script.clone()
+            ))
+            .is_err()
+        );
+        assert_eq!(
+            index_status::load(dir.path()).unwrap().scip["scip-typescript"].exit_code,
+            Some(7)
+        );
+        assert_eq!(prism.index().unwrap().indexed_files, 0);
+        let report = index_status::load(dir.path()).unwrap();
+        assert!(report.has_failures());
+        assert!(
+            enrich_scip_with_tools(dir.path(), &languages, Some(&run), backend, |_| panic!(
+                "obsolete job must not launch"
+            ))
+            .is_err()
+        );
+        // Every fake indexer writes to the current run's explicit output path.
+        let writer = "#!/bin/sh\nwhile [ \"$#\" -gt 0 ]; do if [ \"$1\" = --output ]; then shift; output=\"$1\"; fi; shift; done\nprintf 'CONTENT' > \"$output\"\n";
+        std::fs::write(&script, writer.replace("CONTENT", "\\377")).unwrap();
+        assert!(enrich_scip_with_tools(
+            dir.path(),
+            &languages,
+            Some(&report.run_id),
+            backend,
+            |_| Some(script.clone())
+        )
+        .is_err());
+        assert_eq!(
+            index_status::load(dir.path()).unwrap().scip["scip-typescript"].reason,
+            "SCIP_IMPORT_FAILED"
+        );
+        // A minimal valid protobuf index exercises successful import, not
+        // compiler relationship quality (covered by actual source fixtures).
+        std::fs::write(&script, writer.replace("CONTENT", "\\012\\000")).unwrap();
+        enrich_scip_with_tools(
+            dir.path(),
+            &languages,
+            Some(&report.run_id),
+            backend,
+            |_| Some(script.clone()),
+        )
+        .unwrap();
+        assert!(!index_status::load(dir.path()).unwrap().has_failures());
+        assert!(prism.coverage_notice().starts_with("Coverage:"));
+        assert_eq!(prism.index().unwrap().indexed_files, 0);
+        let current = local_run_id(dir.path()).unwrap().unwrap();
+        prepare_scip(dir.path(), &languages, Some(&current)).unwrap();
+        enrich_scip_with_tools(dir.path(), &languages, Some(&current), backend, |_| {
+            panic!("successful unchanged enrichment must not run again")
+        })
+        .unwrap();
+        assert_eq!(backend.symbols_in_file("a.ts").unwrap().len(), 1);
+        assert!(std::fs::read_dir(dir.path().join(".infigraph"))
+            .unwrap()
+            .all(|e| !e
+                .unwrap()
+                .file_name()
+                .to_string_lossy()
+                .starts_with("scip-run-")));
+    }
+
+    #[test]
+    fn missing_project_prerequisite_is_skipped_before_provisioning() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut prism = Infigraph::open(dir.path(), bundled_registry().unwrap()).unwrap();
+        prism.init().unwrap();
+        prism.index().unwrap();
+        let languages = ["cpp".to_string()].into_iter().collect();
+        let run = local_run_id(dir.path()).unwrap().unwrap();
+        prepare_scip(dir.path(), &languages, Some(&run)).unwrap();
+        enrich_scip_with_tools(
+            dir.path(),
+            &languages,
+            Some(&run),
+            prism.backend().unwrap(),
+            |_| panic!("must not provision skipped indexer"),
+        )
+        .unwrap();
+        assert_eq!(
+            index_status::load(dir.path()).unwrap().scip["scip-clang"].state,
+            StageState::Skipped
+        );
     }
 }

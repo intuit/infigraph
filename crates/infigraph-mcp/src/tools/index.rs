@@ -121,6 +121,15 @@ pub fn tool_index_project(args: &Value) -> Result<String> {
             }
         }
     }
+    out.push_str(&prism.coverage_notice());
+    let coverage = infigraph_core::index_status::current_run(std::path::Path::new(path));
+    let remote = cfg!(feature = "neo4j")
+        && std::env::var("INFIGRAPH_BACKEND").is_ok_and(|mode| mode == "neo4j");
+    if !remote && coverage.is_ok_and(|report| report.has_failures()) {
+        return Err(anyhow::anyhow!(
+            "Partial index: analysis failed; the syntax graph remains available.\n{out}"
+        ));
+    }
     let stats = prism.stats()?;
     out.push_str(&format!("\n{}", stats));
 

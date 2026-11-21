@@ -309,8 +309,25 @@ pub fn extract_entities(
     for sym in symbols {
         seen.entry(sym.id.clone())
             .and_modify(|existing: &mut Symbol| {
-                if sym.kind == SymbolKind::Test && existing.kind == SymbolKind::Function {
+                let callable = |kind: &SymbolKind| {
+                    matches!(
+                        kind,
+                        SymbolKind::Function | SymbolKind::Method | SymbolKind::Test
+                    )
+                };
+                if (sym.kind == SymbolKind::Test && callable(&existing.kind))
+                    || (matches!(sym.language.as_str(), "typescript" | "tsx")
+                        && existing.kind == SymbolKind::Variable
+                        && callable(&sym.kind)
+                        && (existing.span.start_line, existing.span.start_col)
+                            <= (sym.span.end_line, sym.span.end_col)
+                        && (sym.span.start_line, sym.span.start_col)
+                            <= (existing.span.end_line, existing.span.end_col))
+                {
                     existing.kind = sym.kind.clone();
+                    existing.span = sym.span.clone();
+                    existing.signature_hash.clone_from(&sym.signature_hash);
+                    existing.complexity = sym.complexity;
                 }
                 let existing_len = existing.docstring.as_deref().map_or(0, str::len);
                 let new_len = sym.docstring.as_deref().map_or(0, str::len);
@@ -613,7 +630,7 @@ fn is_test_by_name_and_path(name: &str, file: &str, language: &str) -> bool {
 
     match language {
         // JS/TS: *.test.ts, *.spec.js, __tests__/ with describe/it/test
-        "typescript" | "javascript" => {
+        "typescript" | "tsx" | "javascript" => {
             file_lower.ends_with(".test.ts")
                 || file_lower.ends_with(".test.tsx")
                 || file_lower.ends_with(".test.js")
