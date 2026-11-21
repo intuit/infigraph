@@ -495,6 +495,9 @@ def get_settings():
         },
     );
 
+    // Release the repos' graph handles first: build_combined_graph opens the
+    // same files, and Windows refuses a second open while one is held.
+    drop((ig_a, ig_b));
     build_combined_graph(&registry, "test-false-match").unwrap();
 
     let cross_inherits = combined_query(
@@ -614,6 +617,7 @@ class BaseHandler:
         },
     );
 
+    drop((ig_a, ig_b));
     build_combined_graph(&registry, "test-real-inherit").unwrap();
 
     // MyHandler in lib-a inherits BaseHandler in lib-a.
