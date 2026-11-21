@@ -105,6 +105,12 @@ use handlers_chat::api_chat;
 use handlers_git::api_git_summary;
 use handlers_symbol::*;
 
+/// `<host>:<port>`, with host from `env_var`, defaulting to loopback.
+fn bind_addr(env_var: &str, port: u16) -> String {
+    let host = std::env::var(env_var).unwrap_or_else(|_| "127.0.0.1".to_string());
+    format!("{host}:{port}")
+}
+
 /// Start the web UI server on the given port. Runs in a background thread.
 ///
 /// Binds to loopback (`127.0.0.1`) by default so the unauthenticated Web UI/API
@@ -112,8 +118,7 @@ use handlers_symbol::*;
 /// hosts on the network. Set `INFIGRAPH_UI_BIND` to override the bind address
 /// (e.g. `0.0.0.0`) when intentionally exposing the UI.
 pub fn start_ui_server(port: u16) -> bool {
-    let host = std::env::var("INFIGRAPH_UI_BIND").unwrap_or_else(|_| "127.0.0.1".to_string());
-    let addr = format!("{}:{}", host, port);
+    let addr = bind_addr("INFIGRAPH_UI_BIND", port);
     // Pre-check: try binding before spawning thread so caller knows outcome
     let server = match Server::http(&addr) {
         Ok(s) => s,
@@ -169,8 +174,7 @@ pub fn start_ui_server(port: u16) -> bool {
 pub fn start_mcp_http_server(port: u16, is_primary: bool, health_path: &str) -> bool {
     // The HTTP transport exposes graph and webhook endpoints. Keep it local by
     // default; deployments that intentionally expose it can opt in explicitly.
-    let host = std::env::var("INFIGRAPH_MCP_BIND").unwrap_or_else(|_| "127.0.0.1".to_string());
-    let addr = format!("{}:{}", host, port);
+    let addr = bind_addr("INFIGRAPH_MCP_BIND", port);
     let server = match Server::http(&addr) {
         Ok(s) => s,
         Err(_) => return false,
@@ -904,11 +908,10 @@ mod tests {
         let (status, _) = http_get(port, "/api/health");
         assert_eq!(status, 200, "UI should be reachable on 127.0.0.1");
 
-        // ...but the wildcard address must still be free, proving the UI server
-        // did NOT bind 0.0.0.0 (all interfaces). If it had, this bind would fail
-        // with AddrInUse — which is exactly the ADV-2598 exposure.
-        assert!(
-            TcpListener::bind(format!("0.0.0.0:{}", port)).is_ok(),
+        // ...and bound to loopback only, not 0.0.0.0 (the ADV-2598 exposure).
+        assert_eq!(
+            bind_addr("INFIGRAPH_UI_BIND", port),
+            format!("127.0.0.1:{port}"),
             "UI server must not bind 0.0.0.0 by default (ADV-2598)"
         );
     }
@@ -932,8 +935,9 @@ mod tests {
             status, 200,
             "MCP HTTP server should be reachable on loopback"
         );
-        assert!(
-            TcpListener::bind(format!("0.0.0.0:{}", port)).is_ok(),
+        assert_eq!(
+            bind_addr("INFIGRAPH_MCP_BIND", port),
+            format!("127.0.0.1:{port}"),
             "MCP HTTP server must not bind 0.0.0.0 by default"
         );
     }
