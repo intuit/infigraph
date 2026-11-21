@@ -36,8 +36,12 @@ thiserror = "2"
 
 # lbug (Kuzu graph DB) produces a static library that exceeds the 4 GB PE32
 # limit on Windows when compiled in debug mode (LNK1248).
+# debug = false: built from source (Linux CI), cmake otherwise picks
+# RelWithDebInfo, and linking the multi-GB lib into every test binary
+# exhausted the runner's disk.
 [profile.dev.package.lbug]
 opt-level = 2
+debug = false
 
 # esaxx-rs hardcodes static_crt(true) (/MT) which conflicts with lbug's /MD
 # (dynamic CRT) on Windows MSVC, causing LNK2038 linker errors.

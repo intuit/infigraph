@@ -3,12 +3,21 @@ name: CI
 on:
   push:
     branches: [main]
+    paths-ignore: ['**.md', 'docs/**', 'blog/**']
   pull_request:
     branches: [main]
+    paths-ignore: ['**.md', 'docs/**', 'blog/**']
+
+# A newer push to the same PR/branch supersedes the run in progress.
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
 
 env:
   CARGO_TERM_COLOR: always
   CARGO_INCREMENTAL: 0
+  # Full debuginfo dominates test link time; line tables keep file:line in backtraces.
+  CARGO_PROFILE_DEV_DEBUG: line-tables-only
 
 jobs:
   fmt:
@@ -25,6 +34,7 @@ jobs:
     name: Check (${{ matrix.os }})
     runs-on: ${{ matrix.os }}
     strategy:
+      fail-fast: false
       matrix:
         os: [macos-latest, ubuntu-latest, windows-latest]
     steps:
@@ -37,6 +47,38 @@ jobs:
             /usr/local/lib/node_modules /opt/hostedtoolcache/CodeQL
           sudo docker image prune --all --force || true
           df -h
+      # lbug's prebuilt Linux lib was built with an older GCC; linking it with
+      # the runner's GCC 15 cxx bridge mixes std::format ABIs and segfaults in
+      # Database::new. Build lbug's C++ with the same compiler instead.
+      - name: Build lbug from source (Ubuntu)
+        if: runner.os == 'Linux'
+        run: echo "LBUG_BUILD_FROM_SOURCE=1" >> "$GITHUB_ENV"
+      # lbug's static lib links `ssl`/`crypto` (lbug build.rs, static mode).
+      - name: Link OpenSSL (macOS)
+        if: runner.os == 'macOS'
+        run: |
+          brew list openssl@3 >/dev/null 2>&1 || brew install openssl@3
+          echo "LIBRARY_PATH=$(brew --prefix openssl@3)/lib" >> "$GITHUB_ENV"
+      # vcpkg builds OpenSSL from source (~10 min); reuse the installed tree.
+      - name: Cache vcpkg OpenSSL (Windows)
+        if: runner.os == 'Windows'
+        uses: actions/cache@v4
+        with:
+          path: C:\vcpkg\installed
+          key: vcpkg-openssl-x64-windows-v1
+      - name: Link OpenSSL (Windows)
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: |
+          vcpkg install openssl:x64-windows
+          $root = "$env:VCPKG_INSTALLATION_ROOT\installed\x64-windows"
+          # OpenSSL 3 ships libssl.lib/libcrypto.lib; lbug asks the linker for ssl.lib/crypto.lib.
+          $libdir = "$env:RUNNER_TEMP\openssl-lib"
+          New-Item -ItemType Directory -Force $libdir | Out-Null
+          Copy-Item "$root\lib\libssl.lib" "$libdir\ssl.lib"
+          Copy-Item "$root\lib\libcrypto.lib" "$libdir\crypto.lib"
+          "LIB=$libdir;$env:LIB" >> $env:GITHUB_ENV
+          "$root\bin" >> $env:GITHUB_PATH
       - uses: dtolnay/rust-toolchain@stable
         with:
           components: clippy

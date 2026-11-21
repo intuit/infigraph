@@ -295,6 +295,9 @@ mod tests {
         assert!(check_disk_headroom(&std::env::temp_dir(), 1).is_ok());
     }
 
+    // Not on Windows: fs2 resolves any path to its volume root there, so the
+    // lookup succeeds and reports the real drive's free space.
+    #[cfg(not(windows))]
     #[test]
     fn disk_headroom_does_not_block_on_unreadable_path() {
         // Can't determine free space for a path that doesn't exist -- must
