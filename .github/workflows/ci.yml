@@ -3,12 +3,21 @@ name: CI
 on:
   push:
     branches: [main]
+    paths-ignore: ['**.md', 'docs/**', 'blog/**']
   pull_request:
     branches: [main]
+    paths-ignore: ['**.md', 'docs/**', 'blog/**']
+
+# A newer push to the same PR/branch supersedes the run in progress.
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
 
 env:
   CARGO_TERM_COLOR: always
   CARGO_INCREMENTAL: 0
+  # Full debuginfo dominates test link time; line tables keep file:line in backtraces.
+  CARGO_PROFILE_DEV_DEBUG: line-tables-only
 
 jobs:
   fmt:
@@ -50,6 +59,13 @@ jobs:
         run: |
           brew list openssl@3 >/dev/null 2>&1 || brew install openssl@3
           echo "LIBRARY_PATH=$(brew --prefix openssl@3)/lib" >> "$GITHUB_ENV"
+      # vcpkg builds OpenSSL from source (~10 min); reuse the installed tree.
+      - name: Cache vcpkg OpenSSL (Windows)
+        if: runner.os == 'Windows'
+        uses: actions/cache@v4
+        with:
+          path: C:\vcpkg\installed
+          key: vcpkg-openssl-x64-windows-v1
       - name: Link OpenSSL (Windows)
         if: runner.os == 'Windows'
         shell: pwsh
