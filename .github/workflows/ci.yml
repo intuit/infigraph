@@ -30,13 +30,23 @@ jobs:
           components: rustfmt
       - run: cargo fmt --all -- --check
 
+  # The test suite is split into three shards per OS so they run in parallel;
+  # one job running `cargo test --all` took about an hour.
   check:
-    name: Check (${{ matrix.os }})
+    name: Check (${{ matrix.os }}, ${{ matrix.shard.name }})
     runs-on: ${{ matrix.os }}
     strategy:
       fail-fast: false
       matrix:
         os: [macos-latest, ubuntu-latest, windows-latest]
+        shard:
+          - name: core
+            test: -p infigraph-core
+          - name: mcp
+            test: -p infigraph-mcp
+          # Everything else; this shard also runs Clippy and saves the build cache.
+          - name: rest
+            test: --workspace --exclude infigraph-core --exclude infigraph-mcp
     steps:
       - uses: actions/checkout@v4
       - name: Free disk space (Ubuntu)
@@ -85,9 +95,12 @@ jobs:
       - uses: Swatinem/rust-cache@v2
         with:
           key: ci-${{ matrix.os }}
-          save-if: ${{ github.ref == 'refs/heads/main' }}
+          # All shards restore the same cache; only one saves it, so three
+          # copies don't push the repo past GitHub's cache quota.
+          save-if: ${{ github.ref == 'refs/heads/main' && matrix.shard.name == 'rest' }}
           cache-on-failure: true
       - name: Clippy
+        if: matrix.shard.name == 'rest'
         run: cargo clippy --all-targets -- -D warnings
       - name: Test
-        run: cargo test --all
+        run: cargo test ${{ matrix.shard.test }}
