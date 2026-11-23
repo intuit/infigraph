@@ -8,6 +8,10 @@
 //! what) and is never trusted for liveness decisions. Conservative rule:
 //! a held flock with an unreadable payload is an *unknown holder* —
 //! bounded-wait then `Busy`, never broken.
+//!
+//! On Windows the payload is also mirrored to an unlocked `<lock>.info`
+//! sidecar: locks there are mandatory, so no other handle can read a held
+//! lock file.
 
 use std::fs::File;
 use std::io::{Read, Seek, SeekFrom, Write};
@@ -102,6 +106,9 @@ impl Drop for LockFile {
         // Best-effort: clear payload before the flock releases so readers
         // never see a stale identity on a free lock we released cleanly.
         let _ = self.file.set_len(0);
+        if cfg!(windows) {
+            let _ = std::fs::write(info_path(&self.path), b"");
+        }
         let _ = fs2::FileExt::unlock(&self.file);
     }
 }
@@ -118,22 +125,37 @@ fn open_lock_file(path: &Path) -> Result<File> {
         .open(path)?)
 }
 
-fn stamp(file: &mut File, role: &str) -> Result<()> {
+/// `<lock>.info`: the unlocked sidecar holding a copy of the payload.
+fn info_path(path: &Path) -> PathBuf {
+    let mut name = path.as_os_str().to_os_string();
+    name.push(".info");
+    PathBuf::from(name)
+}
+
+fn stamp(file: &mut File, path: &Path, role: &str) -> Result<()> {
     let info = LockInfo::current(role);
     let json = serde_json::to_string(&info)?;
     file.set_len(0)?;
     file.seek(SeekFrom::Start(0))?;
     file.write_all(json.as_bytes())?;
     file.flush()?;
+    if cfg!(windows) {
+        std::fs::write(info_path(path), json.as_bytes())?;
+    }
     Ok(())
 }
 
-/// Best-effort read of the current holder's identity. `None` when the file
-/// is missing, empty, or unparseable (old binary / mid-write).
-pub fn read_holder(path: &Path) -> Option<LockInfo> {
+fn parse_holder(path: &Path) -> Option<LockInfo> {
     let mut buf = String::new();
     File::open(path).ok()?.read_to_string(&mut buf).ok()?;
     serde_json::from_str(buf.trim()).ok()
+}
+
+/// Best-effort read of the current holder's identity. `None` when the file
+/// is missing, empty, or unparseable (old binary / mid-write). Reads the
+/// sidecar first, then the lock file (holders from older binaries).
+pub fn read_holder(path: &Path) -> Option<LockInfo> {
+    parse_holder(&info_path(path)).or_else(|| parse_holder(path))
 }
 
 /// Non-blocking acquisition. `Ok(None)` when another open file description
@@ -142,7 +164,7 @@ pub fn try_acquire(path: &Path, role: &str) -> Result<Option<LockFile>> {
     let mut file = open_lock_file(path)?;
     match file.try_lock_exclusive() {
         Ok(()) => {
-            stamp(&mut file, role)?;
+            stamp(&mut file, path, role)?;
             Ok(Some(LockFile {
                 file,
                 path: path.to_path_buf(),
