@@ -27,6 +27,18 @@ pub struct CallsServiceEdge {
     pub path: String,
 }
 
+/// One detected taint flow, to be written as a `TAINT_FLOW` self-edge on
+/// the symbol the flow was found in. Only the four properties the edge
+/// actually stores travel here -- the richer `taint::TaintFlow` keeps the
+/// file, line numbers, category and sanitizer for reporting.
+#[derive(Debug, Clone)]
+pub struct TaintFlowEdge {
+    pub symbol_id: String,
+    pub source_kind: String,
+    pub sink_kind: String,
+    pub path: String,
+}
+
 /// Backend-agnostic graph storage interface.
 ///
 /// KuzuBackend wraps the existing embedded Kùzu store (local mode).
@@ -239,6 +251,22 @@ pub trait GraphBackend: Send + Sync {
     /// directly (same design as `upsert_files_bulk`/`resolve_calls`). A
     /// no-op for an empty slice.
     fn write_calls_service_edges(&self, edges: &[CallsServiceEdge]) -> Result<()>;
+
+    /// Replace every recorded `TAINT_FLOW` edge with `flows` as a single
+    /// atomic operation, same design as `write_calls_service_edges`.
+    ///
+    /// `taint::write_taint_flows` previously issued the clearing DELETE and
+    /// one CREATE per flow as separate `raw_query` calls. Kùzu's `raw_query`
+    /// takes a fresh connection each time, so that was one connection and
+    /// one transaction per flow -- ~4.5 ms each, 2.5 s for a 557-flow
+    /// corpus, against 0.022 s to compute those same flows. It was also
+    /// never atomic: a crash mid-loop deleted every flow and recreated only
+    /// some of them.
+    ///
+    /// Clearing is unconditional rather than an early return on an empty
+    /// slice: a run that finds no taint must still drop the previous run's
+    /// edges.
+    fn replace_taint_flows(&self, flows: &[TaintFlowEdge]) -> Result<()>;
 
     // ── Resolve ──────────────────────────────────────────────────────
 
