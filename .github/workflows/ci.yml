@@ -100,6 +100,15 @@ jobs:
           # copies don't push the repo past GitHub's cache quota.
           save-if: ${{ github.ref == 'refs/heads/main' && matrix.shard.name == 'rest' }}
           cache-on-failure: true
+      # lbug downloads its prebuilt library into its own source dir under
+      # ~/.cargo/registry/src, which the cache doesn't keep. A restored cache
+      # marks lbug's build script as up to date, so the library is never
+      # fetched again and linking fails. Drop lbug's cached build output so
+      # the script reruns. Linux builds lbug from source into target/ instead.
+      - name: Refetch prebuilt lbug (macOS, Windows)
+        if: runner.os != 'Linux'
+        shell: bash
+        run: rm -rf target/debug/build/lbug-* target/debug/.fingerprint/lbug-*
       - name: Clippy
         if: matrix.shard.name == 'rest'
         run: cargo clippy --all-targets -- -D warnings
