@@ -8,10 +8,11 @@ on:
     branches: [main]
     paths-ignore: ['**.md', 'docs/**', 'blog/**']
 
-# A newer push to the same PR/branch supersedes the run in progress.
+# A newer push to the same PR supersedes the run in progress. Runs on main
+# are never cancelled: each merge gets a result, and main saves the caches.
 concurrency:
   group: ci-${{ github.ref }}
-  cancel-in-progress: true
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
 
 env:
   CARGO_TERM_COLOR: always

@@ -34,6 +34,13 @@ use infigraph_languages::bundled_registry;
 // combined_graph.rs's COMBINED_LOCK convention).
 static COMBINED_LOCK: Mutex<()> = Mutex::new(());
 
+/// Every test takes this: one test points `HOME` at a temp dir, and each
+/// test opens several graph databases, which exhausts mmap space when all
+/// 21 run at once.
+fn serial() -> std::sync::MutexGuard<'static, ()> {
+    COMBINED_LOCK.lock().unwrap_or_else(|e| e.into_inner())
+}
+
 // ── helpers ────────────────────────────────────────────────────────────────
 
 /// Index one or more source files (real extraction) into a fresh Kuzu backend.
@@ -106,6 +113,7 @@ const SINGLE_RPC_PROTO: &str =
 
 #[test]
 fn test_contracts_single_rpc() {
+    let _serial = serial();
     let (_d, backend) = backend_with(&[("user.proto", SINGLE_RPC_PROTO.as_bytes())]);
     let contracts = extract_grpc_contracts(backend.as_ref());
     assert_eq!(contracts.len(), 1, "one RPC → one contract: {contracts:?}");
@@ -116,6 +124,7 @@ fn test_contracts_single_rpc() {
 
 #[test]
 fn test_contracts_multi_rpc() {
+    let _serial = serial();
     let src = "syntax = \"proto3\";\nservice UserService {\n  rpc GetUser (Req) returns (User);\n  rpc ListUsers (Req) returns (Users);\n  rpc DeleteUser (Req) returns (Empty);\n}\n";
     let (_d, backend) = backend_with(&[("user.proto", src.as_bytes())]);
     let mut paths: Vec<String> = extract_grpc_contracts(backend.as_ref())
@@ -136,6 +145,7 @@ fn test_contracts_multi_rpc() {
 
 #[test]
 fn test_contracts_multiple_services_one_proto() {
+    let _serial = serial();
     let src = "syntax = \"proto3\";\nservice UserService {\n  rpc GetUser (Req) returns (User);\n}\nservice OrderService {\n  rpc GetOrder (Req) returns (Order);\n}\n";
     let (_d, backend) = backend_with(&[("svc.proto", src.as_bytes())]);
     let mut paths: Vec<String> = extract_grpc_contracts(backend.as_ref())
@@ -152,6 +162,7 @@ fn test_contracts_multiple_services_one_proto() {
 
 #[test]
 fn test_contracts_none_without_proto() {
+    let _serial = serial();
     // A plain Python file must yield no gRPC contracts.
     let (_d, backend) = backend_with(&[("app.py", b"def handler():\n    return 1\n")]);
     assert!(extract_grpc_contracts(backend.as_ref()).is_empty());
@@ -189,6 +200,7 @@ fn grpc_deps_for(consumer_file: &str, consumer_src: &str) -> Vec<multi::CrossSer
 
 #[test]
 fn test_client_python_pb2_grpc() {
+    let _serial = serial();
     // Python generated stub: user_service_pb2_grpc import + UserServiceStub use.
     let deps = grpc_deps_for(
         "gateway.py",
@@ -203,6 +215,7 @@ fn test_client_python_pb2_grpc() {
 
 #[test]
 fn test_client_go_stub_suffix() {
+    let _serial = serial();
     let deps = grpc_deps_for(
         "client.go",
         "package main\n\nfunc dial() {\n    var s UserServiceStub\n    _ = s\n}\n",
@@ -215,6 +228,7 @@ fn test_client_go_stub_suffix() {
 
 #[test]
 fn test_client_ts_client_suffix() {
+    let _serial = serial();
     let deps = grpc_deps_for(
         "client.ts",
         "export function make(): void {\n  const c: UserServiceClient | null = null;\n  void c;\n}\n",
@@ -227,6 +241,7 @@ fn test_client_ts_client_suffix() {
 
 #[test]
 fn test_client_no_false_match_on_unrelated_name() {
+    let _serial = serial();
     // A name that merely contains the service word but not a stub token must not link.
     let deps = grpc_deps_for(
         "helper.py",
@@ -240,6 +255,7 @@ fn test_client_no_false_match_on_unrelated_name() {
 
 #[test]
 fn test_client_proto_producer_not_scanned_as_consumer() {
+    let _serial = serial();
     // The stub token appears only in the producer's own .proto-adjacent code —
     // but a repo must not be scanned for a service it owns, and .proto files are
     // excluded from the client scan. No consumer here → no gRPC dep.
@@ -260,6 +276,7 @@ fn test_client_proto_producer_not_scanned_as_consumer() {
 /// Python (grpcio): the generated module import is the strongest signal. #30
 #[test]
 fn test_client_py_pb2_grpc_module_import() {
+    let _serial = serial();
     let deps = grpc_deps_for(
         "svc.py",
         "import user_service_pb2_grpc as g\n\ndef make(ch):\n    return g.UserServiceStub(ch)\n",
@@ -273,6 +290,7 @@ fn test_client_py_pb2_grpc_module_import() {
 /// Python server registration is a cross-service coupling too. #30
 #[test]
 fn test_client_py_add_servicer_to_server() {
+    let _serial = serial();
     let deps = grpc_deps_for(
         "server.py",
         "def serve(server, impl):\n    add_UserServiceServicer_to_server(impl, server)\n",
@@ -286,6 +304,7 @@ fn test_client_py_add_servicer_to_server() {
 /// Go (protoc-gen-go-grpc): the New{Svc}Client constructor at the call site. #31
 #[test]
 fn test_client_go_new_client_constructor() {
+    let _serial = serial();
     let deps = grpc_deps_for(
         "main.go",
         "package main\n\nfunc dial(conn *grpc.ClientConn) {\n    c := pb.NewUserServiceClient(conn)\n    _ = c\n}\n",
@@ -299,6 +318,7 @@ fn test_client_go_new_client_constructor() {
 /// Java (grpc-java): {Svc}Grpc.newBlockingStub(channel). #32
 #[test]
 fn test_client_java_grpc_blocking_stub() {
+    let _serial = serial();
     let deps = grpc_deps_for(
         "Client.java",
         "class Client {\n  void go(Channel ch) {\n    var s = UserServiceGrpc.newBlockingStub(ch);\n  }\n}\n",
@@ -313,6 +333,7 @@ fn test_client_java_grpc_blocking_stub() {
 /// from the service symbol, no {Svc}Client token. #33
 #[test]
 fn test_client_ts_connect_es_create_client() {
+    let _serial = serial();
     let deps = grpc_deps_for(
         "client.ts",
         "import { createPromiseClient } from '@connectrpc/connect';\n\nexport function make(t) {\n  return createPromiseClient(UserService, t);\n}\n",
@@ -326,6 +347,7 @@ fn test_client_ts_connect_es_create_client() {
 /// Rust (tonic): {snake}_client module path + {Svc}Client::connect. #34
 #[test]
 fn test_client_rust_tonic_module_path() {
+    let _serial = serial();
     let deps = grpc_deps_for(
         "client.rs",
         "use user_service_client::UserServiceClient;\n\nasync fn dial() {\n    let _c = UserServiceClient::connect(\"http://x\").await;\n}\n",
@@ -340,6 +362,7 @@ fn test_client_rust_tonic_module_path() {
 /// (guards the same-line requirement for the createClient marker). #33
 #[test]
 fn test_client_connect_es_requires_service_on_same_line() {
+    let _serial = serial();
     let deps = grpc_deps_for(
         "client.ts",
         "import { createPromiseClient } from '@connectrpc/connect';\n\nexport function make(t) {\n  return createPromiseClient(SomeOtherService, t);\n}\n",
@@ -353,6 +376,7 @@ fn test_client_connect_es_requires_service_on_same_line() {
 /// C++ (grpc C++ codegen): {Svc}::NewStub(channel) factory call. #34
 #[test]
 fn test_client_cpp_newstub_constructor() {
+    let _serial = serial();
     let deps = grpc_deps_for(
         "client.cc",
         "#include \"user_service.grpc.pb.h\"\n\nvoid Connect(std::shared_ptr<grpc::Channel> channel) {\n  std::unique_ptr<UserService::Stub> stub = UserService::NewStub(channel);\n}\n",
@@ -382,6 +406,7 @@ class Gateway:
 /// GrpcService contract in the group after index → sync_group_contracts.
 #[test]
 fn test_local_grpc_producer_contract_lands_in_group() {
+    let _serial = serial();
     let producer = make_repo(&[("user.proto", PROTO_PRODUCER)]);
     let consumer = make_repo(&[("gateway.py", PY_CONSUMER)]);
     let mut registry = two_repo_group(
@@ -416,6 +441,7 @@ fn test_local_grpc_producer_contract_lands_in_group() {
 /// detection is source-scan based (the stub reference leaves no graph trace).
 #[test]
 fn test_local_grpc_end_to_end_links_consumer_to_producer() {
+    let _serial = serial();
     let producer = make_repo(&[("user.proto", PROTO_PRODUCER)]);
     let consumer = make_repo(&[("gateway.py", PY_CONSUMER)]);
     let mut registry = two_repo_group(
@@ -442,6 +468,7 @@ fn test_local_grpc_end_to_end_links_consumer_to_producer() {
 /// defines the service, but that is not a client dependency.
 #[test]
 fn test_local_grpc_producer_does_not_self_link() {
+    let _serial = serial();
     let producer = make_repo(&[("user.proto", PROTO_PRODUCER)]);
     // Consumer here has NO stub reference — so the only gRPC symbols are in the
     // producer's own proto. No cross-service gRPC edge should be produced.
@@ -482,7 +509,7 @@ fn test_local_grpc_producer_does_not_self_link() {
 ///
 #[test]
 fn test_combined_graph_promotes_grpc_call_to_real_edge() {
-    let _guard = COMBINED_LOCK.lock().unwrap();
+    let _serial = serial();
     let home = tempfile::TempDir::new().unwrap();
     let orig_home = std::env::var("HOME").unwrap_or_default();
     std::env::set_var("HOME", home.path());

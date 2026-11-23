@@ -36,22 +36,33 @@ fn make_project(files: &[(&str, &str)]) -> (tempfile::TempDir, String) {
     (dir, path)
 }
 
+/// Block until each stopped watcher thread has returned. Its `stop_rx` is
+/// dropped then, so sends start failing. Without this a watcher can still be
+/// mid-reindex when the test, or the whole process, ends.
+fn wait_for_watcher_exit(stop_txs: Vec<std::sync::mpsc::Sender<()>>) {
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(30);
+    for tx in stop_txs {
+        while tx.send(()).is_ok() && std::time::Instant::now() < deadline {
+            std::thread::sleep(std::time::Duration::from_millis(20));
+        }
+    }
+}
+
 fn stop_all_watchers() {
     let mut guard = get_watchers();
-    let stopped_paths: Vec<String> = if let Some(map) = guard.as_mut() {
+    let mut stopped_paths = Vec::new();
+    let mut stop_txs = Vec::new();
+    if let Some(map) = guard.as_mut() {
         let ids: Vec<String> = map.keys().cloned().collect();
-        let mut paths = Vec::new();
         for id in ids {
             if let Some(entry) = map.remove(&id) {
-                paths.push(entry.path.clone());
-                let _ = entry.stop_tx.send(());
+                stopped_paths.push(entry.path.clone());
+                stop_txs.push(entry.stop_tx);
             }
         }
-        paths
-    } else {
-        Vec::new()
-    };
+    }
     drop(guard);
+    wait_for_watcher_exit(stop_txs);
     wait_for_watch_locks_released(&stopped_paths);
 }
 
@@ -108,7 +119,7 @@ fn poll_until<F: Fn() -> bool>(check: F, timeout: Duration, desc: &str) -> bool 
 /// Modify an existing file in an existing directory — watcher should detect and reindex.
 #[test]
 fn test_code_watcher_reindexes_modified_file() {
-    let _guard = WATCHER_LOCK.lock().unwrap();
+    let _guard = WATCHER_LOCK.lock().unwrap_or_else(|e| e.into_inner());
     let _cleanup = WatcherCleanup;
     stop_all_watchers();
     init_watchers();
@@ -168,7 +179,7 @@ fn test_code_watcher_reindexes_modified_file() {
 /// Create a new file in an existing directory — watcher should detect and reindex.
 #[test]
 fn test_code_watcher_reindexes_new_file_existing_dir() {
-    let _guard = WATCHER_LOCK.lock().unwrap();
+    let _guard = WATCHER_LOCK.lock().unwrap_or_else(|e| e.into_inner());
     let _cleanup = WatcherCleanup;
     stop_all_watchers();
     init_watchers();
@@ -211,7 +222,7 @@ fn test_code_watcher_reindexes_new_file_existing_dir() {
 /// This is the branch-switch scenario where new dirs appear.
 #[test]
 fn test_code_watcher_reindexes_new_file_new_dir() {
-    let _guard = WATCHER_LOCK.lock().unwrap();
+    let _guard = WATCHER_LOCK.lock().unwrap_or_else(|e| e.into_inner());
     let _cleanup = WatcherCleanup;
     stop_all_watchers();
     init_watchers();
@@ -256,21 +267,24 @@ fn test_code_watcher_reindexes_new_file_new_dir() {
 }
 
 fn stop_all_doc_watchers() {
-    let mut guard = DOC_WATCHERS.lock().unwrap();
+    let mut guard = DOC_WATCHERS.lock().unwrap_or_else(|e| e.into_inner());
+    let mut stop_txs = Vec::new();
     if let Some(map) = guard.as_mut() {
         let ids: Vec<String> = map.keys().cloned().collect();
         for id in ids {
             if let Some(entry) = map.remove(&id) {
-                let _ = entry.stop_tx.send(());
+                stop_txs.push(entry.stop_tx);
             }
         }
     }
+    drop(guard);
+    wait_for_watcher_exit(stop_txs);
 }
 
 /// Doc watcher should detect new .md files and reindex them.
 #[test]
 fn test_doc_watcher_reindexes_new_doc() {
-    let _guard = WATCHER_LOCK.lock().unwrap();
+    let _guard = WATCHER_LOCK.lock().unwrap_or_else(|e| e.into_inner());
     let _cleanup = WatcherCleanup;
     stop_all_watchers();
     stop_all_doc_watchers();
@@ -330,7 +344,7 @@ fn test_doc_watcher_reindexes_new_doc() {
 /// Doc watcher without concurrent readers — isolates whether WAL error is from concurrency.
 #[test]
 fn test_doc_watcher_reindexes_no_concurrent_read() {
-    let _guard = WATCHER_LOCK.lock().unwrap();
+    let _guard = WATCHER_LOCK.lock().unwrap_or_else(|e| e.into_inner());
     let _cleanup = WatcherCleanup;
     stop_all_watchers();
     stop_all_doc_watchers();
@@ -372,7 +386,7 @@ fn test_doc_watcher_reindexes_no_concurrent_read() {
 /// Simulate branch switch: modify existing files, add new files in existing dirs.
 #[test]
 fn test_code_watcher_branch_switch_existing_dirs() {
-    let _guard = WATCHER_LOCK.lock().unwrap();
+    let _guard = WATCHER_LOCK.lock().unwrap_or_else(|e| e.into_inner());
     let _cleanup = WatcherCleanup;
     stop_all_watchers();
     init_watchers();
@@ -434,7 +448,7 @@ fn test_code_watcher_branch_switch_existing_dirs() {
 /// Simulate branch switch with NEW directories (new module added on branch B).
 #[test]
 fn test_code_watcher_branch_switch_new_dirs() {
-    let _guard = WATCHER_LOCK.lock().unwrap();
+    let _guard = WATCHER_LOCK.lock().unwrap_or_else(|e| e.into_inner());
     let _cleanup = WatcherCleanup;
     stop_all_watchers();
     init_watchers();
@@ -505,7 +519,7 @@ fn test_code_watcher_branch_switch_new_dirs() {
 /// Doc watcher should detect new docs in a NEW subdirectory (recursive mode).
 #[test]
 fn test_doc_watcher_reindexes_new_doc_new_dir() {
-    let _guard = WATCHER_LOCK.lock().unwrap();
+    let _guard = WATCHER_LOCK.lock().unwrap_or_else(|e| e.into_inner());
     let _cleanup = WatcherCleanup;
     stop_all_watchers();
     stop_all_doc_watchers();
@@ -550,7 +564,7 @@ fn test_doc_watcher_reindexes_new_doc_new_dir() {
 /// Code watcher should handle directory removal gracefully (no crash/hang).
 #[test]
 fn test_code_watcher_handles_dir_removal() {
-    let _guard = WATCHER_LOCK.lock().unwrap();
+    let _guard = WATCHER_LOCK.lock().unwrap_or_else(|e| e.into_inner());
     let _cleanup = WatcherCleanup;
     stop_all_watchers();
     init_watchers();
@@ -634,7 +648,7 @@ fn test_code_watcher_handles_dir_removal() {
 /// Validates that the filter_registry.for_file() check covers ANTLR plug-n-play grammars.
 #[test]
 fn test_code_watcher_grammar_plugin_extensions() {
-    let _guard = WATCHER_LOCK.lock().unwrap();
+    let _guard = WATCHER_LOCK.lock().unwrap_or_else(|e| e.into_inner());
     let _cleanup = WatcherCleanup;
     stop_all_watchers();
     init_watchers();
@@ -710,7 +724,7 @@ fn test_code_watcher_grammar_plugin_extensions() {
 /// re-resolves the CALLS edge so search still finds the caller relationship.
 #[test]
 fn test_code_watcher_cross_file_auto_resolve() {
-    let _guard = WATCHER_LOCK.lock().unwrap();
+    let _guard = WATCHER_LOCK.lock().unwrap_or_else(|e| e.into_inner());
     let _cleanup = WatcherCleanup;
     stop_all_watchers();
     init_watchers();
@@ -771,7 +785,7 @@ fn test_code_watcher_cross_file_auto_resolve() {
 /// Watcher should ignore files in node_modules, .git, target, etc.
 #[test]
 fn test_code_watcher_ignores_excluded_dirs() {
-    let _guard = WATCHER_LOCK.lock().unwrap();
+    let _guard = WATCHER_LOCK.lock().unwrap_or_else(|e| e.into_inner());
     let _cleanup = WatcherCleanup;
     stop_all_watchers();
     init_watchers();
@@ -841,7 +855,7 @@ fn test_code_watcher_ignores_excluded_dirs() {
 /// Sentinel file stop: writing .infigraph/watch.stop should stop the watcher.
 #[test]
 fn test_code_watcher_sentinel_stop() {
-    let _guard = WATCHER_LOCK.lock().unwrap();
+    let _guard = WATCHER_LOCK.lock().unwrap_or_else(|e| e.into_inner());
     let _cleanup = WatcherCleanup;
     stop_all_watchers();
     init_watchers();
@@ -905,7 +919,7 @@ fn test_code_watcher_sentinel_stop() {
 /// no longer appear in search results.
 #[test]
 fn test_doc_watcher_prunes_stale_docs() {
-    let _guard = WATCHER_LOCK.lock().unwrap();
+    let _guard = WATCHER_LOCK.lock().unwrap_or_else(|e| e.into_inner());
     let _cleanup = WatcherCleanup;
     stop_all_watchers();
     stop_all_doc_watchers();
