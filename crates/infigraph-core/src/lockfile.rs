@@ -9,9 +9,9 @@
 //! a held flock with an unreadable payload is an *unknown holder* —
 //! bounded-wait then `Busy`, never broken.
 //!
-//! The payload is also mirrored to an unlocked `<lock>.info` sidecar:
-//! Windows locks are mandatory, so no other handle can read a held lock
-//! file there.
+//! On Windows the payload is also mirrored to an unlocked `<lock>.info`
+//! sidecar: locks there are mandatory, so no other handle can read a held
+//! lock file.
 
 use std::fs::File;
 use std::io::{Read, Seek, SeekFrom, Write};
@@ -106,7 +106,9 @@ impl Drop for LockFile {
         // Best-effort: clear payload before the flock releases so readers
         // never see a stale identity on a free lock we released cleanly.
         let _ = self.file.set_len(0);
-        let _ = std::fs::write(info_path(&self.path), b"");
+        if cfg!(windows) {
+            let _ = std::fs::write(info_path(&self.path), b"");
+        }
         let _ = fs2::FileExt::unlock(&self.file);
     }
 }
@@ -137,7 +139,9 @@ fn stamp(file: &mut File, path: &Path, role: &str) -> Result<()> {
     file.seek(SeekFrom::Start(0))?;
     file.write_all(json.as_bytes())?;
     file.flush()?;
-    std::fs::write(info_path(path), json.as_bytes())?;
+    if cfg!(windows) {
+        std::fs::write(info_path(path), json.as_bytes())?;
+    }
     Ok(())
 }
 
