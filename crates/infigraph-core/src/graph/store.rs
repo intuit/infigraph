@@ -1,5 +1,6 @@
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
+use std::sync::{Arc, LazyLock, Mutex, Weak};
 
 use anyhow::Result;
 use kuzu::{Connection, Database, SystemConfig};
@@ -38,9 +39,27 @@ impl WriteLock {
     }
 }
 
+/// Live `Database` handles in this process by path, with whether each is
+/// read-only. lbug supports one `Database` per path per process (shared by
+/// many `Connection`s); a second one racing a writer can SIGSEGV
+/// (docs.ladybugdb.com/concurrency), so opens share the live handle.
+static OPEN_DBS: LazyLock<Mutex<OpenDbs>> = LazyLock::new(|| Mutex::new(HashMap::new()));
+
+type OpenDbs = HashMap<PathBuf, (Weak<Database>, bool)>;
+
+fn open_dbs_key(path: &Path) -> PathBuf {
+    match (
+        path.parent().and_then(|p| p.canonicalize().ok()),
+        path.file_name(),
+    ) {
+        (Some(dir), Some(name)) => dir.join(name),
+        _ => path.to_path_buf(),
+    }
+}
+
 /// Persistent graph store backed by Kuzu.
 pub struct GraphStore {
-    db: Database,
+    db: Arc<Database>,
     lock_path: PathBuf,
 }
 
@@ -51,10 +70,25 @@ impl GraphStore {
             std::fs::create_dir_all(parent)?;
         }
         let lock_path = path.with_extension("lock");
-        let db = Database::new(path, SystemConfig::default())
-            .map_err(|e| anyhow::anyhow!("failed to open kuzu db: {e}"))?;
+        let key = open_dbs_key(path);
+        let mut dbs = OPEN_DBS.lock().unwrap_or_else(|e| e.into_inner());
+        if let Some((db, read_only)) = dbs.get(&key).and_then(|(w, ro)| Some((w.upgrade()?, *ro))) {
+            // Same text as lbug's own contention error, so callers retry
+            // until the short-lived reader drops its handle.
+            anyhow::ensure!(
+                !read_only,
+                "failed to open kuzu db: Could not set lock on file : {} (open read-only in this process)",
+                path.display()
+            );
+            return Ok(Self { db, lock_path });
+        }
+        let db = Arc::new(
+            Database::new(path, SystemConfig::default())
+                .map_err(|e| anyhow::anyhow!("failed to open kuzu db: {e}"))?,
+        );
         let store = Self { db, lock_path };
         store.init_schema()?;
+        dbs.insert(key, (Arc::downgrade(&store.db), false));
         Ok(store)
     }
 
@@ -69,15 +103,24 @@ impl GraphStore {
         self.lock_path.parent()
     }
 
-    /// Open an existing Kuzu database in read-only mode.
-    /// Safe for concurrent access while a watcher is writing.
+    /// Open an existing Kuzu database for reading. Reuses this process's
+    /// live handle for `path` when there is one (e.g. a watcher mid-write),
+    /// otherwise opens it in read-only mode.
     pub fn open_read_only(path: &Path) -> Result<Self> {
         let lock_path = path.with_extension("lock");
+        let key = open_dbs_key(path);
+        let mut dbs = OPEN_DBS.lock().unwrap_or_else(|e| e.into_inner());
+        if let Some(db) = dbs.get(&key).and_then(|(w, _)| w.upgrade()) {
+            return Ok(Self { db, lock_path });
+        }
         let config = SystemConfig::default()
             .read_only(true)
             .throw_on_wal_replay_failure(false);
-        let db = Database::new(path, config)
-            .map_err(|e| anyhow::anyhow!("failed to open kuzu db (read-only): {e}"))?;
+        let db = Arc::new(
+            Database::new(path, config)
+                .map_err(|e| anyhow::anyhow!("failed to open kuzu db (read-only): {e}"))?,
+        );
+        dbs.insert(key, (Arc::downgrade(&db), true));
         Ok(Self { db, lock_path })
     }
 
