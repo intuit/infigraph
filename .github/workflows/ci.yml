@@ -107,8 +107,7 @@ jobs:
       # the script reruns. Linux builds lbug from source into target/ instead.
       - name: Refetch prebuilt lbug (macOS, Windows)
         if: runner.os != 'Linux'
-        shell: bash
-        run: rm -rf target/debug/build/lbug-* target/debug/.fingerprint/lbug-*
+        run: cargo clean -p lbug
       - name: Clippy
         if: matrix.shard.name == 'rest'
         run: cargo clippy --all-targets -- -D warnings
