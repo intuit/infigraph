@@ -75,8 +75,12 @@ jobs:
             extra="$extra -C link-arg=$dir/libz.a"
           fi
           if nm "$dir/libcrypto.a" 2>/dev/null | awk '/ U jent_/{f=1} END{exit !f}'; then
-            sudo apt-get install -y -qq libjitterentropy-dev
-            cp "$src/libjitterentropy.a" "$dir/"
+            apt-cache search jitterentropy
+            pkg=$(apt-cache search --names-only jitterentropy | awk '$1 ~ /-dev$/{print $1; exit}')
+            echo "jitterentropy dev package: ${pkg:-none}"
+            sudo apt-get install -y -qq "$pkg"
+            dpkg -L "$pkg"
+            cp "$(dpkg -L "$pkg" | awk '/libjitterentropy.*\.a$/{print; exit}')" "$dir/libjitterentropy.a"
             extra="$extra -C link-arg=$dir/libjitterentropy.a"
           fi
           echo "extra static libs:$extra"
