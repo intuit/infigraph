@@ -7,6 +7,33 @@ Versions follow [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
 
+## [3.2.17] - 2026-11-24
+
+### Added
+
+- Update notice in the MCP server: `initialize` now tells the agent when a newer release is available, so users who only run infigraph through an agent see it (#89)
+- The update check no longer needs the GitHub CLI: it reads the public releases endpoint directly, with a `curl` fallback for networks that inspect TLS (#89)
+
+### Changed
+
+- Graph database upgraded to lbug (Kuzu) 0.19.1 (#70). Building from source now needs OpenSSL; see the README
+- The ONNX-based `kompress` compression is opt-in (`--features kompress`), because the prebuilt ONNX Runtime needs newer x86 CPU instructions (#78)
+- Release binaries link OpenSSL statically and need no OpenSSL on the user's machine; the macOS Intel build runs on a native Intel runner (#98)
+- Installed `CLAUDE.md` blocks and hook messages reworded to plain, explained guidance (#85)
+
+### Fixed
+
+- A process now shares one database handle per graph: a read racing a watcher write in the MCP server could crash the process (#94)
+- Web UI/API and MCP HTTP servers bind to loopback by default; set `INFIGRAPH_UI_BIND` / `INFIGRAPH_MCP_BIND` to expose them (ADV-2598, #78)
+- Indexing no longer panics on a long condition containing non-ASCII text (#88)
+- A corrupt embeddings file is rejected instead of requesting a huge allocation (#82)
+- `--mcp` alone no longer starts the UI keep-alive loop (#57)
+- Unchanged files are re-extracted when the extractor changes, not only when the file does (#71)
+- Call resolution unified, removing non-deterministic edges; cross-repo namespace-link queries scoped per repo in remote mode
+- OpenCode and Copilot MCP configs corrected (#56)
+- Windows: the graph write lock reports who holds it (#90)
+- `release.sh` refuses a tag that doesn't match the `Cargo.toml` version (#52)
+
 ## [3.2.16] - 2026-08-18
 
 ### Added
