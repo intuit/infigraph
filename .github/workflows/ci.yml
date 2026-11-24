@@ -64,12 +64,12 @@ jobs:
       - name: Build lbug from source (Ubuntu)
         if: runner.os == 'Linux'
         run: echo "LBUG_BUILD_FROM_SOURCE=1" >> "$GITHUB_ENV"
-      # lbug's static lib links `ssl`/`crypto` (lbug build.rs, static mode).
+      # lbug links OpenSSL; OPENSSL_DIR tells its build script where.
       - name: Link OpenSSL (macOS)
         if: runner.os == 'macOS'
         run: |
           brew list openssl@3 >/dev/null 2>&1 || brew install openssl@3
-          echo "LIBRARY_PATH=$(brew --prefix openssl@3)/lib" >> "$GITHUB_ENV"
+          echo "OPENSSL_DIR=$(brew --prefix openssl@3)" >> "$GITHUB_ENV"
       # vcpkg builds OpenSSL from source (~10 min); reuse the installed tree.
       - name: Cache vcpkg OpenSSL (Windows)
         if: runner.os == 'Windows'
@@ -83,12 +83,8 @@ jobs:
         run: |
           vcpkg install openssl:x64-windows
           $root = "$env:VCPKG_INSTALLATION_ROOT\installed\x64-windows"
-          # OpenSSL 3 ships libssl.lib/libcrypto.lib; lbug asks the linker for ssl.lib/crypto.lib.
-          $libdir = "$env:RUNNER_TEMP\openssl-lib"
-          New-Item -ItemType Directory -Force $libdir | Out-Null
-          Copy-Item "$root\lib\libssl.lib" "$libdir\ssl.lib"
-          Copy-Item "$root\lib\libcrypto.lib" "$libdir\crypto.lib"
-          "LIB=$libdir;$env:LIB" >> $env:GITHUB_ENV
+          "OPENSSL_DIR=$root" >> $env:GITHUB_ENV
+          # Test binaries load the OpenSSL DLLs at runtime.
           "$root\bin" >> $env:GITHUB_PATH
       - uses: dtolnay/rust-toolchain@stable
         with:
@@ -100,14 +96,6 @@ jobs:
           # copies don't push the repo past GitHub's cache quota.
           save-if: ${{ github.ref == 'refs/heads/main' && matrix.shard.name == 'rest' }}
           cache-on-failure: true
-      # lbug downloads its prebuilt library into its own source dir under
-      # ~/.cargo/registry/src, which the cache doesn't keep. A restored cache
-      # marks lbug's build script as up to date, so the library is never
-      # fetched again and linking fails. Drop lbug's cached build output so
-      # the script reruns. Linux builds lbug from source into target/ instead.
-      - name: Refetch prebuilt lbug (macOS, Windows)
-        if: runner.os != 'Linux'
-        run: cargo clean -p lbug
       - name: Clippy
         if: matrix.shard.name == 'rest'
         run: cargo clippy --all-targets -- -D warnings
