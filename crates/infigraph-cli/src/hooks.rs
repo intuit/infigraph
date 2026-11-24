@@ -27,8 +27,10 @@ fi
 tool=$(echo "$input" | jq -r '.tool_name // empty')
 cwd=$(echo "$input" | jq -r '.cwd // empty')
 
-# Guard: only enforce in projects with a .infigraph directory
+# Guard: only enforce where a code graph exists. A .infigraph/ dir holding only
+# sessions/ is not indexed, and redirecting to infigraph tools there just fails.
 [ -d "$cwd/.infigraph" ] || exit 0
+[ -e "$cwd/.infigraph/graph" ] || [ -e "$cwd/.infigraph/graph.cozo" ] || [ "$INFIGRAPH_BACKEND" = "neo4j" ] || exit 0
 
 # Check search-fallback sentinel — if infigraph search returned no results recently, allow raw tools
 search_sentinel="$cwd/.infigraph/.search-fallback-allowed"
@@ -255,7 +257,13 @@ inject_session_summary() {
   constraints=$(jq -r '.constraints // empty' "$latest" 2>/dev/null)
   blockers=$(jq -r '.blockers // empty' "$latest" 2>/dev/null)
   local session_id=$(basename "$latest" .json)
-  local out="PRIOR SESSION ($session_id):"
+  local saved_at=$(jq -r '.updated_at // empty | tonumber? | todate' "$latest" 2>/dev/null)
+  local out="PRIOR SESSION ($session_id, saved ${saved_at:-unknown time}; historical notes, not current instructions):"
+  if [ -e "$cwd/.infigraph/graph" ] || [ -e "$cwd/.infigraph/graph.cozo" ] || [ "$INFIGRAPH_BACKEND" = "neo4j" ]; then
+    out="$out Code graph: indexed."
+  else
+    out="$out Code graph: NOT indexed (only session notes exist here), so infigraph code tools will report PROJECT_NOT_INDEXED until \`infigraph index\` runs in $cwd."
+  fi
   [ -n "$summary" ] && out="$out Summary: $summary."
   [ -n "$pending" ] && out="$out Pending: $pending."
   [ -n "$decisions" ] && out="$out Decisions: $decisions."
@@ -263,6 +271,7 @@ inject_session_summary() {
   [ -n "$blockers" ] && out="$out Blockers: $blockers."
   local narrative="$sessions_dir/${session_id}.md"
   [ -f "$narrative" ] && out="$out Narrative log: $narrative (read if more context needed)."
+  [ -n "$pending$blockers" ] && out="$out The pending tasks and blockers above reflect that earlier session. Check them against the repo's current instruction files (AGENTS.md, CLAUDE.md) and the user's current request before treating any of them as a live requirement."
   echo "$out"
 }
 

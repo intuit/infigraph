@@ -9,6 +9,39 @@ use super::schema::{CREATE_SCHEMA, MIGRATIONS};
 use super::store_util::escape;
 use crate::lockfile::{self, LockFile};
 
+/// Stable prefix on the error returned when a read-only open finds no code
+/// graph. MCP clients and hooks can match on it.
+pub const NOT_INDEXED_CODE: &str = "PROJECT_NOT_INDEXED";
+
+/// Kuzu cannot create a database in read-only mode, so a missing or empty
+/// graph path would otherwise surface as "Cannot create an empty database
+/// under READ ONLY mode". A `.infigraph/` dir holding only `sessions/` is the
+/// common case: session tools create it, but nothing has been indexed.
+fn ensure_graph_present(path: &Path) -> Result<()> {
+    let present = match std::fs::metadata(path) {
+        Ok(m) if m.is_dir() => std::fs::read_dir(path)
+            .map(|mut it| it.next().is_some())
+            .unwrap_or(false),
+        Ok(m) => m.len() > 0,
+        Err(_) => false,
+    };
+    if present {
+        return Ok(());
+    }
+    let root = path
+        .parent()
+        .and_then(Path::parent)
+        .unwrap_or_else(|| Path::new("."));
+    anyhow::bail!(
+        "{NOT_INDEXED_CODE}: no code graph at {}. This project has not been indexed \
+         (a .infigraph/ directory with only sessions/ does not count). Run `infigraph index` \
+         in {}, or call the index_project MCP tool with path=\"{}\".",
+        path.display(),
+        root.display(),
+        root.display()
+    )
+}
+
 /// RAII guard for exclusive write access to the graph store.
 /// Holds an advisory file lock on `<db_path>.lock` with an identity
 /// payload (see `crate::lockfile`).
@@ -107,6 +140,7 @@ impl GraphStore {
     /// live handle for `path` when there is one (e.g. a watcher mid-write),
     /// otherwise opens it in read-only mode.
     pub fn open_read_only(path: &Path) -> Result<Self> {
+        ensure_graph_present(path)?;
         let lock_path = path.with_extension("lock");
         let key = open_dbs_key(path);
         let mut dbs = OPEN_DBS.lock().unwrap_or_else(|e| e.into_inner());
@@ -307,4 +341,53 @@ fn count_query(conn: &Connection, query: &str) -> Result<u64> {
         }
     }
     Ok(0)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn assert_not_indexed(path: &Path) {
+        let err = GraphStore::open_read_only(path)
+            .err()
+            .expect("read-only open of a missing graph must fail");
+        let msg = err.to_string();
+        assert!(msg.starts_with(NOT_INDEXED_CODE), "got: {msg}");
+        assert!(
+            !msg.contains("READ ONLY mode"),
+            "raw kuzu error leaked: {msg}"
+        );
+        assert!(msg.contains("infigraph index"), "no actionable hint: {msg}");
+    }
+
+    #[test]
+    fn read_only_open_of_sessions_only_dir_reports_not_indexed() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(dir.path().join(".infigraph/sessions")).unwrap();
+        assert_not_indexed(&dir.path().join(".infigraph/graph"));
+        assert!(
+            !dir.path().join(".infigraph/graph").exists(),
+            "read-only open must not create the graph"
+        );
+    }
+
+    #[test]
+    fn read_only_open_of_empty_graph_file_or_dir_reports_not_indexed() {
+        let dir = tempfile::tempdir().unwrap();
+        let file = dir.path().join("graph_file");
+        std::fs::write(&file, b"").unwrap();
+        assert_not_indexed(&file);
+
+        let empty_dir = dir.path().join("graph_dir");
+        std::fs::create_dir_all(&empty_dir).unwrap();
+        assert_not_indexed(&empty_dir);
+    }
+
+    #[test]
+    fn read_only_open_succeeds_after_index() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join(".infigraph/graph");
+        drop(GraphStore::open(&path).unwrap());
+        GraphStore::open_read_only(&path).expect("indexed graph opens read-only");
+    }
 }

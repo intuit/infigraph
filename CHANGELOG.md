@@ -7,6 +7,12 @@ Versions follow [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
 
+### Fixed
+
+- Read-only tools (`search`, `get_stats`, etc.) now return a stable `PROJECT_NOT_INDEXED` error with the `infigraph index` command when a project has no code graph, instead of kuzu's "Cannot create an empty database under READ ONLY mode". A `.infigraph/` directory holding only `sessions/` no longer counts as indexed
+- MCP `get_latest_session`: restored notes are labelled as historical and followed by a separate "Code graph: indexed / not indexed" line, so session state is no longer read as code-index state
+- SessionStart hook: restored notes carry their saved-at timestamp and a "historical, not current instructions" label, plus a separate code-graph readiness line; the PreToolUse enforce hook no longer redirects to infigraph tools in directories that have no code graph
+
 ## [3.2.17] - 2026-11-24
 
 ### Added
