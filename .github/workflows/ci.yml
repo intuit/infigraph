@@ -8,10 +8,11 @@ on:
     branches: [main]
     paths-ignore: ['**.md', 'docs/**', 'blog/**']
 
-# A newer push to the same PR/branch supersedes the run in progress.
+# A newer push to the same PR supersedes the run in progress. Runs on main
+# are never cancelled: each merge gets a result, and main saves the caches.
 concurrency:
   group: ci-${{ github.ref }}
-  cancel-in-progress: true
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
 
 env:
   CARGO_TERM_COLOR: always
@@ -99,6 +100,14 @@ jobs:
           # copies don't push the repo past GitHub's cache quota.
           save-if: ${{ github.ref == 'refs/heads/main' && matrix.shard.name == 'rest' }}
           cache-on-failure: true
+      # lbug downloads its prebuilt library into its own source dir under
+      # ~/.cargo/registry/src, which the cache doesn't keep. A restored cache
+      # marks lbug's build script as up to date, so the library is never
+      # fetched again and linking fails. Drop lbug's cached build output so
+      # the script reruns. Linux builds lbug from source into target/ instead.
+      - name: Refetch prebuilt lbug (macOS, Windows)
+        if: runner.os != 'Linux'
+        run: cargo clean -p lbug
       - name: Clippy
         if: matrix.shard.name == 'rest'
         run: cargo clippy --all-targets -- -D warnings

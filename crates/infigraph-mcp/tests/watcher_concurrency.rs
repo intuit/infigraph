@@ -32,32 +32,43 @@ fn make_project(files: &[(&str, &str)]) -> (tempfile::TempDir, String) {
     (dir, path)
 }
 
+/// Block until each stopped watcher thread has returned. Its `stop_rx` is
+/// dropped then, so sends start failing. Without this a watcher can still be
+/// mid-reindex when the test, or the whole process, ends.
+fn wait_for_watcher_exit(stop_txs: Vec<std::sync::mpsc::Sender<()>>) {
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(30);
+    for tx in stop_txs {
+        while tx.send(()).is_ok() && std::time::Instant::now() < deadline {
+            std::thread::sleep(std::time::Duration::from_millis(20));
+        }
+    }
+}
+
 fn stop_all_watchers() {
     let mut guard = get_watchers();
-    let stopped_paths: Vec<String> = if let Some(map) = guard.as_mut() {
+    let mut stopped_paths = Vec::new();
+    let mut stop_txs = Vec::new();
+    if let Some(map) = guard.as_mut() {
         let ids: Vec<String> = map.keys().cloned().collect();
-        let mut paths = Vec::new();
         for id in ids {
             if let Some(entry) = map.remove(&id) {
-                paths.push(entry.path.clone());
-                let _ = entry.stop_tx.send(());
+                stopped_paths.push(entry.path.clone());
+                stop_txs.push(entry.stop_tx);
             }
         }
-        paths
-    } else {
-        Vec::new()
-    };
+    }
     drop(guard);
     let mut doc_guard = get_doc_watchers();
     if let Some(map) = doc_guard.as_mut() {
         let ids: Vec<String> = map.keys().cloned().collect();
         for id in ids {
             if let Some(entry) = map.remove(&id) {
-                let _ = entry.stop_tx.send(());
+                stop_txs.push(entry.stop_tx);
             }
         }
     }
     drop(doc_guard);
+    wait_for_watcher_exit(stop_txs);
     wait_for_watch_locks_released(&stopped_paths);
 }
 
