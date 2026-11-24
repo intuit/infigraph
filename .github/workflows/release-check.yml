@@ -1,0 +1,132 @@
+name: Release build check
+
+# TEMPORARY (draft PR, do not merge): builds each release target the way
+# release.yml does, with the fixes proposed for it, and checks the binaries.
+on:
+  pull_request:
+    branches: [main]
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  build:
+    name: Build (${{ matrix.target }})
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: macos-latest
+            target: aarch64-apple-darwin
+            cargo_features: ""
+          # Native Intel runner instead of cross-compiling on ARM, so Homebrew
+          # has an x86_64 OpenSSL to link.
+          - os: macos-15-intel
+            target: x86_64-apple-darwin
+            cargo_features: "--no-default-features"
+          - os: ubuntu-latest
+            target: x86_64-unknown-linux-gnu
+            cargo_features: ""
+          - os: ubuntu-24.04-arm
+            target: aarch64-unknown-linux-gnu
+            cargo_features: ""
+          - os: windows-latest
+            target: x86_64-pc-windows-msvc
+            cargo_features: ""
+    steps:
+      - uses: actions/checkout@v4
+      - name: Free disk space (Ubuntu)
+        if: runner.os == 'Linux'
+        run: |
+          sudo rm -rf /usr/share/dotnet /usr/local/lib/android /opt/ghc \
+            /usr/share/swift /usr/local/share/powershell /usr/local/share/chromium \
+            /usr/local/lib/node_modules /opt/hostedtoolcache/CodeQL
+          sudo docker image prune --all --force || true
+
+      # lbug links `ssl` and `crypto`. Link them statically so the released
+      # binaries don't depend on an OpenSSL install on the user's machine:
+      # put only the static archives in a directory and point lbug's
+      # pkg-config lookup (and the linker) at it.
+      - name: Static OpenSSL (Linux)
+        if: runner.os == 'Linux'
+        run: |
+          sudo apt-get update -qq && sudo apt-get install -y -qq libssl-dev pkg-config
+          src=$(pkg-config --variable=libdir openssl)
+          mkdir -p "$RUNNER_TEMP/openssl-static"
+          cp "$src/libssl.a" "$src/libcrypto.a" "$RUNNER_TEMP/openssl-static/"
+          printf 'libdir=%s\nName: OpenSSL\nDescription: static\nVersion: 3\nLibs: -L${libdir} -lssl -lcrypto\n' \
+            "$RUNNER_TEMP/openssl-static" > "$RUNNER_TEMP/openssl-static/openssl.pc"
+          echo "PKG_CONFIG_PATH=$RUNNER_TEMP/openssl-static" >> "$GITHUB_ENV"
+          echo "LIBRARY_PATH=$RUNNER_TEMP/openssl-static" >> "$GITHUB_ENV"
+          # The prebuilt Linux lbug crashes when linked with a newer GCC's cxx bridge.
+          echo "LBUG_BUILD_FROM_SOURCE=1" >> "$GITHUB_ENV"
+      - name: Static OpenSSL (macOS)
+        if: runner.os == 'macOS'
+        run: |
+          brew list openssl@3 >/dev/null 2>&1 || brew install openssl@3
+          src="$(brew --prefix openssl@3)/lib"
+          mkdir -p "$RUNNER_TEMP/openssl-static"
+          cp "$src/libssl.a" "$src/libcrypto.a" "$RUNNER_TEMP/openssl-static/"
+          printf 'libdir=%s\nName: OpenSSL\nDescription: static\nVersion: 3\nLibs: -L${libdir} -lssl -lcrypto\n' \
+            "$RUNNER_TEMP/openssl-static" > "$RUNNER_TEMP/openssl-static/openssl.pc"
+          echo "PKG_CONFIG_PATH=$RUNNER_TEMP/openssl-static" >> "$GITHUB_ENV"
+          echo "LIBRARY_PATH=$RUNNER_TEMP/openssl-static" >> "$GITHUB_ENV"
+      - name: Static OpenSSL (Windows)
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: |
+          vcpkg install openssl:x64-windows-static-md
+          $root = "$env:VCPKG_INSTALLATION_ROOT\installed\x64-windows-static-md"
+          $libdir = "$env:RUNNER_TEMP\openssl-static"
+          New-Item -ItemType Directory -Force $libdir | Out-Null
+          Copy-Item "$root\lib\libssl.lib" "$libdir\ssl.lib"
+          Copy-Item "$root\lib\libcrypto.lib" "$libdir\crypto.lib"
+          "LIB=$libdir;$env:LIB" >> $env:GITHUB_ENV
+          # Static OpenSSL needs these system libraries. This replaces the
+          # target rustflags from .cargo/config.toml, so repeat /STACK here.
+          "CARGO_TARGET_X86_64_PC_WINDOWS_MSVC_RUSTFLAGS=-C link-arg=/STACK:33554432 -C link-arg=crypt32.lib -C link-arg=user32.lib -C link-arg=advapi32.lib -C link-arg=ws2_32.lib" >> $env:GITHUB_ENV
+
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.target }}
+
+      - name: Build
+        run: cargo build --release --target ${{ matrix.target }} -p infigraph-cli -p infigraph-mcp --features remote ${{ matrix.cargo_features }}
+
+      - name: Dynamic dependencies
+        if: always()
+        shell: bash
+        run: |
+          bin=target/${{ matrix.target }}/release
+          for exe in infigraph infigraph-mcp; do
+            f="$bin/$exe"; [ -f "$f.exe" ] && f="$f.exe"
+            echo "== $f"; ls -l "$f" || continue
+            case "$RUNNER_OS" in
+              macOS) otool -L "$f" ;;
+              *) ldd "$f" ;;
+            esac
+          done
+      - name: No dynamic OpenSSL dependency
+        shell: bash
+        run: |
+          bin=target/${{ matrix.target }}/release
+          for exe in infigraph infigraph-mcp; do
+            f="$bin/$exe"; [ -f "$f.exe" ] && f="$f.exe"
+            case "$RUNNER_OS" in
+              macOS) deps=$(otool -L "$f") ;;
+              *) deps=$(ldd "$f") ;;
+            esac
+            if echo "$deps" | grep -i -E 'libssl|libcrypto'; then
+              echo "::error::$f depends on a dynamic OpenSSL"; exit 1
+            fi
+          done
+      - name: Smoke test (binary starts, opens a graph)
+        shell: bash
+        run: |
+          f=target/${{ matrix.target }}/release/infigraph; [ -f "$f.exe" ] && f="$f.exe"
+          "$f" --version
+          proj="$RUNNER_TEMP/smoke"; mkdir -p "$proj"
+          printf 'def hello():\n    return 1\n' > "$proj/app.py"
+          "$f" --root "$proj" index --no-embed
+          "$f" --root "$proj" stats
