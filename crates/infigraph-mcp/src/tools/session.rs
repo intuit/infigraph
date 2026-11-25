@@ -509,6 +509,7 @@ pub fn tool_get_latest_session(args: &Value) -> Result<String> {
         return if let Some(session) = store.load_by_name(session_name)? {
             let mut out = format_session_output(&session, 0, 1, path);
             append_activity_log(&mut out, path);
+            append_restore_caveat(&mut out, path);
             Ok(out)
         } else {
             Ok(format!("No session found with name '{session_name}'."))
@@ -551,8 +552,32 @@ pub fn tool_get_latest_session(args: &Value) -> Result<String> {
 
     append_activity_log(&mut out, path);
     append_old_session_hint(store.sessions_dir(), &mut out);
+    append_restore_caveat(&mut out, path);
 
     Ok(out)
+}
+
+/// Restored notes are a snapshot of an earlier session. Say so, and say
+/// whether a code graph exists: session files alone don't mean the code
+/// tools will work for this path.
+pub fn append_restore_caveat(out: &mut String, path: &str) {
+    out.push_str(
+        "_These are historical notes from earlier sessions. Check pending tasks and blockers \
+         against the repo's current instruction files and the user's current request before \
+         treating them as live requirements._\n\n",
+    );
+    let infigraph_dir = PathBuf::from(path).join(".infigraph");
+    let indexed = infigraph_dir.join("graph").exists()
+        || infigraph_dir.join("graph.cozo").exists()
+        || std::env::var("INFIGRAPH_BACKEND").is_ok_and(|b| b == "neo4j");
+    if indexed {
+        out.push_str("**Code graph:** indexed.\n");
+    } else {
+        out.push_str(&format!(
+            "**Code graph:** not indexed. Session notes exist, but code tools will return \
+             PROJECT_NOT_INDEXED until `infigraph index` runs in {path} (or index_project).\n"
+        ));
+    }
 }
 
 pub fn tool_purge_sessions(args: &Value) -> Result<String> {
@@ -1111,5 +1136,28 @@ mod tests {
         assert!(out.contains("2 recent sessions"));
         assert!(out.contains("**Decisions:** (2 — use"));
         assert!(!out.contains("Goal: foo. Decision: bar"));
+    }
+
+    #[test]
+    fn test_latest_session_marks_notes_historical_and_reports_missing_graph() {
+        let now = 1_750_000_000i64;
+        let mut s1 = make_session("session_2026-06-07", now, now);
+        s1.pending_tasks = "Obtain maintainer approval".into();
+        let dir = tempfile::tempdir().unwrap();
+        let project = dir.path();
+        let sessions_dir = project.join(".infigraph").join("sessions");
+        std::fs::create_dir_all(&sessions_dir).unwrap();
+        SessionStore::open_dir(&sessions_dir)
+            .unwrap()
+            .save(&s1)
+            .unwrap();
+
+        let out = tool_get_latest_session(&json!({"path": project.to_str().unwrap()})).unwrap();
+        assert!(out.contains("historical notes"), "{out}");
+        assert!(out.contains("**Code graph:** not indexed"), "{out}");
+
+        std::fs::create_dir_all(project.join(".infigraph").join("graph")).unwrap();
+        let out = tool_get_latest_session(&json!({"path": project.to_str().unwrap()})).unwrap();
+        assert!(out.contains("**Code graph:** indexed."), "{out}");
     }
 }
