@@ -12,3 +12,11 @@ rustflags = ["-C", "link-arg=-Wl,--allow-multiple-definition"]
 # recurse deeply during static init and Cli::parse(). Set 32MB default.
 [target.x86_64-pc-windows-msvc]
 rustflags = ["-C", "link-arg=/STACK:33554432"]
+
+# lbug's build script downloads a prebuilt liblbug (macOS, Windows) and, unless
+# LBUG_VERSION is set, fetches whatever LadybugDB's latest release is at build
+# time. Pin it to the lbug crate version so every build links the same library
+# (and writes the same storage format). Keep in sync with the `lbug` version in
+# crates/*/Cargo.toml.
+[env]
+LBUG_VERSION = "0.22.3"

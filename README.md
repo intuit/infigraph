@@ -300,7 +300,7 @@ This:
 
 > **System dependencies:** `cmake` and OpenSSL are required to build the graph database.
 > Install before building: `brew install cmake openssl@3` (macOS) or `sudo apt install cmake libssl-dev` (Linux).
-> On macOS, Homebrew's OpenSSL isn't on the linker path by default: `export LIBRARY_PATH="$(brew --prefix openssl@3)/lib"` before `cargo build`.
+> On macOS, point the build at Homebrew's OpenSSL: `export OPENSSL_DIR="$(brew --prefix openssl@3)"` before `cargo build`.
 
 ### Windows
 
@@ -565,7 +565,7 @@ generate_test_context(path="/your/project", file="src/auth.py", test_type="unit"
 
 ```bash
 brew install cmake openssl@3
-export LIBRARY_PATH="$(brew --prefix openssl@3)/lib"
+export OPENSSL_DIR="$(brew --prefix openssl@3)"
 git clone https://github.com/intuit/infigraph.git
 cd infigraph
 cargo build --release -p infigraph-cli -p infigraph-mcp
@@ -598,13 +598,10 @@ winget install Kitware.CMake
 # Install Visual Studio Build Tools with C++ workload
 winget install Microsoft.VisualStudio.2022.BuildTools
 
-# Install OpenSSL (linked by lbug) via vcpkg; lbug looks for ssl.lib/crypto.lib
+# Install OpenSSL (linked by lbug) via vcpkg
 vcpkg install openssl:x64-windows
-$ossl = "$env:VCPKG_ROOT\installed\x64-windows"
-Copy-Item "$ossl\lib\libssl.lib" "$ossl\lib\ssl.lib"
-Copy-Item "$ossl\lib\libcrypto.lib" "$ossl\lib\crypto.lib"
-$env:LIB = "$ossl\lib;$env:LIB"
-$env:PATH = "$ossl\bin;$env:PATH"
+$env:OPENSSL_DIR = "$env:VCPKG_ROOT\installed\x64-windows"
+$env:PATH = "$env:OPENSSL_DIR\bin;$env:PATH"
 
 # Clone and build
 git clone https://github.com/intuit/infigraph.git

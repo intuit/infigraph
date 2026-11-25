@@ -105,6 +105,7 @@ jobs:
             "$dir" > "$dir/openssl.pc"
           echo "PKG_CONFIG_PATH=$dir" >> "$GITHUB_ENV"
           echo "LIBRARY_PATH=$dir" >> "$GITHUB_ENV"
+          echo "OPENSSL_DIR=$dir" >> "$GITHUB_ENV"
           # Newer distro builds of libcrypto.a (Ubuntu 26.04) also pull in zlib
           # and jitterentropy. Link those statically too when it references them.
           # This replaces the target rustflags from .cargo/config.toml, so
@@ -139,6 +140,9 @@ jobs:
             "$RUNNER_TEMP/openssl-static" > "$RUNNER_TEMP/openssl-static/openssl.pc"
           echo "PKG_CONFIG_PATH=$RUNNER_TEMP/openssl-static" >> "$GITHUB_ENV"
           echo "LIBRARY_PATH=$RUNNER_TEMP/openssl-static" >> "$GITHUB_ENV"
+          # lbug's build script otherwise also searches Homebrew's lib dir,
+          # where the dynamic OpenSSL would win.
+          echo "OPENSSL_DIR=$RUNNER_TEMP/openssl-static" >> "$GITHUB_ENV"
       - name: Static OpenSSL (Windows)
         if: runner.os == 'Windows'
         shell: pwsh
@@ -147,9 +151,9 @@ jobs:
           $root = "$env:VCPKG_INSTALLATION_ROOT\installed\x64-windows-static-md"
           $libdir = "$env:RUNNER_TEMP\openssl-static"
           New-Item -ItemType Directory -Force $libdir | Out-Null
-          Copy-Item "$root\lib\libssl.lib" "$libdir\ssl.lib"
-          Copy-Item "$root\lib\libcrypto.lib" "$libdir\crypto.lib"
-          "LIB=$libdir;$env:LIB" >> $env:GITHUB_ENV
+          Copy-Item "$root\lib\libssl.lib" "$libdir\libssl.lib"
+          Copy-Item "$root\lib\libcrypto.lib" "$libdir\libcrypto.lib"
+          "OPENSSL_DIR=$libdir" >> $env:GITHUB_ENV
           # Static OpenSSL needs these system libraries. This replaces the
           # target rustflags from .cargo/config.toml, so repeat /STACK here.
           "CARGO_TARGET_X86_64_PC_WINDOWS_MSVC_RUSTFLAGS=-C link-arg=/STACK:33554432 -C link-arg=crypt32.lib -C link-arg=user32.lib -C link-arg=advapi32.lib -C link-arg=ws2_32.lib" >> $env:GITHUB_ENV
@@ -161,11 +165,6 @@ jobs:
         with:
           key: release-${{ matrix.target }}
           cache-on-failure: true
-      # A restored cache marks lbug's build script as up to date, but the
-      # prebuilt library it downloads lives outside the cache (see ci.yml).
-      - name: Refetch prebuilt lbug (macOS, Windows)
-        if: runner.os != 'Linux'
-        run: cargo clean -p lbug
 
       - name: Download driver jar
         uses: actions/download-artifact@v4
