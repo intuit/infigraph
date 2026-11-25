@@ -301,8 +301,18 @@ fn test_grep_search_skips_ignored_dirs() {
     std::fs::write(dir.path().join("node_modules").join("dep.js"), "findme\n").unwrap();
     std::fs::write(dir.path().join("app.js"), "findme\n").unwrap();
 
+    // Gitignored, non-hardcoded directory -- only a real .gitignore rule
+    // can exclude it.
+    std::fs::write(dir.path().join(".gitignore"), "scratchpad/\n").unwrap();
+    std::fs::create_dir(dir.path().join("scratchpad")).unwrap();
+    std::fs::write(dir.path().join("scratchpad").join("copy.js"), "findme\n").unwrap();
+
     let results = search::grep_search(dir.path(), "findme", None, 100).unwrap();
-    assert_eq!(results.len(), 1, "should skip node_modules");
+    assert_eq!(
+        results.len(),
+        1,
+        "should skip node_modules and gitignored scratchpad/"
+    );
     assert!(results[0].file.contains("app.js"));
 }
 

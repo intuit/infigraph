@@ -151,11 +151,22 @@ Rust, Python, JavaScript, TypeScript, Java, Go, C, C++, C#, Ruby, PHP, Swift, Ko
 
 ## File Discovery
 
-File discovery walks the project directory, applying:
+File discovery walks the project directory via a shared component
+(`infigraph_core::ignore_rules`, `crates/infigraph-core/src/ignore_rules.rs`),
+applying:
 
 ### Ignored directories
 
-Same as document indexing: `.git`, `node_modules`, `__pycache__`, `.venv`, `target`, `build`, `dist`, plus directories starting with `.`
+A fixed safety list is always excluded regardless of any ignore file:
+`.infigraph`, `.git`, `node_modules`, `__pycache__`, `.venv`, `venv`,
+`target`, `build`, `dist`, `.tox`, `vendor`, `.idea`, `.mypy_cache`,
+`coverage`, `.pytest_cache`.
+
+Beyond that, real `.gitignore` rules are honored (via the `ignore` crate),
+plus a custom `.infigraphignore` file recognized with the same syntax and
+directory-level semantics as `.gitignore` — so a project-specific
+convention (e.g. an agent worktree scratch directory) is excluded as long
+as it's listed in either file, without needing a code change.
 
 ### File selection
 

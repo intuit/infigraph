@@ -678,6 +678,15 @@ fn test_docindex_ignores_hidden_and_build_dirs() {
     std::fs::create_dir_all(dir.path().join("target")).unwrap();
     std::fs::write(dir.path().join("target/output.txt"), "build output").unwrap();
 
+    // A project-specific gitignored convention (e.g. an agent worktree
+    // scratch directory) is NOT in any hardcoded list -- only a real
+    // .gitignore rule can exclude it. Regression test for the 2026-08-06
+    // incident where scratchpad/ was walked and indexed as real content,
+    // causing the doc watcher to loop forever re-indexing 0 changed chunks.
+    std::fs::write(dir.path().join(".gitignore"), "scratchpad/\n").unwrap();
+    std::fs::create_dir_all(dir.path().join("scratchpad/wt-foo")).unwrap();
+    std::fs::write(dir.path().join("scratchpad/wt-foo/copy.md"), "# Copy").unwrap();
+
     std::fs::write(dir.path().join("real.md"), "# Real Doc\n\nContent.\n").unwrap();
 
     let mut idx = DocIndex::open(dir.path()).unwrap();
@@ -685,7 +694,7 @@ fn test_docindex_ignores_hidden_and_build_dirs() {
     let result = idx.index().unwrap();
     assert_eq!(
         result.total_files, 1,
-        "should only find real.md, not files in ignored dirs"
+        "should only find real.md, not files in ignored or gitignored dirs"
     );
 }
 
