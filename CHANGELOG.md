@@ -7,11 +7,17 @@ Versions follow [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
 
+## [3.2.18] - 2026-11-26
+
+### Changed
+
+- Graph database upgraded to lbug (Kuzu) 0.22.3, and builds now pin the prebuilt library to that version instead of fetching LadybugDB's latest release (#101). Existing indexes upgrade in place on the first write; older infigraph versions can't read them afterwards. Building from source now finds OpenSSL through `OPENSSL_DIR`; see the README
+
 ### Fixed
 
-- Read-only tools (`search`, `get_stats`, etc.) now return a stable `PROJECT_NOT_INDEXED` error with the `infigraph index` command when a project has no code graph, instead of kuzu's "Cannot create an empty database under READ ONLY mode". A `.infigraph/` directory holding only `sessions/` no longer counts as indexed
-- MCP `get_latest_session`: restored notes are labelled as historical and followed by a separate "Code graph: indexed / not indexed" line, so session state is no longer read as code-index state
-- SessionStart hook: restored notes carry their saved-at timestamp and a "historical, not current instructions" label, plus a separate code-graph readiness line; the PreToolUse enforce hook no longer redirects to infigraph tools in directories that have no code graph
+- Read-only tools (`search`, `get_stats`, etc.) now return a stable `PROJECT_NOT_INDEXED` error with the `infigraph index` command when a project has no code graph, instead of kuzu's "Cannot create an empty database under READ ONLY mode". A `.infigraph/` directory holding only `sessions/` no longer counts as indexed (#100)
+- MCP `get_latest_session`: restored notes are labelled as historical and followed by a separate "Code graph: indexed / not indexed" line, so session state is no longer read as code-index state (#100)
+- SessionStart hook: restored notes carry their saved-at timestamp and a "historical, not current instructions" label, plus a separate code-graph readiness line; the PreToolUse enforce hook no longer redirects to infigraph tools in directories that have no code graph (#100)
 
 ## [3.2.17] - 2026-11-24
 
