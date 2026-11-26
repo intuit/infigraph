@@ -27,17 +27,14 @@ pub fn find_mcp_binary() -> Result<PathBuf> {
 fn find_binary(paths: impl IntoIterator<Item = PathBuf>) -> Option<PathBuf> {
     paths.into_iter().find(|p| {
         let Ok(meta) = p.metadata() else { return false };
-        if !meta.is_file() {
-            return false;
-        }
         #[cfg(unix)]
         {
             use std::os::unix::fs::PermissionsExt;
-            meta.permissions().mode() & 0o111 != 0
+            meta.is_file() && meta.permissions().mode() & 0o111 != 0
         }
         #[cfg(not(unix))]
         {
-            true
+            meta.is_file()
         }
     })
 }
