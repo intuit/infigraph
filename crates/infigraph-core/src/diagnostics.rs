@@ -715,14 +715,25 @@ mod tests {
         let dir = fixture();
         let path = dir.path().join(".infigraph/graph.lock");
         let _guard = lockfile::try_acquire(&path, "test").unwrap().unwrap();
-        let before = std::fs::read(&path).unwrap();
+        // Windows mandatory locks prevent another handle from reading the
+        // held file. Production mirrors holder identity to this sidecar.
+        let payload_path = if cfg!(windows) {
+            path.with_extension("lock.info")
+        } else {
+            path.clone()
+        };
+        let before = std::fs::read(&payload_path).unwrap();
         let result = diagnose_with(
             dir.path(),
             &|_| panic!("must not probe busy graph"),
             &|| Ok(Registry::default()),
         );
         assert!(codes(&result).contains(&DiagnosticCode::GraphLockBusy));
-        assert_eq!(std::fs::read(path).unwrap(), before);
+        assert_eq!(std::fs::read(payload_path).unwrap(), before);
+        assert!(matches!(
+            lockfile::observe(&path).unwrap(),
+            Observation::Held
+        ));
     }
     #[test]
     fn graph_observation_holds_shared_lock_through_probe() {
