@@ -4,6 +4,11 @@
 (function_declaration
   name: (identifier) @func.name) @func.def
 
+; Variable-bound callables
+(variable_declarator
+  name: (identifier) @func.name
+  value: [(arrow_function) (function_expression) (generator_function)]) @func.def
+
 ; Class declarations
 (class_declaration
   name: (type_identifier) @class.name) @class.def

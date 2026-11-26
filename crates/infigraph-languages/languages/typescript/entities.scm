@@ -4,11 +4,10 @@
 (function_declaration
   name: (identifier) @func.name) @func.def
 
-; Arrow functions assigned to const/let
-(lexical_declaration
-  (variable_declarator
-    name: (identifier) @func.name
-    value: (arrow_function)) @func.def)
+; Variable-bound callable definitions
+(variable_declarator
+  name: (identifier) @func.name
+  value: [(arrow_function) (function_expression) (generator_function)]) @func.def
 
 ; Class declarations
 (class_declaration

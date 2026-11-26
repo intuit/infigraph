@@ -309,8 +309,28 @@ pub fn extract_entities(
     for sym in symbols {
         seen.entry(sym.id.clone())
             .and_modify(|existing: &mut Symbol| {
-                if sym.kind == SymbolKind::Test && existing.kind == SymbolKind::Function {
+                let callable = |kind: &SymbolKind| {
+                    matches!(
+                        kind,
+                        SymbolKind::Function | SymbolKind::Method | SymbolKind::Test
+                    )
+                };
+                if matches!(sym.language.as_str(), "typescript" | "tsx")
+                    && existing.kind == SymbolKind::Variable
+                    && callable(&sym.kind)
+                    && (existing.span.start_line, existing.span.start_col)
+                        <= (sym.span.end_line, sym.span.end_col)
+                    && (sym.span.start_line, sym.span.start_col)
+                        <= (existing.span.end_line, existing.span.end_col)
+                {
                     existing.kind = sym.kind.clone();
+                    existing.span = sym.span.clone();
+                    existing.signature_hash.clone_from(&sym.signature_hash);
+                    existing.complexity = sym.complexity;
+                } else if sym.kind == SymbolKind::Test && existing.kind == SymbolKind::Function {
+                    // Preserve the pre-existing Test precedence without replacing
+                    // definition metadata for other duplicate matches/languages.
+                    existing.kind = SymbolKind::Test;
                 }
                 let existing_len = existing.docstring.as_deref().map_or(0, str::len);
                 let new_len = sym.docstring.as_deref().map_or(0, str::len);
@@ -613,7 +633,7 @@ fn is_test_by_name_and_path(name: &str, file: &str, language: &str) -> bool {
 
     match language {
         // JS/TS: *.test.ts, *.spec.js, __tests__/ with describe/it/test
-        "typescript" | "javascript" => {
+        "typescript" | "tsx" | "javascript" => {
             file_lower.ends_with(".test.ts")
                 || file_lower.ends_with(".test.tsx")
                 || file_lower.ends_with(".test.js")
@@ -880,6 +900,32 @@ fn strip_docstring(raw: &str) -> String {
 mod tests {
     use super::*;
     use tree_sitter::Parser;
+
+    #[test]
+    fn test_precedence_preserves_existing_definition_metadata() {
+        let grammar = tree_sitter_python::LANGUAGE.into();
+        let src = b"@decorate\ndef greet():\n    return 1\n";
+        let mut parser = Parser::new();
+        parser.set_language(&grammar).unwrap();
+        let tree = parser.parse(src, None).unwrap();
+        let function_query = "(decorated_definition definition: (function_definition name: (identifier) @func.name)) @func.def";
+        let query = Query::new(&grammar, function_query).unwrap();
+        let original = extract_entities("greet.py", src, tree.root_node(), &query, "python");
+        let query = Query::new(
+            &grammar,
+            &format!("{function_query}\n(function_definition name: (identifier) @test.name) @test.def"),
+        )
+        .unwrap();
+        let merged = extract_entities("greet.py", src, tree.root_node(), &query, "python");
+        assert_eq!(original.len(), 1);
+        assert_eq!(merged.len(), 1);
+        assert_eq!(original[0].kind, SymbolKind::Function);
+        assert_eq!(merged[0].kind, SymbolKind::Test);
+        assert_eq!(merged[0].span.start_line, original[0].span.start_line);
+        assert_eq!(merged[0].span.end_line, original[0].span.end_line);
+        assert_eq!(merged[0].signature_hash, original[0].signature_hash);
+        assert_eq!(merged[0].complexity, original[0].complexity);
+    }
 
     #[test]
     fn test_module_capture_produces_module_symbol() {

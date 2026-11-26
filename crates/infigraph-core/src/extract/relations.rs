@@ -1,7 +1,7 @@
 use tree_sitter::{Node, Query, QueryCursor, StreamingIterator};
 
 use crate::lang::CustomEdgeDef;
-use crate::model::{Relation, RelationKind, Span};
+use crate::model::{Relation, RelationKind, Span, Symbol, SymbolKind};
 
 /// Extract relationships from a parsed AST using a Tree-sitter query.
 ///
@@ -32,6 +32,26 @@ pub fn extract_relations_with_custom_edges(
     query: &Query,
     custom_edges: &[CustomEdgeDef],
     decompose_query: Option<&Query>,
+) -> Vec<Relation> {
+    extract_relations_with_owners(
+        file,
+        source,
+        root,
+        query,
+        custom_edges,
+        decompose_query,
+        None,
+    )
+}
+
+pub(super) fn extract_relations_with_owners(
+    file: &str,
+    source: &[u8],
+    root: Node,
+    query: &Query,
+    custom_edges: &[CustomEdgeDef],
+    decompose_query: Option<&Query>,
+    owners: Option<&[Symbol]>,
 ) -> Vec<Relation> {
     let mut cursor = QueryCursor::new();
     let mut matches = cursor.matches(query, root, source);
@@ -161,8 +181,41 @@ pub fn extract_relations_with_custom_edges(
 
         if rel_kind == Some(RelationKind::Calls) && source_name.is_none() {
             if let Some(site) = site_node {
-                source_name =
-                    find_enclosing_function(site, source).or_else(|| Some(file.to_string()));
+                source_name = owners
+                    .and_then(|symbols| {
+                        let start = (
+                            site.start_position().row as u32 + 1,
+                            site.start_position().column as u32,
+                        );
+                        let end = (
+                            site.end_position().row as u32 + 1,
+                            site.end_position().column as u32,
+                        );
+                        symbols
+                            .iter()
+                            .filter(|s| {
+                                matches!(
+                                    s.kind,
+                                    SymbolKind::Function | SymbolKind::Method | SymbolKind::Test
+                                ) && (s.span.start_line, s.span.start_col) <= start
+                                    && (s.span.end_line, s.span.end_col) >= end
+                            })
+                            .max_by_key(|s| {
+                                (
+                                    (s.span.start_line, s.span.start_col),
+                                    std::cmp::Reverse((s.span.end_line, s.span.end_col)),
+                                )
+                            })
+                            .and_then(|s| s.id.strip_prefix(&format!("{file}::")))
+                            .map(str::to_owned)
+                    })
+                    .or_else(|| {
+                        owners
+                            .is_none()
+                            .then(|| find_enclosing_function(site, source))
+                            .flatten()
+                    })
+                    .or_else(|| Some(file.to_string()));
             }
         }
 
