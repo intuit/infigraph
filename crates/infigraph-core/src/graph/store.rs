@@ -140,6 +140,12 @@ impl GraphStore {
     /// live handle for `path` when there is one (e.g. a watcher mid-write),
     /// otherwise opens it in read-only mode.
     pub fn open_read_only(path: &Path) -> Result<Self> {
+        Self::open_read_only_with_config(path, SystemConfig::default())
+    }
+
+    /// Read-only open with caller-specified resource limits. Existing handles
+    /// remain shared; the diagnostic child starts without any cached handles.
+    pub fn open_read_only_with_config(path: &Path, config: SystemConfig) -> Result<Self> {
         ensure_graph_present(path)?;
         let lock_path = path.with_extension("lock");
         let key = open_dbs_key(path);
@@ -147,9 +153,7 @@ impl GraphStore {
         if let Some(db) = dbs.get(&key).and_then(|(w, _)| w.upgrade()) {
             return Ok(Self { db, lock_path });
         }
-        let config = SystemConfig::default()
-            .read_only(true)
-            .throw_on_wal_replay_failure(false);
+        let config = config.read_only(true).throw_on_wal_replay_failure(false);
         let db = Arc::new(
             Database::new(path, config)
                 .map_err(|e| anyhow::anyhow!("failed to open kuzu db (read-only): {e}"))?,

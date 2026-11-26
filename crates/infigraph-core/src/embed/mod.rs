@@ -341,16 +341,24 @@ pub fn best_embedder() -> Box<dyn EmbedProvider> {
 
 /// Count the number of embeddings in the binary file at `root/.infigraph/embeddings.bin`.
 pub fn embedding_count(root: &Path) -> usize {
+    embedding_count_checked(root).unwrap_or(0)
+}
+
+/// Read just the embedding header, preserving missing/invalid state for
+/// diagnostics. Does not load models, mmap assets, or validate all entries.
+pub fn embedding_count_checked(root: &Path) -> std::io::Result<usize> {
     let path = root.join(".infigraph").join("embeddings.bin");
-    let Ok(file) = std::fs::File::open(&path) else {
-        return 0;
-    };
+    if !path.metadata()?.is_file() {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            "embeddings are not a regular file",
+        ));
+    }
+    let file = std::fs::File::open(&path)?;
     let mut r = BufReader::new(file);
     let mut buf4 = [0u8; 4];
-    if r.read_exact(&mut buf4).is_err() {
-        return 0;
-    }
-    u32::from_le_bytes(buf4) as usize
+    r.read_exact(&mut buf4)?;
+    Ok(u32::from_le_bytes(buf4) as usize)
 }
 
 /// Save symbol embeddings to a binary file.
