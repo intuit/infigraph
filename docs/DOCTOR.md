@@ -52,8 +52,8 @@ between checks. Unexpected native failures/timeouts are UNKNOWN. No automatic
 full rebuild, process termination of watchers, lock removal, config edits, or
 repair. Only doctor's own timed-out child probe may be terminated. The probe uses a
 64 MiB buffer pool, 1 GiB database mapping budget, two query threads, and a
-10-second timeout. Unix also caps address space at 4 GiB (or the stricter
-inherited limit) and disables core dumps. Graphs that exceed the probe's
+10-second timeout. Linux also caps address space at 4 GiB (or the stricter
+inherited limit); Unix disables core dumps. Graphs that exceed the probe's
 resource budget are UNKNOWN, not declared corrupt.
 
 ## Limitations
@@ -66,8 +66,10 @@ hashes. Future checks should consume the owning APIs when those exist.
 The isolated native probe is available from the `infigraph` and `infigraph-mcp`
 executables. Other programs embedding core, or renamed executables, report
 `GRAPH_STATUS_UNKNOWN` rather than launching an unsupported host's startup.
-Windows applies the database/thread budgets and timeout; the address-space and
-core-dump limits are Unix-specific.
+All platforms apply the database/thread budgets and timeout. The process-wide
+address-space cap is Linux-only: macOS can reject a fixed cap below its startup
+virtual mappings. Core-dump suppression is Unix-only. The database budgets on
+macOS and Windows do not establish a process-wide memory ceiling.
 
 ## Follow-up
 

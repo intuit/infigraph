@@ -163,6 +163,11 @@ pub fn run_probe_if_requested() -> Option<i32> {
         if libc::setrlimit(libc::RLIMIT_CORE, &limit) != 0 {
             return Some(2);
         }
+    }
+    // macOS reserves a large virtual address range at startup and rejects a
+    // fixed limit below it. Keep its native budgets/timeout, as on Windows.
+    #[cfg(target_os = "linux")]
+    unsafe {
         // A corrupt native size field must not exhaust the host. Stay within
         // any stricter inherited limit; unsupported probes return UNKNOWN.
         let mut address = libc::rlimit {
@@ -672,8 +677,19 @@ mod tests {
         for name in ["graph.wal.checkpoint", "graph.wal.orphan"] {
             let path = dir.path().join(".infigraph").join(name);
             std::fs::write(&path, b"retained checkpoint").unwrap();
-            let result = report(dir.path());
-            assert_eq!(result.status, Health::Healthy);
+            // Test our filename preflight independently of native checkpoint
+            // parsing: these sentinel bytes are not a valid checkpoint WAL.
+            let result = diagnose_with(
+                dir.path(),
+                &|_| {
+                    Ok(GraphCounts {
+                        files: 1,
+                        symbols: 1,
+                    })
+                },
+                &|| Ok(Registry::default()),
+            );
+            assert_eq!(result.status, Health::Healthy, "{result:?}");
             assert!(codes(&result).contains(&DiagnosticCode::GraphReadable));
             assert_eq!(std::fs::read(path).unwrap(), b"retained checkpoint");
         }
