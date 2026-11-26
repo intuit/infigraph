@@ -206,3 +206,80 @@ fn native_probe_failure_is_contained_without_repair() {
         1
     );
 }
+
+#[test]
+fn non_neo4j_backend_values_keep_local_checks() {
+    let project = tempfile::tempdir().unwrap();
+    let home = tempfile::tempdir().unwrap();
+    for backend in ["", "Kuzu", "kuzu", "unknown"] {
+        let output = Command::new(env!("CARGO_BIN_EXE_infigraph"))
+            .arg("--root")
+            .arg(project.path())
+            .args(["doctor", "--json"])
+            .env("HOME", home.path())
+            .env("INFIGRAPH_REGISTRY_HOME", home.path())
+            .env("INFIGRAPH_BACKEND", backend)
+            .output()
+            .unwrap();
+        assert_eq!(output.status.code(), Some(2), "backend {backend:?}");
+        let report: Value = serde_json::from_slice(&output.stdout).unwrap();
+        assert!(report["checks"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|c| c["code"] == "PROJECT_NOT_INDEXED"));
+    }
+}
+
+#[cfg(unix)]
+#[test]
+fn git_is_skipped_without_revision_and_bounded_when_registered() {
+    use std::os::unix::fs::PermissionsExt;
+    use std::time::{Duration, Instant};
+
+    let project = tempfile::tempdir().unwrap();
+    let home = tempfile::tempdir().unwrap();
+    let bin = tempfile::tempdir().unwrap();
+    let git = bin.path().join("git");
+    std::fs::write(
+        &git,
+        "#!/bin/sh\necho called > \"$0.invoked\"\nexec /bin/sleep 30\n",
+    )
+    .unwrap();
+    std::fs::set_permissions(&git, std::fs::Permissions::from_mode(0o755)).unwrap();
+    let marker = git.with_extension("invoked");
+    let run = || {
+        Command::new(env!("CARGO_BIN_EXE_infigraph"))
+            .arg("--root")
+            .arg(project.path())
+            .args(["doctor", "--json"])
+            .env("PATH", bin.path())
+            .env("HOME", home.path())
+            .env("INFIGRAPH_REGISTRY_HOME", home.path())
+            .env("INFIGRAPH_BACKEND", "kuzu")
+            .output()
+            .unwrap()
+    };
+    run();
+    assert!(!marker.exists());
+    std::fs::create_dir_all(home.path().join(".infigraph")).unwrap();
+    let registry = serde_json::json!({"repos":{"fixture":{
+        "name":"fixture", "path":project.path(), "languages":[], "symbol_count":1,
+        "module_count":0, "last_indexed_commit":"recorded"
+    }},"groups":{}});
+    std::fs::write(
+        home.path().join(".infigraph/registry.json"),
+        serde_json::to_vec(&registry).unwrap(),
+    )
+    .unwrap();
+    let start = Instant::now();
+    let output = run();
+    assert!(start.elapsed() < Duration::from_secs(10));
+    assert!(marker.exists());
+    let report: Value = serde_json::from_slice(&output.stdout).unwrap();
+    assert!(report["checks"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .any(|c| c["code"] == "INDEX_FRESHNESS_UNKNOWN"));
+}

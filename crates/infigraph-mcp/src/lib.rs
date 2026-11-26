@@ -694,12 +694,18 @@ pub fn handle_tools_call(id: &Value, request: &Value) -> Value {
     // Diagnostics must remain read-only and machine-readable: no activity
     // files, session mutations, focus recording, or text compression.
     if tool_name == "diagnose" {
-        return match dispatch_tool(tool_name, &args) {
-            Ok(content) => {
+        let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            dispatch_tool(tool_name, &args)
+        }));
+        return match result {
+            Ok(Ok(content)) => {
                 json!({"jsonrpc":"2.0", "id":id, "result":{"content":[{"type":"text", "text":content}]}})
             }
-            Err(_) => {
+            Ok(Err(_)) => {
                 json!({"jsonrpc":"2.0", "id":id, "result":{"isError":true, "content":[{"type":"text", "text":"diagnose requires a string path"}]}})
+            }
+            Err(_) => {
+                json!({"jsonrpc":"2.0", "id":id, "result":{"isError":true, "content":[{"type":"text", "text":"diagnose failed unexpectedly"}]}})
             }
         };
     }

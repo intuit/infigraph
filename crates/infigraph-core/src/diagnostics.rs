@@ -7,7 +7,7 @@ use serde::{Deserialize, Serialize};
 
 use crate::graph::{GraphBackend, KuzuBackend};
 use crate::lockfile::{self, Observation};
-use crate::multi::{git_head_commit, Registry};
+use crate::multi::Registry;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
 #[serde(rename_all = "snake_case")]
@@ -250,19 +250,44 @@ fn isolated_probe(path: &Path) -> anyhow::Result<GraphCounts> {
 }
 
 fn has_wal(path: &Path) -> std::io::Result<bool> {
-    // Kuzu/LadybugDB WAL-family siblings, including graph.wal.*.
-    let wal = path.with_extension("wal");
-    let Some(name) = wal.file_name().and_then(|s| s.to_str()) else {
-        return Ok(true);
-    };
-    for entry in std::fs::read_dir(path.parent().unwrap_or(Path::new(".")))? {
-        let name_on_disk = entry?.file_name();
-        let name_on_disk = name_on_disk.to_string_lossy();
-        if name_on_disk == name || name_on_disk.starts_with(&format!("{name}.")) {
-            return Ok(true);
+    // A checkpoint WAL may remain after a clean checkpoint. Only the active
+    // WAL and shadow require recovery-sensitive handling; do not open either.
+    for suffix in ["wal", "shadow"] {
+        match std::fs::symlink_metadata(path.with_extension(suffix)) {
+            Ok(_) => return Ok(true),
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+            Err(e) => return Err(e),
         }
     }
     Ok(false)
+}
+
+fn git_head_commit(root: &Path) -> Option<String> {
+    let mut child = Command::new("git")
+        .args(["rev-parse", "HEAD"])
+        .current_dir(root)
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::null())
+        .spawn()
+        .ok()?;
+    let deadline = Instant::now() + Duration::from_secs(2);
+    loop {
+        match child.try_wait() {
+            Ok(Some(_)) => break,
+            Ok(None) if Instant::now() < deadline => std::thread::sleep(Duration::from_millis(20)),
+            _ => {
+                let _ = child.kill();
+                let _ = child.wait();
+                return None;
+            }
+        }
+    }
+    let output = child.wait_with_output().ok()?;
+    output
+        .status
+        .success()
+        .then(|| String::from_utf8_lossy(&output.stdout).trim().to_string())
 }
 
 pub fn diagnose(root: &Path) -> DiagnosticReport {
@@ -302,7 +327,7 @@ fn diagnose_with(
         None,
     );
     let backend = std::env::var("INFIGRAPH_BACKEND").unwrap_or_else(|_| "kuzu".into());
-    if backend != "kuzu" {
+    if backend == "neo4j" {
         report.push(
             RemoteStatusUnknown,
             Unknown,
@@ -430,7 +455,7 @@ fn check_graph(
     // Keep the shared lock guard through the isolated open and query.
     let _lock = lock;
     if !matches!(has_wal(&path), Ok(false)) {
-        report.push(GraphStatusUnknown, Unknown, Warning, "WAL-family files exist or could not be inspected; database was not opened.", Some("Allow the writer to finish. Preserve graph/WAL files if the writer exited uncleanly."));
+        report.push(GraphStatusUnknown, Unknown, Warning, "Active WAL or shadow file exists, or could not be inspected; database was not opened.", Some("Allow the writer to finish. Preserve graph/WAL/shadow files if the writer exited uncleanly."));
         return;
     }
     match probe(&path) {
@@ -481,11 +506,16 @@ fn check_registry(
             None,
         );
     }
-    let head = git_head_commit(root);
     let revisions: Vec<_> = entries
         .iter()
         .filter_map(|e| e.last_indexed_commit.as_deref())
         .collect();
+    // No subprocess is needed when there is no revision to compare.
+    let head = if revisions.is_empty() {
+        None
+    } else {
+        git_head_commit(root)
+    };
     match head {
         Some(head) if !revisions.is_empty() && revisions.iter().any(|r| *r != head) => report.push(IndexStale, Problem, Warning, "Current HEAD differs from a registry-recorded indexed revision; registry metadata may lag watcher updates.", Some("Run `infigraph index`, then rerun doctor.")),
         Some(_) if !revisions.is_empty() => report.push(IndexRevisionMatch, Pass, Info, "HEAD matches the registry-recorded revision; working-tree freshness is not established.", None),
@@ -626,7 +656,7 @@ mod tests {
     #[test]
     fn wal_is_unknown_without_opening_even_with_no_lock_payload() {
         let dir = fixture();
-        let wal = dir.path().join(".infigraph/graph.wal.orphan");
+        let wal = dir.path().join(".infigraph/graph.wal");
         std::fs::write(&wal, b"retain this WAL").unwrap();
         let result = diagnose_with(dir.path(), &|_| panic!("must not open WAL graph"), &|| {
             Ok(Registry::default())
@@ -636,6 +666,34 @@ mod tests {
         assert!(codes(&result).contains(&DiagnosticCode::GraphStatusUnknown));
         assert_eq!(std::fs::read(wal).unwrap(), b"retain this WAL");
     }
+    #[test]
+    fn checkpoint_wal_does_not_degrade_an_idle_graph() {
+        let dir = fixture();
+        for name in ["graph.wal.checkpoint", "graph.wal.orphan"] {
+            let path = dir.path().join(".infigraph").join(name);
+            std::fs::write(&path, b"retained checkpoint").unwrap();
+            let result = report(dir.path());
+            assert_eq!(result.status, Health::Healthy);
+            assert!(codes(&result).contains(&DiagnosticCode::GraphReadable));
+            assert_eq!(std::fs::read(path).unwrap(), b"retained checkpoint");
+        }
+    }
+
+    #[test]
+    fn shadow_skips_native_open_and_is_preserved() {
+        let dir = fixture();
+        let path = dir.path().join(".infigraph/graph.shadow");
+        std::fs::write(&path, b"retain shadow").unwrap();
+        let result = diagnose_with(
+            dir.path(),
+            &|_| panic!("must not open shadow graph"),
+            &|| Ok(Registry::default()),
+        );
+        assert_eq!(result.status, Health::Degraded);
+        assert!(codes(&result).contains(&DiagnosticCode::GraphStatusUnknown));
+        assert_eq!(std::fs::read(path).unwrap(), b"retain shadow");
+    }
+
     #[test]
     fn held_graph_lock_skips_probe_without_changing_payload() {
         let dir = fixture();
