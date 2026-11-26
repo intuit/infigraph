@@ -913,7 +913,9 @@ mod tests {
         let original = extract_entities("greet.py", src, tree.root_node(), &query, "python");
         let query = Query::new(
             &grammar,
-            &format!("{function_query}\n(function_definition name: (identifier) @test.name) @test.def"),
+            &format!(
+                "{function_query}\n(function_definition name: (identifier) @test.name) @test.def"
+            ),
         )
         .unwrap();
         let merged = extract_entities("greet.py", src, tree.root_node(), &query, "python");
