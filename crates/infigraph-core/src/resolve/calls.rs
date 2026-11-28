@@ -4,7 +4,7 @@ use anyhow::Result;
 use rayon::prelude::*;
 
 use crate::graph::store::GraphStore;
-use crate::graph::store_util::copy_edges_with_bad_record_retry;
+use crate::graph::store_util::{copy_edges_with_bad_record_retry, unique_tmp_dir};
 use crate::learned::LearnedStore;
 use crate::model::{FileExtraction, RelationKind};
 
@@ -38,8 +38,8 @@ pub fn resolve_calls_incremental(
         symbol_map.entry(name).or_default().push((id, file, kind));
     }
 
-    let mut stats = write_resolved_calls(&conn, extractions, &symbol_map, learned_store)?;
-    stats.inherits_resolved = resolve_inherits(&conn, extractions, &symbol_map)?;
+    let mut stats = write_resolved_calls(store, extractions, &symbol_map, learned_store)?;
+    stats.inherits_resolved = resolve_inherits(store, extractions, &symbol_map)?;
     resolve_custom_edges(&conn, extractions, &symbol_map)?;
     Ok(stats)
 }
@@ -74,8 +74,8 @@ pub fn resolve_calls(
         }
     }
 
-    let mut stats = write_resolved_calls(&conn, extractions, &symbol_map, learned_store)?;
-    stats.inherits_resolved = resolve_inherits(&conn, extractions, &symbol_map)?;
+    let mut stats = write_resolved_calls(store, extractions, &symbol_map, learned_store)?;
+    stats.inherits_resolved = resolve_inherits(store, extractions, &symbol_map)?;
     resolve_custom_edges(&conn, extractions, &symbol_map)?;
     Ok(stats)
 }
@@ -766,8 +766,15 @@ pub(crate) fn resolve_pairs(
 /// loop, then does the parquet-bulk-copy write and ExternalRef/EXTERNAL_CALL
 /// write that only Kuzu's embedded `Connection` can do.
 /// Caller must hold WriteLock.
+/// Writes the resolved edges. Takes `&GraphStore` rather than a borrowed
+/// `Connection` because `copy_edges_with_bad_record_retry` mints a fresh
+/// connection per retry: a caught COPY failure can leave the connection it
+/// ran on wedged, and the next COPY on that same connection then fails with
+/// Kuzu's internal "Invalid transaction type to rollback." None of these
+/// bulk loads share a transaction, so there is nothing to lose by not
+/// sharing the connection.
 fn write_resolved_calls(
-    conn: &kuzu::Connection<'_>,
+    store: &GraphStore,
     extractions: &[FileExtraction],
     symbol_map: &HashMap<String, Vec<(String, String, String)>>,
     learned_store: Option<&LearnedStore>,
@@ -779,12 +786,13 @@ fn write_resolved_calls(
     } = resolve_pairs(extractions, symbol_map, learned_store);
 
     if !pairs.is_empty() {
-        let pq_path = std::env::temp_dir().join("infigraph_resolve_calls.parquet");
-        copy_edges_with_bad_record_retry(conn, "CALLS", pairs, "Symbol", "Symbol", &pq_path);
+        let pq_path = unique_tmp_dir().join("infigraph_resolve_calls.parquet");
+        copy_edges_with_bad_record_retry(store, "CALLS", pairs, "Symbol", "Symbol", &pq_path)?;
     }
 
     if !external_calls.is_empty() {
-        write_external_calls(conn, &external_calls, symbol_map, extractions);
+        let conn = store.connection()?;
+        write_external_calls(&conn, &external_calls, symbol_map, extractions);
     }
 
     Ok(stats)
@@ -834,8 +842,8 @@ pub fn re_resolve_for_files(
         .collect();
 
     let filtered_owned: Vec<FileExtraction> = filtered.into_iter().cloned().collect();
-    let mut stats = write_resolved_calls(&conn, &filtered_owned, &symbol_map, learned_store)?;
-    stats.inherits_resolved = resolve_inherits(&conn, &filtered_owned, &symbol_map)?;
+    let mut stats = write_resolved_calls(store, &filtered_owned, &symbol_map, learned_store)?;
+    stats.inherits_resolved = resolve_inherits(store, &filtered_owned, &symbol_map)?;
     Ok(stats)
 }
 
