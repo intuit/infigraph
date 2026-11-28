@@ -27,6 +27,25 @@ pub struct CallsServiceEdge {
     pub path: String,
 }
 
+/// A code-smell/concern match, to be written as a `Concern` node linked to
+/// its symbol via `HAS_CONCERN`.
+#[derive(Debug, Clone)]
+pub struct Concern {
+    pub symbol_id: String,
+    pub kind: String,
+    pub detail: String,
+}
+
+/// A resolved dynamic-dispatch/reflection site, to be written as a
+/// `RESOLVES_TO` edge from the calling symbol to its resolved target.
+#[derive(Debug, Clone)]
+pub struct ResolvesToEdge {
+    pub caller_symbol: String,
+    pub target: String,
+    pub mechanism: String,
+    pub config_source: String,
+}
+
 /// Backend-agnostic graph storage interface.
 ///
 /// KuzuBackend wraps the existing embedded Kùzu store (local mode).
@@ -239,6 +258,23 @@ pub trait GraphBackend: Send + Sync {
     /// directly (same design as `upsert_files_bulk`/`resolve_calls`). A
     /// no-op for an empty slice.
     fn write_calls_service_edges(&self, edges: &[CallsServiceEdge]) -> Result<()>;
+
+    /// Replace every recorded `Concern` with `concerns` as a single atomic
+    /// operation. Backend owns the transaction — callers don't manage
+    /// connections directly (same design as `write_calls_service_edges`).
+    ///
+    /// Previously implemented by issuing `BEGIN TRANSACTION`/`COMMIT`
+    /// through `raw_query` -- both backends' `raw_query` deliberately no-op
+    /// those (Kùzu: fresh connection per call, so control statements can't
+    /// span calls; Neo4j: transactions are driver-level, not Cypher), so
+    /// the delete-then-recreate was never actually atomic. A crash mid-loop
+    /// could delete all concerns and only recreate some of them.
+    fn replace_concerns(&self, concerns: &[Concern]) -> Result<()>;
+
+    /// Replace every recorded `RESOLVES_TO` edge with `edges` as a single
+    /// atomic operation. Same design and same prior non-atomicity bug as
+    /// `replace_concerns`.
+    fn replace_resolves_to(&self, edges: &[ResolvesToEdge]) -> Result<()>;
 
     // ── Resolve ──────────────────────────────────────────────────────
 

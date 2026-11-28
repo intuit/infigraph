@@ -401,6 +401,7 @@ pub fn load_embeddings(path: &Path) -> Result<Vec<(String, Vec<f32>)>> {
         pos += 4;
         let float_bytes = dim * 4;
         anyhow::ensure!(pos + float_bytes <= data.len(), "truncated embeddings file");
+        #[allow(clippy::chunks_exact_to_as_chunks)]
         let vec: Vec<f32> = data[pos..pos + float_bytes]
             .as_chunks::<4>()
             .0

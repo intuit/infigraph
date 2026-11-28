@@ -11,6 +11,7 @@ use scip::types::{symbol_information, Index, SymbolRole};
 use crate::graph::parquet_loader;
 use crate::graph::store_util::{
     copy_edges_with_bad_record_retry, escape, extract_bad_copy_value, fwd_slash_path,
+    unique_tmp_dir,
 };
 use crate::graph::GraphStore;
 use crate::model::{Span, SymbolKind};
@@ -232,8 +233,7 @@ pub fn import_scip_index(
     const CHUNK: usize = 2000;
     const MAX_SYMBOL_RETRIES: usize = 20;
     if !new_symbols.is_empty() {
-        let tmp = std::env::temp_dir();
-        let sym_pq = tmp.join("infigraph_scip_symbols.parquet");
+        let sym_pq = unique_tmp_dir().join("infigraph_scip_symbols.parquet");
 
         let mut seen_ids = std::collections::HashSet::with_capacity(new_symbols.len());
         let mut remaining: Vec<_> = new_symbols
@@ -245,6 +245,13 @@ pub fn import_scip_index(
             if remaining.is_empty() {
                 break;
             }
+
+            // Fresh connection every attempt -- a caught COPY failure can
+            // leave Kùzu's internal transaction bookkeeping wedged for
+            // whatever query runs next on that same connection (see
+            // `copy_edges_with_bad_record_retry`'s doc comment for the
+            // production incident this mirrors).
+            let conn = store.connection()?;
 
             let ids: Vec<&str> = remaining.iter().map(|(id, ..)| id.as_str()).collect();
             let names: Vec<&str> = remaining
@@ -342,6 +349,9 @@ pub fn import_scip_index(
         }
 
         if !remaining.is_empty() {
+            // Fresh connection: the retry loop above may have just failed a
+            // COPY on whatever connection it was using.
+            let conn = store.connection()?;
             for chunk in remaining.chunks(CHUNK) {
                 let rows: Vec<String> = chunk
                     .iter()
@@ -370,6 +380,9 @@ pub fn import_scip_index(
     // Bulk write enrichments via UNWIND (updates can't use COPY FROM).
     // Only docstring is enriched -- see the note on `enrichments` above for
     // why start_line/end_line must never be written here.
+    // Fresh connection: the Symbol-COPY block above may have just failed a
+    // COPY on whatever connection it was using.
+    let conn = store.connection()?;
     for chunk in enrichments.chunks(CHUNK) {
         let rows: Vec<String> = chunk
             .iter()
@@ -464,17 +477,16 @@ pub fn import_scip_index(
     // Bulk write CALLS edges via Parquet COPY FROM, dropping any bad-PK
     // record and retrying rather than falling back to UNWIND for the batch.
     if !calls_to_create.is_empty() {
-        let tmp = std::env::temp_dir();
-        let edge_pq = tmp.join("infigraph_scip_calls.parquet");
+        let edge_pq = unique_tmp_dir().join("infigraph_scip_calls.parquet");
         stats.references_added = calls_to_create.len();
         copy_edges_with_bad_record_retry(
-            &conn,
+            store,
             "CALLS",
             calls_to_create,
             "Symbol",
             "Symbol",
             &edge_pq,
-        );
+        )?;
     }
 
     // Pass 3: build INHERITS edges from SCIP's compiler-verified is_implementation
@@ -532,17 +544,16 @@ pub fn import_scip_index(
     // Bulk write INHERITS edges via Parquet COPY FROM, dropping any bad-PK
     // record and retrying rather than falling back to UNWIND for the batch.
     if !inherits_to_create.is_empty() {
-        let tmp = std::env::temp_dir();
-        let edge_pq = tmp.join("infigraph_scip_inherits.parquet");
+        let edge_pq = unique_tmp_dir().join("infigraph_scip_inherits.parquet");
         stats.relations_added = inherits_to_create.len();
         copy_edges_with_bad_record_retry(
-            &conn,
+            store,
             "INHERITS",
             inherits_to_create,
             "Symbol",
             "Symbol",
             &edge_pq,
-        );
+        )?;
     }
 
     // Persist learned corrections (if any were recorded)
